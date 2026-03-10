@@ -10,7 +10,7 @@ set -euo pipefail 2>/dev/null || set -eu
 
 # ==========================================================
 # ITGO Master Installer
-# Version: 1.0.7
+# Version: 1.0.8
 #
 # HOME structure (itgo):
 #   ~/UPG
@@ -25,6 +25,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - SSH history prompt (single block; removes old status-installer block)
 # - cleanup installer (downloaded via wget)
 # - tseq installer (downloaded via wget)
+# - downloader app installer deploy (downloaded via wget)
 #
 # Extra steps:
 # - optional install/check of nano, mc, rsync
@@ -36,11 +37,12 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # ==========================================================
 
-MASTER_VERSION="1.0.7"
+MASTER_VERSION="1.0.8"
 
 STATUS_VERSION="3.12.7"
 CLEANUP_VERSION="1.0.1"
 TSEQ_VERSION="3.11"
+DOWNLOADER_APP_VERSION="1.0.0"
 
 TARGET_USER="${1:-itgo}"
 
@@ -55,6 +57,7 @@ GITHUB_REPO="itgo-scripts"
 STATUS_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/status-${STATUS_VERSION}/STATUS/status_installer_public.sh"
 CLEANUP_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/cleanup-${CLEANUP_VERSION}/CLEANUP/cleanup_installer_public.sh"
 TSEQ_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/tseq-${TSEQ_VERSION}/TSEQ/tseq_installer_public.sh"
+DOWNLOADER_APP_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/downloader_app-${DOWNLOADER_APP_VERSION}/DOWNLOADER_APP/upg_installer.sh"
 
 TMP_LOG="/tmp/itgo-master-install.$(date +%Y%m%d_%H%M%S).log"
 
@@ -142,6 +145,11 @@ start_final_logging_if_possible() {
   echo "[$(ts)] ITGO Master Installer v$MASTER_VERSION"
   echo "[$(ts)] User: $TARGET_USER"
   echo "[$(ts)] Log file: $FINAL_LOG"
+  echo "[$(ts)] Module versions:"
+  echo "[$(ts)]   STATUS         : $STATUS_VERSION"
+  echo "[$(ts)]   CLEANUP       : $CLEANUP_VERSION"
+  echo "[$(ts)]   TSEQ          : $TSEQ_VERSION"
+  echo "[$(ts)]   DOWNLOADER_APP: $DOWNLOADER_APP_VERSION"
 
   if [[ -f "$TMP_LOG" ]]; then
     echo "[$(ts)] --- pre-log (from $TMP_LOG) ---"
@@ -350,6 +358,31 @@ run_module_as_itgo() {
   sudo -u "$TARGET_USER" bash "$script" $args
 }
 
+install_downloader_app_script() {
+  local src="${1:?}"
+  local app_dir="$UTILITY_DIR/DOWNLOADER_APP"
+  local dst="$app_dir/upg_installer.sh"
+  local link="/usr/local/bin/dwupg"
+
+  echo "[$(ts)] ACTION: install downloader app into $app_dir"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$app_dir"
+
+  install -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$src" "$dst"
+
+  if [[ -L "$link" || -e "$link" ]]; then
+    echo "[$(ts)] ACTION: remove existing $link"
+    rm -f "$link"
+  fi
+
+  ln -s "$dst" "$link"
+  chmod 0755 "$dst" 2>/dev/null || true
+
+  echo "[$(ts)] OK: downloader app installed:"
+  echo "[$(ts)]   script : $dst"
+  echo "[$(ts)]   symlink: $link"
+  echo "[$(ts)]   usage  : dwupg"
+}
+
 cleanup_downloaded_installers() {
   if [[ -d "$TMP_DIR" ]]; then
     if prompt_yn "Usunąć pobrane instalery (*.sh) z $TMP_DIR?" "Y"; then
@@ -492,7 +525,6 @@ main() {
 
   # Must have dirs if we want to download installers
   if [[ -z "${TMP_DIR:-}" || ! -d "${TMP_DIR:-/nonexistent}" ]]; then
-    # try to resolve if user exists
     if have_user; then
       ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
       UTILITY_DIR="$ITGO_HOME/UTILITY"
@@ -507,6 +539,7 @@ main() {
   local status_sh="$TMP_DIR/status_installer_public.sh"
   local cleanup_sh="$TMP_DIR/cleanup_installer_public.sh"
   local tseq_sh="$TMP_DIR/tseq_installer_public.sh"
+  local downloader_app_sh="$TMP_DIR/upg_installer.sh"
 
   if prompt_yn "MODUŁ: Server-Status (systemd + /usr/local + /var/cache)?" "Y"; then
     ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
@@ -545,6 +578,30 @@ main() {
     echo "[$(ts)] OK: TSEQ done."
   else
     echo "[$(ts)] SKIP: TSEQ."
+  fi
+
+  if prompt_yn "MODUŁ: DOWNLOADER_APP (zainstalować ~/UTILITY/DOWNLOADER_APP/upg_installer.sh i symlink /usr/local/bin/dwupg)?" "Y"; then
+    ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+
+    if ! have_user; then
+      echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+      exit 1
+    fi
+
+    ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+    [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+    UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+    TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+
+    [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+    [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+
+    download_to_tmp "$DOWNLOADER_APP_URL" "$downloader_app_sh"
+    install_downloader_app_script "$downloader_app_sh"
+    echo "[$(ts)] OK: DOWNLOADER_APP done."
+  else
+    echo "[$(ts)] SKIP: DOWNLOADER_APP."
   fi
 
   cleanup_downloaded_installers
