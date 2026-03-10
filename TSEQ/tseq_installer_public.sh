@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ========= TSEQ (Tomcat Sequencer) Installer v3.12 =========
-VERSION="3.12"
+# ========= TSEQ (Tomcat Sequencer) Installer v3.12.1 =========
+VERSION="3.12.1"
 BASE_USER="itgo"
 
 UTILITY_DIRNAME="UTILITY"
