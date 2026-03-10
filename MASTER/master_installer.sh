@@ -10,7 +10,7 @@ set -euo pipefail 2>/dev/null || set -eu
 
 # ==========================================================
 # ITGO Master Installer
-# Version: 1.1.0
+# Version: 1.1.1
 #
 # HOME structure (itgo):
 #   ~/UPG
@@ -39,7 +39,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
 
-MASTER_VERSION="1.1.0"
+MASTER_VERSION="1.1.1"
 
 STATUS_VERSION="3.12.9"
 CLEANUP_VERSION="1.0.2"
@@ -116,7 +116,6 @@ install_packages() {
   fi
 }
 
-# Derived globals (after home resolved)
 ITGO_HOME=""
 UTILITY_DIR=""
 LOG_DIR=""
@@ -402,11 +401,16 @@ install_downloader_app_script() {
   local app_dir="$UTILITY_DIR/DOWNLOADER_APP"
   local dst="$app_dir/upg_installer.sh"
   local link="/usr/local/bin/dwupg"
+  local version_file="$app_dir/.downloader_version"
 
   echo "[$(ts)] ACTION: install downloader app into $app_dir"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$app_dir"
 
   install -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$src" "$dst"
+
+  printf "%s\n" "$DOWNLOADER_APP_VERSION" > "$version_file"
+  chown "$TARGET_USER:$TARGET_USER" "$version_file" 2>/dev/null || true
+  chmod 0644 "$version_file" 2>/dev/null || true
 
   if [[ -L "$link" || -e "$link" ]]; then
     echo "[$(ts)] ACTION: remove existing $link"
@@ -419,6 +423,7 @@ install_downloader_app_script() {
   echo "[$(ts)] OK: downloader app installed:"
   echo "[$(ts)]   script : $dst"
   echo "[$(ts)]   symlink: $link"
+  echo "[$(ts)]   verfile: $version_file"
   echo "[$(ts)]   usage  : dwupg"
 }
 
