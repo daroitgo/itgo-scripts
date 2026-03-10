@@ -10,7 +10,7 @@ set -euo pipefail 2>/dev/null || set -eu
 
 # ==========================================================
 # ITGO Master Installer
-# Version: 1.0.9
+# Version: 1.1.0
 #
 # HOME structure (itgo):
 #   ~/UPG
@@ -28,7 +28,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - downloader app installer deploy (downloaded via wget)
 #
 # Extra steps:
-# - optional install/check of nano, mc, rsync, dos2unix
+# - optional install/check of nano, mc, rsync, dos2unix, jq, wget
 # - optional ~/.bash_logout history cleanup block
 # - optional add user to docker group
 #
@@ -36,21 +36,17 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Asks before each module.
 # - BOOTSTRAP is one question (user + dirs + sudoers + ACL + docker group).
 # - Cleans downloaded *.sh from TMP at the end (asks).
+# - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
 
-MASTER_VERSION="1.0.9"
+MASTER_VERSION="1.1.0"
 
-STATUS_VERSION="3.12.8"
-CLEANUP_VERSION="1.0.1"
-TSEQ_VERSION="3.11"
-DOWNLOADER_APP_VERSION="1.0.0"
+STATUS_VERSION="3.12.9"
+CLEANUP_VERSION="1.0.2"
+TSEQ_VERSION="3.12"
+DOWNLOADER_APP_VERSION="1.0.1"
 
 TARGET_USER="${1:-itgo}"
-
-# OLD Nextcloud distribution (deprecated)
-#STATUS_URL='https://helpdesk.itgo.com.pl/nextcloud/index.php/s/Ti4PRnHQQJFXeyn/download'
-#CLEANUP_URL='https://helpdesk.itgo.com.pl/nextcloud/index.php/s/WLFcGe3c92qnsfp/download'
-#TSEQ_URL='https://helpdesk.itgo.com.pl/nextcloud/index.php/s/JGYMTmykH3aJoSC/download'
 
 GITHUB_OWNER="daroitgo"
 GITHUB_REPO="itgo-scripts"
@@ -101,10 +97,7 @@ resolve_home() {
 
 pkg_installed() {
   local pkg="${1:?}"
-  if rpm -q "$pkg" >/dev/null 2>&1; then
-    return 0
-  fi
-  return 1
+  rpm -q "$pkg" >/dev/null 2>&1
 }
 
 install_packages() {
@@ -159,6 +152,25 @@ start_final_logging_if_possible() {
   fi
 }
 
+safe_backup() {
+  local f="${1:?}"
+  [[ -e "$f" ]] || return 0
+  rm -f "${f}.bak" 2>/dev/null || true
+  cp -a "$f" "${f}.bak"
+}
+
+cleanup_old_bash_backups() {
+  local files=(
+    "$ITGO_HOME/.bash_profile"
+    "$ITGO_HOME/.bashrc"
+    "$ITGO_HOME/.bash_logout"
+  )
+  local f=""
+  for f in "${files[@]}"; do
+    rm -f "${f}.bak."* 2>/dev/null || true
+  done
+}
+
 ensure_user_and_password_if_missing() {
   if have_user; then
     prelog "OK: user '$TARGET_USER' exists (skip create/passwd)."
@@ -196,6 +208,7 @@ ensure_home_dirs() {
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$LOG_UPDATE"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
 
+  cleanup_old_bash_backups
   start_final_logging_if_possible
 }
 
@@ -275,7 +288,7 @@ ensure_docker_group_membership() {
 }
 
 ensure_basic_tools_step() {
-  local wanted=(nano mc rsync dos2unix)
+  local wanted=(nano mc rsync dos2unix jq wget)
   local missing=()
   local p=""
 
@@ -303,7 +316,6 @@ ensure_basic_tools_step() {
 
 install_bash_logout_history_clear() {
   local bl="$ITGO_HOME/.bash_logout"
-  local bak="$bl.bak.$(date +%Y%m%d_%H%M%S)"
 
   local START="# >>> ITGO HISTORY CLEAR ON LOGOUT (auto) >>>"
   local END="# <<< ITGO HISTORY CLEAR ON LOGOUT (auto) <<<"
@@ -320,7 +332,7 @@ BEOF
   touch "$bl"
   chown "$TARGET_USER:$TARGET_USER" "$bl" 2>/dev/null || true
   chmod 0644 "$bl" 2>/dev/null || true
-  cp -a "$bl" "$bak"
+  safe_backup "$bl"
 
   if grep -qF "$START" "$bl" 2>/dev/null; then
     awk -v start="$START" -v end="$END" '
@@ -337,7 +349,7 @@ BEOF
   chown "$TARGET_USER:$TARGET_USER" "$bl" 2>/dev/null || true
   chmod 0644 "$bl" 2>/dev/null || true
 
-  echo "[$(ts)] OK: ~/.bash_logout updated. Backup: $bak"
+  echo "[$(ts)] OK: ~/.bash_logout updated. Backup: ${bl}.bak"
 }
 
 ensure_wget() {
@@ -422,11 +434,8 @@ cleanup_downloaded_installers() {
   fi
 }
 
-# --- SINGLE BLOCK installer: ask history, then run status ONCE
-# Also removes old status-installer block so we don't get double status.
 install_ssh_history_prompt_block() {
   local bp="$ITGO_HOME/.bash_profile"
-  local bak="$bp.bak.$(date +%Y%m%d_%H%M%S)"
 
   local START="# >>> ITGO SSH HISTORY PROMPT (auto) >>>"
   local END="# <<< ITGO SSH HISTORY PROMPT (auto) <<<"
@@ -470,9 +479,8 @@ BEOF
   touch "$bp"
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
   chmod 0644 "$bp" 2>/dev/null || true
-  cp -a "$bp" "$bak"
+  safe_backup "$bp"
 
-  # remove our previous block if exists
   if grep -qF "$START" "$bp" 2>/dev/null; then
     awk -v start="$START" -v end="$END" '
       $0==start {inside=1; next}
@@ -484,7 +492,6 @@ BEOF
     chmod 0644 "$bp" 2>/dev/null || true
   fi
 
-  # remove old status-installer block if exists
   if grep -qF "$OLD_START" "$bp" 2>/dev/null; then
     awk -v start="$OLD_START" -v end="$OLD_END" '
       $0==start {inside=1; next}
@@ -496,12 +503,11 @@ BEOF
     chmod 0644 "$bp" 2>/dev/null || true
   fi
 
-  # append fresh single block
   printf "\n%s\n" "$BLOCK" >> "$bp"
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
   chmod 0644 "$bp" 2>/dev/null || true
 
-  echo "[$(ts)] OK: installed single SSH prompt+status block. Backup: $bak"
+  echo "[$(ts)] OK: installed single SSH prompt+status block. Backup: ${bp}.bak"
 }
 
 bootstrap_block() {
@@ -512,33 +518,46 @@ bootstrap_block() {
   ensure_docker_group_membership
 }
 
+prepare_dirs_after_skip_bootstrap() {
+  if have_user; then
+    ITGO_HOME="$(resolve_home)" || true
+    UTILITY_DIR="$ITGO_HOME/UTILITY"
+    LOG_DIR="$UTILITY_DIR/LOG"
+    LOG_OTHER="$LOG_DIR/OTHER"
+    LOG_UPDATE="$LOG_DIR/UPDATE"
+    TMP_DIR="$UTILITY_DIR/TMP"
+    cleanup_old_bash_backups
+    start_final_logging_if_possible
+  fi
+}
+
+section() {
+  echo
+  echo "===================================================="
+  echo "[$(ts)] $*"
+  echo "===================================================="
+}
+
 main() {
   need_root
   prelog "BEGIN: ITGO Master Installer v$MASTER_VERSION user=$TARGET_USER"
 
+  section "SEKCJA 1/6 - BOOTSTRAP"
   if prompt_yn "BOOTSTRAP: user '$TARGET_USER' + katalogi HOME + (opcjonalnie) sudoers + ACL + docker group?" "Y"; then
     bootstrap_block
   else
     echo "[$(ts)] SKIP: bootstrap."
-    if have_user; then
-      ITGO_HOME="$(resolve_home)" || true
-      UTILITY_DIR="$ITGO_HOME/UTILITY"
-      LOG_DIR="$UTILITY_DIR/LOG"
-      LOG_OTHER="$LOG_DIR/OTHER"
-      LOG_UPDATE="$LOG_DIR/UPDATE"
-      TMP_DIR="$UTILITY_DIR/TMP"
-      start_final_logging_if_possible
-    fi
+    prepare_dirs_after_skip_bootstrap
   fi
 
-  # krok po bootstrapie: pakiety bazowe
-  if prompt_yn "KROK: sprawdzić nano, mc, rsync, dos2unix i doinstalować brakujące?" "Y"; then
+  section "SEKCJA 2/6 - NARZĘDZIA SYSTEMOWE"
+  if prompt_yn "KROK: sprawdzić nano, mc, rsync, dos2unix, jq, wget i doinstalować brakujące?" "Y"; then
     ensure_basic_tools_step
   else
     echo "[$(ts)] SKIP: pakiety bazowe."
   fi
 
-  # krok po bootstrapie: ~/.bash_logout z czyszczeniem historii
+  section "SEKCJA 3/6 - ZACHOWANIE SHELLA"
   if prompt_yn "KROK: ustawić w ~/.bash_logout: history -c && history -w ?" "Y"; then
     if ! have_user; then
       echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
@@ -551,7 +570,6 @@ main() {
     echo "[$(ts)] SKIP: ~/.bash_logout history clear."
   fi
 
-  # Must have dirs if we want to download installers
   if [[ -z "${TMP_DIR:-}" || ! -d "${TMP_DIR:-/nonexistent}" ]]; then
     if have_user; then
       ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
@@ -569,6 +587,7 @@ main() {
   local tseq_sh="$TMP_DIR/tseq_installer_public.sh"
   local downloader_app_sh="$TMP_DIR/upg_installer.sh"
 
+  section "SEKCJA 4/6 - MODUŁY CORE"
   if prompt_yn "MODUŁ: Server-Status (systemd + /usr/local + /var/cache)?" "Y"; then
     ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
     download_to_tmp "$STATUS_URL" "$status_sh"
@@ -578,6 +597,16 @@ main() {
     echo "[$(ts)] SKIP: Server-Status."
   fi
 
+  if prompt_yn "MODUŁ: TSEQ (systemd + /usr/local/sbin/tseq + ~/UTILITY/TSEQ)?" "Y"; then
+    ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+    download_to_tmp "$TSEQ_URL" "$tseq_sh"
+    run_module_root "$tseq_sh"
+    echo "[$(ts)] OK: TSEQ done."
+  else
+    echo "[$(ts)] SKIP: TSEQ."
+  fi
+
+  section "SEKCJA 5/6 - HOOKI I NARZĘDZIA UŻYTKOWE"
   if prompt_yn "MODUŁ: SSH login prompt: pytać czy zapisywać historię + potem status (bez dubli)?" "Y"; then
     if ! have_user; then
       echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
@@ -597,15 +626,6 @@ main() {
     echo "[$(ts)] OK: Cleanup done."
   else
     echo "[$(ts)] SKIP: Cleanup."
-  fi
-
-  if prompt_yn "MODUŁ: TSEQ (systemd + /usr/local/sbin/tseq + ~/UTILITY/TSEQ)?" "Y"; then
-    ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
-    download_to_tmp "$TSEQ_URL" "$tseq_sh"
-    run_module_root "$tseq_sh"
-    echo "[$(ts)] OK: TSEQ done."
-  else
-    echo "[$(ts)] SKIP: TSEQ."
   fi
 
   if prompt_yn "MODUŁ: DOWNLOADER_APP (zainstalować ~/UTILITY/DOWNLOADER_APP/upg_installer.sh i symlink /usr/local/bin/dwupg)?" "Y"; then
@@ -632,6 +652,7 @@ main() {
     echo "[$(ts)] SKIP: DOWNLOADER_APP."
   fi
 
+  section "SEKCJA 6/6 - PORZĄDKI KOŃCOWE"
   cleanup_downloaded_installers
 
   echo "[$(ts)] DONE."
