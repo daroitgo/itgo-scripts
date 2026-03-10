@@ -4,9 +4,9 @@ set -o pipefail 2>/dev/null || true
 
 # ==========================================================
 # server-status installer
-# Version: 3.12.8
+# Version: 3.12.9
 # Usage:
-#   sudo bash status_installer_3.12.8.sh itgo
+#   sudo bash status_installer_3.12.9.sh itgo
 #
 # Install:
 #   <HOME>/UTILITY/STATUS/
@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.8"
+VERSION="3.12.9"
 TARGET_USER="${1:-itgo}"
 
 CACHE_DIR="/var/cache/server-status"
@@ -40,6 +40,17 @@ UNIT_APPS_TIMER="/etc/systemd/system/server-status-apps-collect.timer"
 
 need_root() { [[ "$(id -u)" -eq 0 ]] || { echo "ERROR: run as root: sudo bash $0 <user>" >&2; exit 1; }; }
 ensure_user() { id "$TARGET_USER" >/dev/null 2>&1 || { echo "ERROR: user $TARGET_USER not found" >&2; exit 1; }; }
+
+safe_backup() {
+  local f="${1:?}"
+  [[ -e "$f" ]] || return 0
+  rm -f "${f}.bak" 2>/dev/null || true
+  cp -a "$f" "${f}.bak"
+}
+
+cleanup_old_legacy_backups() {
+  rm -f "$BASH_PROFILE".bak.* 2>/dev/null || true
+}
 
 resolve_home() {
   TARGET_HOME="$(getent passwd "$TARGET_USER" | awk -F: '{print $6}')"
@@ -118,7 +129,6 @@ major="${os_ver%%.*}"
 java_ver="NOT_INSTALLED"
 command -v java >/dev/null 2>&1 && java_ver="$(java -version 2>&1 | head -n1 | tr -d '\r')"
 
-# ---- last update: dnf vs yum ----
 last_update="UNKNOWN"
 if [[ -f /var/lib/dnf/history.sqlite ]]; then
   last_update="$(stat -c '%y' /var/lib/dnf/history.sqlite 2>/dev/null | cut -d'.' -f1 || echo UNKNOWN)"
@@ -138,7 +148,6 @@ if [[ "$last_update" != "UNKNOWN" ]]; then
   fi
 fi
 
-# ---- security updates needed? (cache-only, non-invasive) ----
 security_hint="UNKNOWN"
 security_src="n/a"
 
@@ -159,7 +168,6 @@ count_security_lines() {
   '
 }
 
-# HARD RULE: this must never block the collector (offline machines exist)
 SEC_TIMEOUT="12s"
 
 if command -v dnf >/dev/null 2>&1; then
@@ -187,7 +195,6 @@ else
   security_src="n/a"
 fi
 
-# ---- firewall: ONLY permanent (pm) ----
 fw_state="UNKNOWN"
 fw_default="UNKNOWN"
 fw_active="UNKNOWN"
@@ -251,7 +258,6 @@ elif command -v iptables >/dev/null 2>&1; then
   fw_direct="(n/a)"
 fi
 
-# ---- Support until: LOCAL EOL DB only ----
 support_until="UNKNOWN"
 support_src="local-db:missing"
 
@@ -322,7 +328,6 @@ COL
 chmod 0755 "$COLLECTOR_SRC"
 }
 
-# NOTE: apps collector unchanged vs your 3.12.6 paste (kept as-is)
 write_apps_collector_src() {
 cat > "$APPS_COLLECTOR_SRC" <<'APPCOL'
 #!/usr/bin/env bash
@@ -337,10 +342,8 @@ mkdir -p "$OUTDIR"
 collected="$(date '+%Y-%m-%d %H:%M')"
 host="$(hostname -f 2>/dev/null || hostname)"
 
-# keywords (case-insensitive)
 KW_REGEX='wildfly|integrationplatform|bank_krwi|bank-krwi|p1adapter|edm-amdx|mpi|start_docker|tomcat|catalina|ekrn|p1erej|p1rej|p1ser|sgds|edm|epn|erej|e-rej|p1-rej|p1-erej|zm'
 
-# blacklist known false positives (ledmon contains "edm")
 is_blacklisted_unit() {
   case "${1:-}" in
     ledmon.service) return 0 ;;
@@ -412,13 +415,6 @@ detect_appname_fallback() {
   echo "$t" | tr '[:upper:]' '[:lower:]' | grep -oE "$KW_REGEX" | head -n1 | tr -d '\r'
 }
 
-# ---------------- LOGS RULES (your truth table) ----------------
-# EDM -> /var/log/asseco/
-# MPI -> /var/log/asseco/
-# ZM  -> /usr/local/ZM/start_docker/log/ (contains subdirs)
-# WildFly -> /srv/WildflyAMMS/wildfly-*/standalone/log/
-# IntegrationPlatform_X -> /srv/IntegrationPlatform_X/apache-tomcat/logs/
-# P1EREJ -> /srv/P1EREJ/docker-logs/
 logs_dir_for_app_path() {
   local app="${1:-}"
   local p="${2:-}"
@@ -686,7 +682,7 @@ module_state() {
 
 status_vf="$HOME/UTILITY/STATUS/.status_installer_version"
 tseq_vf="$HOME/UTILITY/TSEQ/.tseq_version"
-downloader_vf="$HOME/UTILITY/DOWNLOADER/.downloader_version"
+downloader_vf="$HOME/UTILITY/DOWNLOADER_APP/.downloader_version"
 upg_cleanup_vf="$HOME/UTILITY/UPG_CLEANUP/.upg_cleanup_version"
 
 status_installed="$(module_state "$status_vf")"
@@ -950,8 +946,8 @@ set -o pipefail 2>/dev/null || true
 SYS="/var/cache/server-status/system.txt"
 APPS="/var/cache/server-status/apps.txt"
 
-TTL_SYS=600     # 10 min
-TTL_APPS=86400  # 24h
+TTL_SYS=600
+TTL_APPS=86400
 
 refresh=0
 if [[ "${1:-}" == "--refresh" || "${1:-}" == "-r" ]]; then
@@ -1005,6 +1001,11 @@ EOF_CMD
 patch_bash_profile() {
   touch "$BASH_PROFILE"
   chown "$TARGET_USER:$TARGET_USER" "$BASH_PROFILE"
+  chmod 0644 "$BASH_PROFILE" 2>/dev/null || true
+
+  cleanup_old_legacy_backups
+  safe_backup "$BASH_PROFILE"
+
   perl -0777 -i -pe 's/\n# --- system-audit on SSH login \(background\) ---.*?# --- \/system-audit ---\n/\n/sms' "$BASH_PROFILE"
 
   cat >> "$BASH_PROFILE" <<'EOF_BP'
