@@ -4,9 +4,9 @@ set -o pipefail 2>/dev/null || true
 
 # ==========================================================
 # server-status installer
-# Version: 3.12.7
+# Version: 3.12.8
 # Usage:
-#   sudo bash status_installer_3.12.7.sh itgo
+#   sudo bash status_installer_3.12.8.sh itgo
 #
 # Install:
 #   <HOME>/UTILITY/STATUS/
@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.7"
+VERSION="3.12.8"
 TARGET_USER="${1:-itgo}"
 
 CACHE_DIR="/var/cache/server-status"
@@ -670,22 +670,44 @@ fw_pm_ports="$(getv "FW pm ports")"
 fw_pm_services="$(getv "FW pm services")"
 fw_direct="$(getv "FW directrules")"
 
-inst_ver="UNKNOWN"
-ver_file="$HOME/UTILITY/STATUS/.status_installer_version"
-[[ -f "$ver_file" ]] && inst_ver="$(head -n1 "$ver_file" 2>/dev/null | tr -d '\r' || echo UNKNOWN)"
-
-upg_cleanup="NO"
-if [[ -f "$HOME/.bashrc" ]] && grep -qF "# >>> UPG XML cleanup (auto) >>>" "$HOME/.bashrc" 2>/dev/null; then
-  upg_cleanup="YES"
-fi
-
-tseq_ver="UNKNOWN"
-for vf in "/home/itgo/UTILITY/TSEQ/.tseq_version" "$HOME/UTILITY/TSEQ/.tseq_version"; do
+read_version_file() {
+  local vf="$1"
   if [[ -f "$vf" ]]; then
-    tseq_ver="$(head -n1 "$vf" 2>/dev/null | tr -d '\r' || echo UNKNOWN)"
-    break
+    head -n1 "$vf" 2>/dev/null | tr -d '\r'
+  else
+    echo ""
   fi
-done
+}
+
+module_state() {
+  local vf="$1"
+  [[ -f "$vf" ]] && echo "YES" || echo "NO"
+}
+
+status_vf="$HOME/UTILITY/STATUS/.status_installer_version"
+tseq_vf="$HOME/UTILITY/TSEQ/.tseq_version"
+downloader_vf="$HOME/UTILITY/DOWNLOADER/.downloader_version"
+upg_cleanup_vf="$HOME/UTILITY/UPG_CLEANUP/.upg_cleanup_version"
+
+status_installed="$(module_state "$status_vf")"
+tseq_installed="$(module_state "$tseq_vf")"
+downloader_installed="$(module_state "$downloader_vf")"
+upg_cleanup_installed="$(module_state "$upg_cleanup_vf")"
+
+inst_ver="$(read_version_file "$status_vf")"
+tseq_ver="$(read_version_file "$tseq_vf")"
+downloader_ver="$(read_version_file "$downloader_vf")"
+upg_cleanup_ver="$(read_version_file "$upg_cleanup_vf")"
+
+[[ -n "${inst_ver:-}" ]] || inst_ver="UNKNOWN"
+[[ -n "${tseq_ver:-}" ]] || tseq_ver="UNKNOWN"
+[[ -n "${downloader_ver:-}" ]] || downloader_ver="UNKNOWN"
+[[ -n "${upg_cleanup_ver:-}" ]] || upg_cleanup_ver="UNKNOWN"
+
+upg_cleanup_hook="NO"
+if [[ -f "$HOME/.bashrc" ]] && grep -qF "# >>> UPG XML cleanup (auto) >>>" "$HOME/.bashrc" 2>/dev/null; then
+  upg_cleanup_hook="YES"
+fi
 
 RED=$'\033[31m'; GREEN=$'\033[32m'; RESET=$'\033[0m'
 
@@ -724,15 +746,21 @@ printf "%-10s %b\n" "SecUpd"     "${secbadge}"
 printf "%-10s %s\n" "SecSrc"     "${secsrc:-UNKNOWN}"
 printf "%-10s %s\n" "Support"    "${support:-UNKNOWN}"
 printf "%-10s %s\n" "SupportSrc" "${supportsrc:-local-db}"
-printf "%-10s %s\n" "StatusInst" "${inst_ver:-UNKNOWN}"
-printf "%-10s %s\n" "UPGclean"   "${upg_cleanup}"
-printf "%-10s %s\n" "TSEQ"       "${tseq_ver:-UNKNOWN}"
+
+echo
+echo "== MODULES =="
+printf "%-12s %-5s %s\n" "MODULE" "INST" "VERSION / INFO"
+printf "%-12s %-5s %s\n" "------------" "-----" "------------------------------"
+printf "%-12s %-5s %s\n" "StatusInst" "${status_installed:-NO}" "${inst_ver:-UNKNOWN}"
+printf "%-12s %-5s %s\n" "UPGclean"   "${upg_cleanup_installed:-NO}" "${upg_cleanup_ver:-UNKNOWN} (bashrc:${upg_cleanup_hook})"
+printf "%-12s %-5s %s\n" "TSEQ"       "${tseq_installed:-NO}" "${tseq_ver:-UNKNOWN}"
+printf "%-12s %-5s %s\n" "Downloader" "${downloader_installed:-NO}" "${downloader_ver:-UNKNOWN}"
 
 echo
 echo "== FIREWALL (permanent) =="
-printf "%-10s %s\n" "State"   "${fw:-UNKNOWN}"
-printf "%-10s %s\n" "Default" "${fw_default:-UNKNOWN}"
-printf "%-10s %s\n" "Active"  "${fw_active:-UNKNOWN}"
+printf "%-10s %s\n" "State"    "${fw:-UNKNOWN}"
+printf "%-10s %s\n" "Default"  "${fw_default:-UNKNOWN}"
+printf "%-10s %s\n" "Active"   "${fw_active:-UNKNOWN}"
 printf "%-10s %s\n" "PM Ports" "${fw_pm_ports:-UNKNOWN}"
 printf "%-10s %s\n" "PM Svcs"  "${fw_pm_services:-UNKNOWN}"
 printf "%-10s %s\n" "Direct"   "${fw_direct:-UNKNOWN}"

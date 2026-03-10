@@ -10,7 +10,7 @@ set -euo pipefail 2>/dev/null || set -eu
 
 # ==========================================================
 # ITGO Master Installer
-# Version: 1.0.8
+# Version: 1.0.9
 #
 # HOME structure (itgo):
 #   ~/UPG
@@ -28,16 +28,17 @@ set -euo pipefail 2>/dev/null || set -eu
 # - downloader app installer deploy (downloaded via wget)
 #
 # Extra steps:
-# - optional install/check of nano, mc, rsync
+# - optional install/check of nano, mc, rsync, dos2unix
 # - optional ~/.bash_logout history cleanup block
+# - optional add user to docker group
 #
 # NOTE:
 # - Asks before each module.
-# - BOOTSTRAP is one question (user + dirs + sudoers + ACL).
+# - BOOTSTRAP is one question (user + dirs + sudoers + ACL + docker group).
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # ==========================================================
 
-MASTER_VERSION="1.0.8"
+MASTER_VERSION="1.0.9"
 
 STATUS_VERSION="3.12.7"
 CLEANUP_VERSION="1.0.1"
@@ -247,8 +248,34 @@ ensure_acls_block() {
   fi
 }
 
+ensure_docker_group_membership() {
+  if ! have_user; then
+    echo "[$(ts)] WARN: user '$TARGET_USER' nie istnieje. Pomijam docker group."
+    return 0
+  fi
+
+  if ! getent group docker >/dev/null 2>&1; then
+    echo "[$(ts)] WARN: grupa 'docker' nie istnieje. Pomijam dopięcie użytkownika."
+    return 0
+  fi
+
+  if id -nG "$TARGET_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    echo "[$(ts)] OK: user '$TARGET_USER' już jest w grupie docker."
+    return 0
+  fi
+
+  if prompt_yn "Dodać użytkownika '$TARGET_USER' do grupy docker?" "Y"; then
+    echo "[$(ts)] ACTION: usermod -aG docker $TARGET_USER"
+    usermod -aG docker "$TARGET_USER"
+    echo "[$(ts)] OK: user '$TARGET_USER' dodany do grupy docker."
+    echo "[$(ts)] INFO: zmiana zadziała po ponownym logowaniu użytkownika."
+  else
+    echo "[$(ts)] SKIP: dopięcie do grupy docker."
+  fi
+}
+
 ensure_basic_tools_step() {
-  local wanted=(nano mc rsync)
+  local wanted=(nano mc rsync dos2unix)
   local missing=()
   local p=""
 
@@ -482,13 +509,14 @@ bootstrap_block() {
   ensure_home_dirs
   ensure_sudo_nopasswd_block
   ensure_acls_block
+  ensure_docker_group_membership
 }
 
 main() {
   need_root
   prelog "BEGIN: ITGO Master Installer v$MASTER_VERSION user=$TARGET_USER"
 
-  if prompt_yn "BOOTSTRAP: user '$TARGET_USER' + katalogi HOME + (opcjonalnie) sudoers + ACL?" "Y"; then
+  if prompt_yn "BOOTSTRAP: user '$TARGET_USER' + katalogi HOME + (opcjonalnie) sudoers + ACL + docker group?" "Y"; then
     bootstrap_block
   else
     echo "[$(ts)] SKIP: bootstrap."
@@ -504,7 +532,7 @@ main() {
   fi
 
   # krok po bootstrapie: pakiety bazowe
-  if prompt_yn "KROK: sprawdzić nano, mc, rsync i doinstalować brakujące?" "Y"; then
+  if prompt_yn "KROK: sprawdzić nano, mc, rsync, dos2unix i doinstalować brakujące?" "Y"; then
     ensure_basic_tools_step
   else
     echo "[$(ts)] SKIP: pakiety bazowe."

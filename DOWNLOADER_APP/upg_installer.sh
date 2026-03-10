@@ -18,6 +18,8 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Pokazuje listę dostępnych wersji
 # - Pobiera wybrany plik do ~/UPG
 # - Przed pobraniem usuwa wszystkie pliki *.jar z ~/UPG
+# - Zapisuje wersję instalera do:
+#     ~/UTILITY/DOWNLOADER/.downloader_version
 # - Na końcu pokazuje podsumowanie:
 #   * co pobrano
 #   * czas pobierania (min, sek)
@@ -32,13 +34,29 @@ set -euo pipefail 2>/dev/null || set -eu
 
 VERSION="1.0.0"
 MANIFEST_URL="https://helpdesk.itgo.com.pl/nextcloud/index.php/s/s2778Z6z4rEibLp/download"
+
 TARGET_DIR="${HOME}/UPG"
+
+UTILITY_DIR="${HOME}/UTILITY"
+DOWNLOADER_DIR="${UTILITY_DIR}/DOWNLOADER"
+VERSION_FILE="${DOWNLOADER_DIR}/.downloader_version"
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "ERROR: Brak wymaganego polecenia: $1"
     exit 1
   }
+}
+
+ensure_dirs() {
+  mkdir -p "$TARGET_DIR"
+  mkdir -p "$DOWNLOADER_DIR"
+  chmod 0755 "$UTILITY_DIR" "$DOWNLOADER_DIR" 2>/dev/null || true
+}
+
+write_version_file() {
+  printf "%s\n" "$VERSION" > "$VERSION_FILE"
+  chmod 0644 "$VERSION_FILE" 2>/dev/null || true
 }
 
 cleanup_old_jars() {
@@ -109,6 +127,9 @@ main() {
   require_cmd curl
   require_cmd jq
   require_cmd wget
+
+  ensure_dirs
+  write_version_file
 
   echo "ITGO UPG Installer Fetcher v${VERSION}"
   echo
@@ -193,6 +214,8 @@ main() {
   echo "Zapisano do : ${target_file}"
   echo "Czas        : ${elapsed_human}"
   echo "Rozmiar     : ${size_human}"
+  echo "Installer   : ${VERSION}"
+  echo "Ver file    : ${VERSION_FILE}"
   echo "========================================"
 }
 

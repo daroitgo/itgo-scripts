@@ -188,7 +188,6 @@ interactive_configure_order() {
 
   log "ORDER: interactive setup started"
 
-  # read discovered entries into arrays (no pipe subshell issues)
   local svcs=() bases=() line svc base
   while IFS=$'\t' read -r svc base; do
     [[ -n "${svc:-}" ]] || continue
@@ -537,8 +536,9 @@ fix_permissions() {
 }
 
 write_version_file() {
-  echo "$VERSION" >"$VERSION_FILE"
+  printf "%s\n" "$VERSION" > "$VERSION_FILE"
   chmod 0644 "$VERSION_FILE" 2>/dev/null || true
+  chown "$BASE_USER:$BASE_USER" "$VERSION_FILE" 2>/dev/null || true
 }
 
 write_default_order_if_missing() {
