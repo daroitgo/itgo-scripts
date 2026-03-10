@@ -10,7 +10,7 @@ set -euo pipefail 2>/dev/null || set -eu
 
 # ==========================================================
 # ITGO Master Installer
-# Version: 1.0.6
+# Version: 1.0.7
 #
 # HOME structure (itgo):
 #   ~/UPG
@@ -26,13 +26,17 @@ set -euo pipefail 2>/dev/null || set -eu
 # - cleanup installer (downloaded via wget)
 # - tseq installer (downloaded via wget)
 #
+# Extra steps:
+# - optional install/check of nano, mc, rsync
+# - optional ~/.bash_logout history cleanup block
+#
 # NOTE:
 # - Asks before each module.
 # - BOOTSTRAP is one question (user + dirs + sudoers + ACL).
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # ==========================================================
 
-MASTER_VERSION="1.0.6"
+MASTER_VERSION="1.0.7"
 
 STATUS_VERSION="3.12.7"
 CLEANUP_VERSION="1.0.1"
@@ -89,6 +93,30 @@ resolve_home() {
   h="$(getent passwd "$TARGET_USER" | awk -F: '{print $6}' || true)"
   [[ -n "${h:-}" ]] || return 1
   echo "$h"
+}
+
+pkg_installed() {
+  local pkg="${1:?}"
+  if rpm -q "$pkg" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+install_packages() {
+  local missing=("$@")
+  [[ "${#missing[@]}" -gt 0 ]] || return 0
+
+  if command -v dnf >/dev/null 2>&1; then
+    echo "[$(ts)] ACTION: dnf -y install ${missing[*]}"
+    dnf -y install "${missing[@]}"
+  elif command -v yum >/dev/null 2>&1; then
+    echo "[$(ts)] ACTION: yum -y install ${missing[*]}"
+    yum -y install "${missing[@]}"
+  else
+    echo "[$(ts)] ERROR: brak dnf/yum."
+    return 1
+  fi
 }
 
 # Derived globals (after home resolved)
@@ -169,7 +197,7 @@ ensure_sudo_nopasswd_block() {
     return 0
   fi
 
-  if prompt_yn "Dodać sudo NOPASSWD dla '$TARGET_USER' (itgo ALL=(ALL) NOPASSWD: ALL)?" "N"; then
+  if prompt_yn "Dodać sudo NOPASSWD dla '$TARGET_USER' (${TARGET_USER} ALL=(ALL) NOPASSWD: ALL)?" "N"; then
     echo "[$(ts)] ACTION: writing $f"
     cat > "$f" <<EOF_SUD
 ${TARGET_USER} ALL=(ALL) NOPASSWD: ALL
@@ -209,6 +237,72 @@ ensure_acls_block() {
   else
     echo "[$(ts)] SKIP: ACL block."
   fi
+}
+
+ensure_basic_tools_step() {
+  local wanted=(nano mc rsync)
+  local missing=()
+  local p=""
+
+  for p in "${wanted[@]}"; do
+    if pkg_installed "$p"; then
+      echo "[$(ts)] OK: pakiet '$p' już zainstalowany."
+    else
+      echo "[$(ts)] WARN: pakiet '$p' nie jest zainstalowany."
+      missing+=("$p")
+    fi
+  done
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    echo "[$(ts)] OK: wszystkie pakiety bazowe są już obecne."
+    return 0
+  fi
+
+  if prompt_yn "Brakuje: ${missing[*]}. Zainstalować teraz?" "Y"; then
+    install_packages "${missing[@]}"
+    echo "[$(ts)] OK: pakiety bazowe zainstalowane."
+  else
+    echo "[$(ts)] SKIP: instalacja pakietów bazowych."
+  fi
+}
+
+install_bash_logout_history_clear() {
+  local bl="$ITGO_HOME/.bash_logout"
+  local bak="$bl.bak.$(date +%Y%m%d_%H%M%S)"
+
+  local START="# >>> ITGO HISTORY CLEAR ON LOGOUT (auto) >>>"
+  local END="# <<< ITGO HISTORY CLEAR ON LOGOUT (auto) <<<"
+
+  local BLOCK
+  BLOCK=$(cat <<'BEOF'
+# >>> ITGO HISTORY CLEAR ON LOGOUT (auto) >>>
+history -c && history -w
+# <<< ITGO HISTORY CLEAR ON LOGOUT (auto) <<<
+BEOF
+)
+
+  echo "[$(ts)] ACTION: patch $bl (history clear on logout)"
+  touch "$bl"
+  chown "$TARGET_USER:$TARGET_USER" "$bl" 2>/dev/null || true
+  chmod 0644 "$bl" 2>/dev/null || true
+  cp -a "$bl" "$bak"
+
+  if grep -qF "$START" "$bl" 2>/dev/null; then
+    awk -v start="$START" -v end="$END" '
+      $0==start {inside=1; next}
+      $0==end   {inside=0; next}
+      !inside   {print}
+    ' "$bl" > "${bl}.tmp"
+    mv "${bl}.tmp" "$bl"
+    chown "$TARGET_USER:$TARGET_USER" "$bl" 2>/dev/null || true
+    chmod 0644 "$bl" 2>/dev/null || true
+  fi
+
+  printf "\n%s\n" "$BLOCK" >> "$bl"
+  chown "$TARGET_USER:$TARGET_USER" "$bl" 2>/dev/null || true
+  chmod 0644 "$bl" 2>/dev/null || true
+
+  echo "[$(ts)] OK: ~/.bash_logout updated. Backup: $bak"
 }
 
 ensure_wget() {
@@ -315,6 +409,7 @@ BEOF
   echo "[$(ts)] ACTION: patch $bp (replace old status block + ensure single prompt+status)"
   touch "$bp"
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
+  chmod 0644 "$bp" 2>/dev/null || true
   cp -a "$bp" "$bak"
 
   # remove our previous block if exists
@@ -326,6 +421,7 @@ BEOF
     ' "$bp" > "${bp}.tmp"
     mv "${bp}.tmp" "$bp"
     chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
+    chmod 0644 "$bp" 2>/dev/null || true
   fi
 
   # remove old status-installer block if exists
@@ -337,11 +433,13 @@ BEOF
     ' "$bp" > "${bp}.tmp"
     mv "${bp}.tmp" "$bp"
     chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
+    chmod 0644 "$bp" 2>/dev/null || true
   fi
 
   # append fresh single block
   printf "\n%s\n" "$BLOCK" >> "$bp"
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
+  chmod 0644 "$bp" 2>/dev/null || true
 
   echo "[$(ts)] OK: installed single SSH prompt+status block. Backup: $bak"
 }
@@ -372,6 +470,26 @@ main() {
     fi
   fi
 
+  # krok po bootstrapie: pakiety bazowe
+  if prompt_yn "KROK: sprawdzić nano, mc, rsync i doinstalować brakujące?" "Y"; then
+    ensure_basic_tools_step
+  else
+    echo "[$(ts)] SKIP: pakiety bazowe."
+  fi
+
+  # krok po bootstrapie: ~/.bash_logout z czyszczeniem historii
+  if prompt_yn "KROK: ustawić w ~/.bash_logout: history -c && history -w ?" "Y"; then
+    if ! have_user; then
+      echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+      exit 1
+    fi
+    ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+    [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+    install_bash_logout_history_clear
+  else
+    echo "[$(ts)] SKIP: ~/.bash_logout history clear."
+  fi
+
   # Must have dirs if we want to download installers
   if [[ -z "${TMP_DIR:-}" || ! -d "${TMP_DIR:-/nonexistent}" ]]; then
     # try to resolve if user exists
@@ -382,7 +500,6 @@ main() {
       LOG_OTHER="$LOG_DIR/OTHER"
       LOG_UPDATE="$LOG_DIR/UPDATE"
       TMP_DIR="$UTILITY_DIR/TMP"
-      # if still missing, warn
       [[ -d "$TMP_DIR" ]] || echo "[$(ts)] WARN: $TMP_DIR missing; modules download may fail."
     fi
   fi
