@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ==========================================================
 # UPG XML + ~/.cache cleanup installer
-# Version: 1.0.1
+# Version: 1.0.2
 #
 # Co robi:
 # - wstawia/odświeża blok w ~/.bashrc
@@ -18,7 +18,7 @@ set -euo pipefail
 # - ścieżka /home/itgo/UPG jest na stałe
 # ==========================================================
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 
 UTILITY_DIR="${HOME}/UTILITY"
 MODULE_DIR="${UTILITY_DIR}/UPG_CLEANUP"
@@ -45,7 +45,7 @@ cleanup_upg_xml_and_cache() {
   if (( ${#cache_items[@]} )); then
     rm -rf -- "${cache_items[@]}"
   fi
-  shopt -u dotglob
+  shopt -u dotglob nullglob
 }
 
 # tylko gdy to sesja SSH i interaktywny shell
@@ -67,13 +67,18 @@ write_version_file() {
   chmod 0644 "$VERSION_FILE" 2>/dev/null || true
 }
 
-backup_bashrc() {
+cleanup_old_legacy_backups() {
+  rm -f "${BASHRC}.bak."* 2>/dev/null || true
+}
+
+safe_backup() {
   touch "$BASHRC"
-  cp -a "$BASHRC" "${BASHRC}.bak.$(date +%Y%m%d_%H%M%S)"
+  rm -f "${BASHRC}.bak" 2>/dev/null || true
+  cp -a "$BASHRC" "${BASHRC}.bak"
 }
 
 remove_old_block_if_exists() {
-  if grep -qF "$BLOCK_START" "$BASHRC"; then
+  if grep -qF "$BLOCK_START" "$BASHRC" 2>/dev/null; then
     awk -v start="$BLOCK_START" -v end="$BLOCK_END" '
       $0==start {inside=1; next}
       $0==end   {inside=0; next}
@@ -90,11 +95,14 @@ append_fresh_block() {
 main() {
   ensure_dirs
   write_version_file
-  backup_bashrc
+
+  touch "$BASHRC"
+  cleanup_old_legacy_backups
+  safe_backup
   remove_old_block_if_exists
   append_fresh_block
 
-  echo "OK: blok wstawiony/odświeżony w $BASHRC (backup zrobiony)."
+  echo "OK: blok wstawiony/odświeżony w $BASHRC (backup: ${BASHRC}.bak)."
   echo "OK: wersja instalera zapisana do $VERSION_FILE"
   echo "INFO: Zaloguj się ponownie przez SSH i wyloguj, żeby trap zadziałał."
   echo "DONE"
