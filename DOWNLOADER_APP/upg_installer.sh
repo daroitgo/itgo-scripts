@@ -10,7 +10,7 @@ set -euo pipefail 2>/dev/null || set -eu
 
 # ==========================================================
 # ITGO UPG Installer Fetcher
-# Version: 1.0.0
+# Version: 1.0.1
 #
 # Opis:
 # - Pobiera manifest versions.json z Nextcloud
@@ -19,7 +19,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Pobiera wybrany plik do ~/UPG
 # - Przed pobraniem usuwa wszystkie pliki *.jar z ~/UPG
 # - Zapisuje wersję instalera do:
-#     ~/UTILITY/DOWNLOADER/.downloader_version
+#     ~/UTILITY/DOWNLOADER_APP/.downloader_version
 # - Na końcu pokazuje podsumowanie:
 #   * co pobrano
 #   * czas pobierania (min, sek)
@@ -32,13 +32,13 @@ set -euo pipefail 2>/dev/null || set -eu
 # - wget
 # ==========================================================
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 MANIFEST_URL="https://helpdesk.itgo.com.pl/nextcloud/index.php/s/s2778Z6z4rEibLp/download"
 
 TARGET_DIR="${HOME}/UPG"
 
 UTILITY_DIR="${HOME}/UTILITY"
-DOWNLOADER_DIR="${UTILITY_DIR}/DOWNLOADER"
+DOWNLOADER_DIR="${UTILITY_DIR}/DOWNLOADER_APP"
 VERSION_FILE="${DOWNLOADER_DIR}/.downloader_version"
 
 require_cmd() {
@@ -50,6 +50,7 @@ require_cmd() {
 
 ensure_dirs() {
   mkdir -p "$TARGET_DIR"
+  mkdir -p "$UTILITY_DIR"
   mkdir -p "$DOWNLOADER_DIR"
   chmod 0755 "$UTILITY_DIR" "$DOWNLOADER_DIR" 2>/dev/null || true
 }
