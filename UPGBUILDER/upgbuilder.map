@@ -1,0 +1,78 @@
+# ==========================================================
+# UPGbuilder map
+# format: key=value
+# ==========================================================
+
+scan.roots=/srv,/opt
+
+# ==========================================================
+# REGUŁA: platforms_zm
+# ==========================================================
+platforms_zm.output=update_platforms_zm.sh
+platforms_zm.template=templates/template_update_platforms_zm.sh
+platforms_zm.version=1.0.0
+platforms_zm.detect_mode=prefix
+platforms_zm.detect_value=IntegrationPlatform
+platforms_zm.detect_mode_2=contains
+platforms_zm.detect_value_2=zm_docker
+platforms_zm.log_path=/var/log/asseco
+
+# ==========================================================
+# REGUŁA: platforms
+# ==========================================================
+platforms.output=update_platforms.sh
+platforms.template=templates/template_update_platforms.sh
+platforms.version=1.0.0
+platforms.detect_mode=prefix
+platforms.detect_value=IntegrationPlatform
+platforms.log_path={{APP_DIR}}/apache-tomcat/logs
+
+# ==========================================================
+# REGUŁA: wildfly
+# ==========================================================
+wildfly.output=update_wildfly.sh
+wildfly.template=templates/template_update_wildfly.sh
+wildfly.version=1.0.0
+wildfly.detect_mode=prefix
+wildfly.detect_value=Wildfly
+wildfly.log_path={{APP_DIR}}/wildfly-26.0.1.Final/standalone/log
+
+# ==========================================================
+# REGUŁA: bk
+# ==========================================================
+bk.output=update_bk.sh
+bk.template=templates/template_update_bk.sh
+bk.version=1.0.0
+bk.detect_mode=contains
+bk.detect_value=BK,Bank_krwi,Bank_Krwi
+bk.log_path=/var/log/asseco
+
+# ==========================================================
+# REGUŁA: amdx
+# ==========================================================
+amdx.output=update_amdx.sh
+amdx.template=templates/template_update_amdx.sh
+amdx.version=1.0.0
+amdx.detect_mode=contains
+amdx.detect_value=amdx
+amdx.log_path=/var/log/asseco
+
+# ==========================================================
+# REGUŁA: mpi
+# ==========================================================
+mpi.output=update_mpi.sh
+mpi.template=templates/template_update_mpi.sh
+mpi.version=1.0.0
+mpi.detect_mode=contains
+mpi.detect_value=mpi
+mpi.log_path=/var/log/asseco
+
+# ==========================================================
+# REGUŁA: p1adapter
+# ==========================================================
+p1adapter.output=update_p1adapter.sh
+p1adapter.template=templates/template_update_p1adapter.sh
+p1adapter.version=1.0.0
+p1adapter.detect_mode=contains
+p1adapter.detect_value=p1adapter
+p1adapter.log_path=/var/log/asseco
