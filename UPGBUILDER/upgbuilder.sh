@@ -18,10 +18,6 @@ BACKUP_DIR="${MODULE_DIR}/backup"
 OUTPUT_DIR="${HOME}/UPG"
 VERSION_FILE="${MODULE_DIR}/.upgbuilder_version"
 
-# Uzupełnij pod swój realny raw URL repo/tag/branch:
-GITHUB_BASE_URL="https://raw.githubusercontent.com/daroitgo/itgo-scripts/main/UPGbuilder"
-MAP_URL="${GITHUB_BASE_URL}/upgbuilder.map"
-
 MODE="${1:-normal}"
 
 # Kolejność ma znaczenie.
@@ -37,7 +33,13 @@ RULE_ORDER=(
 
 # -------------------- GLOBALS --------------------
 
-UPGBUILDER_VERSION="0.0.1"
+UPGBUILDER_VERSION="0.0.2"
+RAW_REPO_BASE="https://raw.githubusercontent.com/daroitgo/itgo-scripts"
+
+GITHUB_TAG=""
+GITHUB_BASE_URL=""
+MAP_URL=""
+
 SCAN_ROOTS=()
 
 declare -A MAP_DATA
@@ -81,10 +83,26 @@ ensure_dirs() {
   mkdir -p "$MODULE_DIR" "$TMP_DIR" "$BACKUP_DIR" "$OUTPUT_DIR"
 }
 
+set_github_urls() {
+  GITHUB_TAG="upgbuilder-${UPGBUILDER_VERSION}"
+  GITHUB_BASE_URL="${RAW_REPO_BASE}/${GITHUB_TAG}/UPGBUILDER"
+  MAP_URL="${GITHUB_BASE_URL}/upgbuilder.map"
+}
+
 load_version() {
   if [[ -f "$VERSION_FILE" ]]; then
-    UPGBUILDER_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+    local file_version
+    file_version="$(tr -d '[:space:]' < "$VERSION_FILE")"
+
+    if [[ "$file_version" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+      UPGBUILDER_VERSION="$file_version"
+    else
+      log "[WARN] Nieprawidłowa zawartość $VERSION_FILE: $file_version"
+      log "[WARN] Używam wersji wbudowanej: $UPGBUILDER_VERSION"
+    fi
   fi
+
+  set_github_urls
 }
 
 download_file() {
@@ -313,32 +331,32 @@ build_special_steps() {
     if [[ "$base" == "IntegrationPlatform_ADM" ]]; then
       ADM_DIR="$dir"
       ADM_NEW_DIR="${dir}_NEW"
-      ADM_JRXML_STEP="$(cat <<EOF
+      ADM_JRXML_STEP="$(cat <<'EOF'
 step_copy_adm_jrxml() {
   echo "[0a] Kopiowanie plików JRXML z ADM -> ADM_NEW (przed zmianami)..."
 
   local JRXML_SRC_DIR JRXML_DST_DIR
-  JRXML_SRC_DIR="\${ADM_DIR}/apache-tomcat/webapps/DocumentationArchive/WEB-INF/classes"
-  JRXML_DST_DIR="\${ADM_NEW_DIR}/apache-tomcat/webapps/DocumentationArchive/WEB-INF/classes"
+  JRXML_SRC_DIR="${ADM_DIR}/apache-tomcat/webapps/DocumentationArchive/WEB-INF/classes"
+  JRXML_DST_DIR="${ADM_NEW_DIR}/apache-tomcat/webapps/DocumentationArchive/WEB-INF/classes"
 
   local JRXML_FILES=(
     "AD_spis_zdawczo_odbiorczy_zm4.jrxml"
     "AD_spis_zdawczo_odbiorczy_zm6.jrxml"
   )
 
-  if [[ -d "\$JRXML_SRC_DIR" ]]; then
-    mkdir -p "\$JRXML_DST_DIR"
+  if [[ -d "$JRXML_SRC_DIR" ]]; then
+    mkdir -p "$JRXML_DST_DIR"
     local f
-    for f in "\${JRXML_FILES[@]}"; do
-      if [[ -f "\$JRXML_SRC_DIR/\$f" ]]; then
-        echo "    cp \$JRXML_SRC_DIR/\$f -> \$JRXML_DST_DIR/"
-        cp -f "\$JRXML_SRC_DIR/\$f" "\$JRXML_DST_DIR/"
+    for f in "${JRXML_FILES[@]}"; do
+      if [[ -f "$JRXML_SRC_DIR/$f" ]]; then
+        echo "    cp $JRXML_SRC_DIR/$f -> $JRXML_DST_DIR/"
+        cp -f "$JRXML_SRC_DIR/$f" "$JRXML_DST_DIR/"
       else
-        echo "    [WARN] Brak pliku źródłowego: \$JRXML_SRC_DIR/\$f (pomijam)"
+        echo "    [WARN] Brak pliku źródłowego: $JRXML_SRC_DIR/$f (pomijam)"
       fi
     done
   else
-    echo "    [WARN] Brak katalogu źródłowego: \$JRXML_SRC_DIR (pomijam kopię JRXML)"
+    echo "    [WARN] Brak katalogu źródłowego: $JRXML_SRC_DIR (pomijam kopię JRXML)"
   fi
 }
 
@@ -432,7 +450,6 @@ render_template() {
 
   cp "$template_file" "$tmp_out"
 
-  # Proste placeholdery jednolinijkowe
   sed -i \
     -e "s/{{UPGBUILDER_VERSION}}/$(escape_sed_repl "$UPGBUILDER_VERSION")/g" \
     -e "s/{{GENERATED_AT}}/$(escape_sed_repl "$(date '+%F %T')")/g" \
@@ -448,10 +465,11 @@ render_template() {
     -e "s/{{ADM_NEW_DIR}}/$(escape_sed_repl "$ADM_NEW_DIR")/g" \
     "$tmp_out"
 
-  # Blok wielolinijkowy ADM
   if grep -q '{{ADM_JRXML_STEP}}' "$tmp_out"; then
     python3 - "$tmp_out" "$ADM_JRXML_STEP" <<'PY'
-import sys, pathlib
+import sys
+import pathlib
+
 path = pathlib.Path(sys.argv[1])
 replacement = sys.argv[2]
 text = path.read_text()
