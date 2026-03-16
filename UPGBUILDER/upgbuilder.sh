@@ -37,7 +37,7 @@ RULE_ORDER=(
 
 # -------------------- GLOBALS --------------------
 
-UPGBUILDER_VERSION="0.0.0"
+UPGBUILDER_VERSION="0.0.1"
 SCAN_ROOTS=()
 
 declare -A MAP_DATA
