@@ -6,8 +6,8 @@ set -euo pipefail
 # ==========================================================
 # Builds or updates local update_*.sh helpers based on:
 # - detection rules from GitHub map
-# - templates from GitHub templates/
-# - local server paths detected in /srv and /opt
+# - templates from GitHub
+# - local server paths detected from scan roots in map
 # ==========================================================
 
 # -------------------- CONFIG --------------------
@@ -33,7 +33,7 @@ RULE_ORDER=(
 
 # -------------------- GLOBALS --------------------
 
-UPGBUILDER_VERSION="0.0.3"
+UPGBUILDER_VERSION="0.0.4"
 RAW_REPO_BASE="https://raw.githubusercontent.com/daroitgo/itgo-scripts"
 
 GITHUB_TAG=""
@@ -129,6 +129,26 @@ lower() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
 
+array_clear_by_name() {
+  local arr_name="$1"
+  eval "$arr_name=()"
+}
+
+array_append_by_name() {
+  local arr_name="$1"
+  local value="$2"
+  local value_q
+
+  printf -v value_q '%q' "$value"
+  eval "$arr_name+=($value_q)"
+}
+
+array_copy_by_name() {
+  local src_name="$1"
+  local dst_name="$2"
+  eval "$dst_name=(\"\${${src_name}[@]}\")"
+}
+
 read_map() {
   local map_file="$1"
   local line key value
@@ -153,14 +173,26 @@ read_map() {
 
 split_csv() {
   local input="$1"
-  local -n out_arr="$2"
+  local out_name="$2"
   local old_ifs="$IFS"
-  IFS=',' read -r -a out_arr <<< "$input"
+  local -a tmp_arr=()
+  local item
+
+  IFS=',' read -r -a tmp_arr <<< "$input"
   IFS="$old_ifs"
+
+  array_clear_by_name "$out_name"
+
+  for item in "${tmp_arr[@]}"; do
+    item="$(trim "$item")"
+    [[ -z "$item" ]] && continue
+    array_append_by_name "$out_name" "$item"
+  done
 }
 
 scan_dirs() {
   local roots_csv root dir base
+
   roots_csv="${MAP_DATA[scan.roots]}"
   split_csv "$roots_csv" SCAN_ROOTS
 
@@ -190,6 +222,8 @@ match_name() {
   local value="$2"
   local name="$3"
   local v lowered_name item
+  local -a items=()
+
   lowered_name="$(lower "$name")"
 
   case "$mode" in
@@ -197,7 +231,6 @@ match_name() {
       [[ "$name" == "$value"* ]]
       ;;
     contains)
-      local items=()
       split_csv "$value" items
       for item in "${items[@]}"; do
         item="$(trim "$item")"
@@ -221,15 +254,15 @@ match_name() {
 find_matches_for_condition() {
   local mode="$1"
   local value="$2"
-  local -n out_arr="$3"
+  local out_name="$3"
   local dir name
 
-  out_arr=()
+  array_clear_by_name "$out_name"
 
   for dir in "${FOUND_DIRS[@]}"; do
     name="$(basename "$dir")"
     if match_name "$mode" "$value" "$name"; then
-      out_arr+=("$dir")
+      array_append_by_name "$out_name" "$dir"
     fi
   done
 }
@@ -279,8 +312,12 @@ evaluate_rule() {
 
 assign_rule_paths() {
   local rule="$1"
-  local -n hits1_ref="$2"
-  local -n hits2_ref="$3"
+  local hits1_name="$2"
+  local hits2_name="$3"
+  local -a hits1_ref=() hits2_ref=()
+
+  array_copy_by_name "$hits1_name" hits1_ref
+  array_copy_by_name "$hits2_name" hits2_ref
 
   APP_DIR=""
   PLATFORM_DIR=""
@@ -317,8 +354,11 @@ assign_rule_paths() {
 
 build_special_steps() {
   local rule="$1"
-  local -n hits1_ref="$2"
+  local hits1_name="$2"
   local dir base
+  local -a hits1_ref=()
+
+  array_copy_by_name "$hits1_name" hits1_ref
 
   ADM_DIR=""
   ADM_NEW_DIR=""
@@ -447,6 +487,7 @@ render_template() {
   local template_file="$1"
   local output_file="$2"
   local tmp_out="$TMP_DIR/rendered.tmp"
+  local rendered_text
 
   cp "$template_file" "$tmp_out"
 
@@ -466,16 +507,9 @@ render_template() {
     "$tmp_out"
 
   if grep -q '{{ADM_JRXML_STEP}}' "$tmp_out"; then
-    python3 - "$tmp_out" "$ADM_JRXML_STEP" <<'PY'
-import sys
-import pathlib
-
-path = pathlib.Path(sys.argv[1])
-replacement = sys.argv[2]
-text = path.read_text()
-text = text.replace("{{ADM_JRXML_STEP}}", replacement)
-path.write_text(text)
-PY
+    rendered_text="$(cat "$tmp_out")"
+    rendered_text="${rendered_text//\{\{ADM_JRXML_STEP\}\}/$ADM_JRXML_STEP}"
+    printf '%s' "$rendered_text" > "$tmp_out"
   fi
 
   mv "$tmp_out" "$output_file"
@@ -484,6 +518,7 @@ PY
 
 print_detect_summary() {
   local dir
+
   log "[DETECT] Scan roots: ${MAP_DATA[scan.roots]}"
   log
 
@@ -532,11 +567,12 @@ print_detect_summary() {
 
 print_generate_summary() {
   local output_file="$1"
+  local dir
+
   log
   log "UPGbuilder result"
   log "-----------------"
   log "Detected:"
-  local dir
   for dir in "${MATCHED_PATHS[@]}"; do
     log "- $dir"
   done
