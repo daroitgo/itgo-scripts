@@ -10,7 +10,6 @@ set -euo pipefail 2>/dev/null || set -eu
 
 # ==========================================================
 # ITGO Master Installer
-# Version: 1.1.1
 #
 # HOME structure (itgo):
 #   ~/UPG
@@ -38,10 +37,10 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
+MASTER_VERSION="1.1.3"
 
-MASTER_VERSION="1.1.2"
-
-STATUS_VERSION="3.12.9"
+# >>> AUTO-MODULE-VERSIONS START >>>
+STATUS_VERSION="3.12.10"
 CLEANUP_VERSION="1.0.2"
 TSEQ_VERSION="3.12.1"
 DOWNLOADER_APP_VERSION="1.0.1"
@@ -57,6 +56,7 @@ CLEANUP_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/cl
 TSEQ_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/tseq-${TSEQ_VERSION}/TSEQ/tseq_installer_public.sh"
 DOWNLOADER_APP_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/downloader_app-${DOWNLOADER_APP_VERSION}/DOWNLOADER_APP/upg_installer.sh"
 UPGBUILDER_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/upgbuilder-${UPGBUILDER_VERSION}/UPGBUILDER/upgbuilder.sh"
+# <<< AUTO-MODULE-VERSIONS END <<<
 
 TMP_LOG="/tmp/itgo-master-install.$(date +%Y%m%d_%H%M%S).log"
 
