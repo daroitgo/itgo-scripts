@@ -39,12 +39,13 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
 
-MASTER_VERSION="1.1.1"
+MASTER_VERSION="1.1.2"
 
 STATUS_VERSION="3.12.9"
 CLEANUP_VERSION="1.0.2"
 TSEQ_VERSION="3.12.1"
 DOWNLOADER_APP_VERSION="1.0.1"
+UPGBUILDER_VERSION="0.0.3"
 
 TARGET_USER="${1:-itgo}"
 
@@ -55,6 +56,7 @@ STATUS_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/sta
 CLEANUP_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/cleanup-${CLEANUP_VERSION}/CLEANUP/cleanup_installer_public.sh"
 TSEQ_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/tseq-${TSEQ_VERSION}/TSEQ/tseq_installer_public.sh"
 DOWNLOADER_APP_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/downloader_app-${DOWNLOADER_APP_VERSION}/DOWNLOADER_APP/upg_installer.sh"
+UPGBUILDER_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/upgbuilder-${UPGBUILDER_VERSION}/UPGBUILDER/upgbuilder.sh"
 
 TMP_LOG="/tmp/itgo-master-install.$(date +%Y%m%d_%H%M%S).log"
 
@@ -143,6 +145,7 @@ start_final_logging_if_possible() {
   echo "[$(ts)]   CLEANUP       : $CLEANUP_VERSION"
   echo "[$(ts)]   TSEQ          : $TSEQ_VERSION"
   echo "[$(ts)]   DOWNLOADER_APP: $DOWNLOADER_APP_VERSION"
+  echo "[$(ts)]   UPGBUILDER    : $UPGBUILDER_VERSION"
 
   if [[ -f "$TMP_LOG" ]]; then
     echo "[$(ts)] --- pre-log (from $TMP_LOG) ---"
@@ -427,6 +430,37 @@ install_downloader_app_script() {
   echo "[$(ts)]   usage  : dwupg"
 }
 
+install_upgbuilder_script() {
+  local src="${1:?}"
+  local app_dir="$UTILITY_DIR/UPGbuilder"
+  local dst="$app_dir/upgbuilder.sh"
+  local link="/usr/local/bin/upgbuilder"
+  local version_file="$app_dir/.upgbuilder_version"
+
+  echo "[$(ts)] ACTION: install upgbuilder into $app_dir"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$app_dir"
+
+  install -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$src" "$dst"
+
+  printf "%s\n" "$UPGBUILDER_VERSION" > "$version_file"
+  chown "$TARGET_USER:$TARGET_USER" "$version_file" 2>/dev/null || true
+  chmod 0644 "$version_file" 2>/dev/null || true
+
+  if [[ -L "$link" || -e "$link" ]]; then
+    echo "[$(ts)] ACTION: remove existing $link"
+    rm -f "$link"
+  fi
+
+  ln -s "$dst" "$link"
+  chmod 0755 "$dst" 2>/dev/null || true
+
+  echo "[$(ts)] OK: upgbuilder installed:"
+  echo "[$(ts)]   script : $dst"
+  echo "[$(ts)]   symlink: $link"
+  echo "[$(ts)]   verfile: $version_file"
+  echo "[$(ts)]   usage  : upgbuilder"
+}
+
 cleanup_downloaded_installers() {
   if [[ -d "$TMP_DIR" ]]; then
     if prompt_yn "Usunąć pobrane instalery (*.sh) z $TMP_DIR?" "Y"; then
@@ -591,6 +625,7 @@ main() {
   local cleanup_sh="$TMP_DIR/cleanup_installer_public.sh"
   local tseq_sh="$TMP_DIR/tseq_installer_public.sh"
   local downloader_app_sh="$TMP_DIR/upg_installer.sh"
+  local upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
 
   section "SEKCJA 4/6 - MODUŁY CORE"
   if prompt_yn "MODUŁ: Server-Status (systemd + /usr/local + /var/cache)?" "Y"; then
@@ -655,6 +690,38 @@ main() {
     echo "[$(ts)] OK: DOWNLOADER_APP done."
   else
     echo "[$(ts)] SKIP: DOWNLOADER_APP."
+  fi
+
+  if prompt_yn "MODUŁ: UPGbuilder (zainstalować ~/UTILITY/UPGbuilder/upgbuilder.sh i symlink /usr/local/bin/upgbuilder)?" "Y"; then
+    ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+
+    if ! have_user; then
+      echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+      exit 1
+    fi
+
+    ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+    [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+    UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+    TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+
+    [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+    [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+
+    download_to_tmp "$UPGBUILDER_URL" "$upgbuilder_sh"
+    install_upgbuilder_script "$upgbuilder_sh"
+
+    if prompt_yn "Uruchomić teraz: upgbuilder --detect jako $TARGET_USER?" "Y"; then
+      echo "[$(ts)] RUN(itgo): sudo -u $TARGET_USER /usr/local/bin/upgbuilder --detect"
+      sudo -u "$TARGET_USER" /usr/local/bin/upgbuilder --detect
+    else
+      echo "[$(ts)] SKIP: upgbuilder --detect."
+    fi
+
+    echo "[$(ts)] OK: UPGbuilder done."
+  else
+    echo "[$(ts)] SKIP: UPGbuilder."
   fi
 
   section "SEKCJA 6/6 - PORZĄDKI KOŃCOWE"
