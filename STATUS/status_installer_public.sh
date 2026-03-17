@@ -4,9 +4,9 @@ set -o pipefail 2>/dev/null || true
 
 # ==========================================================
 # server-status installer
-# Version: 3.12.9
+# Version: 3.12.10
 # Usage:
-#   sudo bash status_installer_3.12.9.sh itgo
+#   sudo bash status_installer_3.12.10.sh itgo
 #
 # Install:
 #   <HOME>/UTILITY/STATUS/
@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.9"
+VERSION="3.12.10"
 TARGET_USER="${1:-itgo}"
 
 CACHE_DIR="/var/cache/server-status"
@@ -683,21 +683,25 @@ module_state() {
 status_vf="$HOME/UTILITY/STATUS/.status_installer_version"
 tseq_vf="$HOME/UTILITY/TSEQ/.tseq_version"
 downloader_vf="$HOME/UTILITY/DOWNLOADER_APP/.downloader_version"
+upgbuilder_vf="$HOME/UTILITY/UPGbuilder/.upgbuilder_version"
 upg_cleanup_vf="$HOME/UTILITY/UPG_CLEANUP/.upg_cleanup_version"
 
 status_installed="$(module_state "$status_vf")"
 tseq_installed="$(module_state "$tseq_vf")"
 downloader_installed="$(module_state "$downloader_vf")"
+upgbuilder_installed="$(module_state "$upgbuilder_vf")"
 upg_cleanup_installed="$(module_state "$upg_cleanup_vf")"
 
 inst_ver="$(read_version_file "$status_vf")"
 tseq_ver="$(read_version_file "$tseq_vf")"
 downloader_ver="$(read_version_file "$downloader_vf")"
+upgbuilder_ver="$(read_version_file "$upgbuilder_vf")"
 upg_cleanup_ver="$(read_version_file "$upg_cleanup_vf")"
 
 [[ -n "${inst_ver:-}" ]] || inst_ver="UNKNOWN"
 [[ -n "${tseq_ver:-}" ]] || tseq_ver="UNKNOWN"
 [[ -n "${downloader_ver:-}" ]] || downloader_ver="UNKNOWN"
+[[ -n "${upgbuilder_ver:-}" ]] || upgbuilder_ver="UNKNOWN"
 [[ -n "${upg_cleanup_ver:-}" ]] || upg_cleanup_ver="UNKNOWN"
 
 upg_cleanup_hook="NO"
@@ -751,6 +755,7 @@ printf "%-12s %-5s %s\n" "StatusInst" "${status_installed:-NO}" "${inst_ver:-UNK
 printf "%-12s %-5s %s\n" "UPGclean"   "${upg_cleanup_installed:-NO}" "${upg_cleanup_ver:-UNKNOWN} (bashrc:${upg_cleanup_hook})"
 printf "%-12s %-5s %s\n" "TSEQ"       "${tseq_installed:-NO}" "${tseq_ver:-UNKNOWN}"
 printf "%-12s %-5s %s\n" "Downloader" "${downloader_installed:-NO}" "${downloader_ver:-UNKNOWN}"
+printf "%-12s %-5s %s\n" "UPGbuilder" "${upgbuilder_installed:-NO}" "${upgbuilder_ver:-UNKNOWN}"
 
 echo
 echo "== FIREWALL (permanent) =="
