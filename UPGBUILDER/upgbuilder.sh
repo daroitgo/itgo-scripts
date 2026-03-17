@@ -33,7 +33,7 @@ RULE_ORDER=(
 
 # -------------------- GLOBALS --------------------
 
-UPGBUILDER_VERSION="0.0.4"
+UPGBUILDER_VERSION="0.0.5"
 RAW_REPO_BASE="https://raw.githubusercontent.com/daroitgo/itgo-scripts"
 
 GITHUB_TAG=""
@@ -143,10 +143,26 @@ array_append_by_name() {
   eval "$arr_name+=($value_q)"
 }
 
+array_length_by_name() {
+  local arr_name="$1"
+  local len
+
+  eval 'len=${#'"$arr_name"'[@]}'
+  printf '%s\n' "$len"
+}
+
 array_copy_by_name() {
   local src_name="$1"
   local dst_name="$2"
-  eval "$dst_name=(\"\${${src_name}[@]}\")"
+  local len i item
+
+  array_clear_by_name "$dst_name"
+  len="$(array_length_by_name "$src_name")"
+
+  for ((i=0; i<len; i++)); do
+    eval 'item=${'"$src_name"'[$i]}'
+    array_append_by_name "$dst_name" "$item"
+  done
 }
 
 read_map() {
