@@ -37,14 +37,14 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.1"
+MASTER_VERSION="1.2.3"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.10"
 CLEANUP_VERSION="1.0.2"
 TSEQ_VERSION="3.12.1"
 DOWNLOADER_APP_VERSION="1.0.1"
-UPGBUILDER_VERSION="0.1.0"
+UPGBUILDER_VERSION="0.1.1"
 
 TARGET_USER="${1:-itgo}"
 
@@ -57,6 +57,26 @@ TSEQ_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/tseq-
 DOWNLOADER_APP_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/downloader_app-${DOWNLOADER_APP_VERSION}/DOWNLOADER_APP/upg_installer.sh"
 UPGBUILDER_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/upgbuilder-${UPGBUILDER_VERSION}/UPGBUILDER/upgbuilder.sh"
 # <<< AUTO-MODULE-VERSIONS END <<<
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_DIR="${SOURCE_DIR:-}"
+
+if [[ -z "$SOURCE_DIR" && -d "$SCRIPT_DIR/../STATUS" && -d "$SCRIPT_DIR/../UPGBUILDER" ]]; then
+  SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+
+OFFLINE_MODE="0"
+if [[ -n "$SOURCE_DIR" ]]; then
+  OFFLINE_MODE="1"
+fi
+
+STATUS_LOCAL_PATH="${SOURCE_DIR}/STATUS/status_installer_public.sh"
+CLEANUP_LOCAL_PATH="${SOURCE_DIR}/CLEANUP/cleanup_installer_public.sh"
+TSEQ_LOCAL_PATH="${SOURCE_DIR}/TSEQ/tseq_installer_public.sh"
+DOWNLOADER_APP_LOCAL_PATH="${SOURCE_DIR}/DOWNLOADER_APP/upg_installer.sh"
+UPGBUILDER_LOCAL_PATH="${SOURCE_DIR}/UPGBUILDER/upgbuilder.sh"
+UPGBUILDER_LOCAL_MAP="${SOURCE_DIR}/UPGBUILDER/upgbuilder.map"
+UPGBUILDER_LOCAL_TEMPLATE_DIR="${SOURCE_DIR}/UPGBUILDER/template"
 
 TMP_LOG="/tmp/itgo-master-install.$(date +%Y%m%d_%H%M%S).log"
 
