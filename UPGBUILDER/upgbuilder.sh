@@ -33,7 +33,7 @@ RULE_ORDER=(
 
 # -------------------- GLOBALS --------------------
 
-UPGBUILDER_VERSION="0.0.5"
+UPGBUILDER_VERSION="0.0.6"
 RAW_REPO_BASE="https://raw.githubusercontent.com/daroitgo/itgo-scripts"
 
 GITHUB_TAG=""

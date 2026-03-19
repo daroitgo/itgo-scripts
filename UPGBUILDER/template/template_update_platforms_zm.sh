@@ -6,7 +6,7 @@
 # ==========================================================
 # UPGBUILDER_VERSION={{UPGBUILDER_VERSION}}
 # TEMPLATE_NAME=template_update_platforms_zm.sh
-# TEMPLATE_VERSION=1.0.0
+# TEMPLATE_VERSION=1.1.0
 # RULE_NAME=platforms_zm
 # GENERATED_AT={{GENERATED_AT}}
 # GENERATED_HOST={{HOSTNAME}}
@@ -15,8 +15,16 @@
 
 set -euo pipefail
 
+UPGBUILDER_VERSION="{{UPGBUILDER_VERSION}}"
+TEMPLATE_NAME="template_update_platforms_zm.sh"
+TEMPLATE_VERSION="1.1.0"
+UPDATER_VERSION="${TEMPLATE_VERSION}"
+RULE_NAME="platforms_zm"
+TARGET_USER="{{TARGET_USER}}"
+
 BACKUP_DIR="/home/itgo/BACKUP"
 SRV_DIR="/srv"
+OPT_DIR="/opt"
 
 UPG_DIR="/home/itgo/UPG/ZM"
 
@@ -34,13 +42,18 @@ mkdir -p "${RUN_LOG_DIR}"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "========================================================================"
-echo "[INFO] Start skryptu: $(basename "$0")"
-echo "[INFO] Log: $LOG_FILE"
-echo "[INFO] Data: $(date)"
-echo "[INFO] Użytkownik: $(whoami)"
-echo "[INFO] PLATFORM_DIR: ${PLATFORM_DIR}"
-echo "[INFO] ZM_DOCKER_DIR: ${ZM_DOCKER_DIR}"
-echo "[INFO] APP_LOG_DIR: ${APP_LOG_DIR}"
+echo "[INFO] Start skryptu      : $(basename "$0")"
+echo "[INFO] Wersja updatera   : ${UPDATER_VERSION}"
+echo "[INFO] Wersja template   : ${TEMPLATE_VERSION}"
+echo "[INFO] Wersja UPGbuilder : ${UPGBUILDER_VERSION}"
+echo "[INFO] Rule              : ${RULE_NAME}"
+echo "[INFO] Log               : ${LOG_FILE}"
+echo "[INFO] Data              : $(date '+%F %T')"
+echo "[INFO] Użytkownik        : $(whoami)"
+echo "[INFO] Host              : $(hostname)"
+echo "[INFO] PLATFORM_DIR      : ${PLATFORM_DIR}"
+echo "[INFO] ZM_DOCKER_DIR     : ${ZM_DOCKER_DIR}"
+echo "[INFO] APP_LOG_DIR       : ${APP_LOG_DIR}"
 echo "========================================================================"
 
 ask_continue() {
@@ -50,6 +63,27 @@ ask_continue() {
     echo "[ABORT] Przerwano na żądanie użytkownika."
     exit 1
   fi
+}
+
+ask_yes_no() {
+  local msg="$1"
+  local default="${2:-N}"
+  local prompt=""
+  local ans=""
+
+  if [[ "$default" =~ ^[TtYy]$ ]]; then
+    prompt="[T/n]"
+  else
+    prompt="[t/N]"
+  fi
+
+  read -r -p "${msg} ${prompt}: " ans
+
+  if [[ -z "$ans" ]]; then
+    [[ "$default" =~ ^[TtYy]$ ]] && return 0 || return 1
+  fi
+
+  [[ "$ans" =~ ^[TtYy]$ ]]
 }
 
 run_step() {
@@ -96,6 +130,14 @@ compose_has_flag() {
 
 have_numfmt() { command -v numfmt >/dev/null 2>&1; }
 
+format_duration() {
+  local total="${1:-0}"
+  local mm ss
+  mm=$((total / 60))
+  ss=$((total % 60))
+  printf "%02dm %02ds" "$mm" "$ss"
+}
+
 to_bytes() {
   local s="${1// /}"
   s="${s//,/\.}"
@@ -103,6 +145,7 @@ to_bytes() {
   num="$(echo "$s" | sed -E 's/^([0-9]+(\.[0-9]+)?).*/\1/')"
   unit="$(echo "$s" | sed -E 's/^[0-9]+(\.[0-9]+)?(.*)$/\2/' | tr '[:upper:]' '[:lower:]')"
   [[ -z "$num" ]] && return 1
+
   case "$unit" in
     b|"")      awk -v n="$num" 'BEGIN{printf "%.0f\n", n}' ;;
     kb|kib)    awk -v n="$num" 'BEGIN{printf "%.0f\n", n*1024}' ;;
@@ -122,11 +165,17 @@ bytes_to_human() {
   fi
 }
 
+bytes_to_mb() {
+  local b="${1:-0}"
+  awk -v n="$b" 'BEGIN{printf "%.1f", n/1024/1024}'
+}
+
 snapshot_compose_images() {
   local out
   if ! out="$("${COMPOSE_CMD[@]}" images 2>/dev/null)"; then
     return 0
   fi
+
   echo "$out" | awk '
     NR==1 {next}
     NF>=5 {
@@ -138,21 +187,22 @@ snapshot_compose_images() {
 calc_total_delta_bytes() {
   local before_file="$1"
   local after_file="$2"
-  awk -F'\\|' '
+
+  awk -F'[|]' '
     FNR==NR { before[$1]=$2; next }
     { after[$1]=$2 }
     END {
       for (k in after) {
         b=before[k];
         a=after[k];
-        if (a=="" ) continue;
+        if (a == "") continue;
         print k "|" b "|" a
       }
     }' "$before_file" "$after_file"
 }
 
 step_clear_logs() {
-  echo "[1] Czyszczenie logów Tomcata dla platformy..."
+  echo "[1/7] Czyszczenie logów Tomcata dla platformy..."
   if [[ -d "${PLATFORM_DIR}/apache-tomcat/logs" ]]; then
     rm -rf "${PLATFORM_DIR}/apache-tomcat/logs/"* || true
   else
@@ -178,36 +228,35 @@ TODAY_BK=""
 NEW_BACKUP=""
 
 step_prepare_backup() {
-  echo "[2] Przygotowanie katalogu backupu..."
+  echo "[2/7] Przygotowanie katalogu backupu..."
   mkdir -p "$BACKUP_DIR"
 
-  local oldest
-  oldest=$(ls -1dt "$BACKUP_DIR"/*/ 2>/dev/null | tail -n 1 || true)
-  if [[ -n "${oldest:-}" ]]; then
-    echo "    Usuwam najstarszy: $oldest"
-    rm -rf -- "$oldest"
+  mapfile -t TO_DEL < <(ls -1dt "${BACKUP_DIR}"/*/ 2>/dev/null | tail -n +3 || true)
+  if ((${#TO_DEL[@]})); then
+    printf '%s\0' "${TO_DEL[@]}" | xargs -0r rm -rf
+    echo "[INFO] Usunięto stare backupy: ${TO_DEL[*]}"
   else
-    echo "    Brak wcześniejszych katalogów backupu – nic do usunięcia."
+    echo "[INFO] Brak starych backupów do usunięcia."
   fi
 
   TODAY_BK="$(date +'%d%m%Y')"
-  NEW_BACKUP="$BACKUP_DIR/$TODAY_BK"
-  echo "    Tworzę: $NEW_BACKUP"
+  NEW_BACKUP="${BACKUP_DIR}/${TODAY_BK}"
+  echo "[INFO] Tworzę: ${NEW_BACKUP}"
   mkdir -p "$NEW_BACKUP"
 }
 
 step_move_platform_to_backup() {
-  echo "[3] Przenoszenie katalogu platformy do backupu..."
+  echo "[3/7] Przenoszenie katalogu platformy do backupu..."
   if [[ -z "${NEW_BACKUP:-}" ]]; then
     echo "[ERROR] Zmienna NEW_BACKUP nie jest ustawiona."
     return 1
   fi
 
   if [[ -d "$PLATFORM_DIR" ]]; then
-    echo "    mv $PLATFORM_DIR -> $NEW_BACKUP/"
+    echo "[INFO] mv ${PLATFORM_DIR} -> ${NEW_BACKUP}/"
     mv "$PLATFORM_DIR" "$NEW_BACKUP"/
   else
-    echo "    [WARN] Brak: $PLATFORM_DIR (pomijam)"
+    echo "[WARN] Brak: ${PLATFORM_DIR} (pomijam)"
   fi
 }
 
@@ -221,44 +270,59 @@ is_empty_src() {
 }
 
 step_sync_upg_to_zm() {
-  echo "[4] Synchronizacja $UPG_DIR -> $ZM_DOCKER_DIR ..."
+  echo "[4/7] Synchronizacja ${UPG_DIR} -> ${ZM_DOCKER_DIR} ..."
   sudo mkdir -p "$ZM_DOCKER_DIR"
 
   if is_empty_src; then
-    echo "[WARN] Źródło '$UPG_DIR' jest puste lub nie istnieje."
-    ask_continue "Kontynuować bez kopiowania z $UPG_DIR?"
+    echo "[WARN] Źródło '${UPG_DIR}' jest puste lub nie istnieje."
+    ask_continue "Kontynuować bez kopiowania z ${UPG_DIR}?"
     echo "[INFO] Pomijam kopiowanie, kontynuuję kolejne kroki."
     return 0
   fi
 
-  echo "    rsync -> $ZM_DOCKER_DIR/"
+  echo "[INFO] rsync -> ${ZM_DOCKER_DIR}/"
   sudo rsync -a --delete "$UPG_DIR"/ "$ZM_DOCKER_DIR"/
 }
 
 step_rename_new_dirs() {
-  echo "[5] Zmiana nazw katalogów *_NEW..."
+  echo "[5/7] Zmiana nazw katalogów *_NEW..."
+
   shopt -s nullglob
   local dir new_name
-  for dir in "$SRV_DIR"/*_NEW "$OPT_DIR"/*_NEW; do
-    [[ -d "$dir" ]] || continue
-    new_name="${dir%_NEW}"
-    echo "    $dir -> $new_name"
-    mv "$dir" "$new_name"
+  local roots=()
+
+  [[ -d "$SRV_DIR" ]] && roots+=("$SRV_DIR")
+  [[ -d "$OPT_DIR" ]] && roots+=("$OPT_DIR")
+
+  if ((${#roots[@]} == 0)); then
+    echo "[WARN] Brak katalogów bazowych do przeszukania (${SRV_DIR}, ${OPT_DIR})."
+    shopt -u nullglob
+    return 0
+  fi
+
+  for root in "${roots[@]}"; do
+    for dir in "${root}"/*_NEW; do
+      [[ -d "$dir" ]] || continue
+      new_name="${dir%_NEW}"
+      echo "[INFO] ${dir} -> ${new_name}"
+      mv "$dir" "$new_name"
+    done
   done
+
   shopt -u nullglob
 }
 
 step_set_permissions() {
-  echo "[6] Nadawanie uprawnień 775 dla katalogu platformy..."
+  echo "[6/7] Nadawanie uprawnień 775 dla katalogu platformy..."
   if [[ -d "$PLATFORM_DIR" ]]; then
     sudo chmod -R 775 "$PLATFORM_DIR"
   else
-    echo "[WARN] Brak katalogu po rename: $PLATFORM_DIR"
+    echo "[WARN] Brak katalogu po rename: ${PLATFORM_DIR}"
   fi
 }
 
 step_docker_cleanup_restart_and_pull() {
-  echo "[7] Docker: cleanup + restart + compose pull (w $ZM_DOCKER_DIR)"
+  echo "[7/7] Docker: akcje interaktywne + compose pull (w ${ZM_DOCKER_DIR})"
 
   command -v docker >/dev/null 2>&1 || {
     echo "[ERROR] 'docker' nie znaleziony w PATH." >&2
@@ -266,58 +330,90 @@ step_docker_cleanup_restart_and_pull() {
   }
 
   cd "$ZM_DOCKER_DIR" || {
-    echo "[ERROR] Nie mogę wejść do $ZM_DOCKER_DIR"
+    echo "[ERROR] Nie mogę wejść do ${ZM_DOCKER_DIR}"
     return 1
   }
 
   detect_compose
   echo "[INFO] Compose wykryty: ${COMPOSE_KIND} | ${COMPOSE_VER}"
 
-  echo "[INFO] Compose down: --rmi all --volumes --remove-orphans"
-  sudo "${COMPOSE_CMD[@]}" down --rmi all --volumes --remove-orphans || true
-
-  echo "[INFO] docker system prune -af"
-  sudo docker system prune -af || true
-
-  echo "[INFO] docker volume prune -f"
-  sudo docker volume prune -f || true
-
-  echo "[INFO] docker volume rm (wszystkie)"
-  sudo docker volume ls -q | xargs -r sudo docker volume rm || true
-
-  if command -v systemctl >/dev/null 2>&1; then
-    echo "[INFO] Restart docker: systemctl restart docker"
-    sudo systemctl restart docker
+  if ask_yes_no "Czy zatrzymać stack i usunąć kontenery/orphans z compose?" "N"; then
+    echo "[INFO] Compose down: --remove-orphans"
+    sudo "${COMPOSE_CMD[@]}" down --remove-orphans || true
   else
-    echo "[WARN] Brak systemctl – pomijam restart usługi docker."
+    echo "[INFO] Pominięto compose down."
   fi
 
-  local tmp_before="" tmp_after="" tmp_pairs="" pull_log=""
-  cleanup_tmp() {
-    [[ -n "$tmp_before" ]] && rm -f "$tmp_before"
-    [[ -n "$tmp_after"  ]] && rm -f "$tmp_after"
-    [[ -n "$tmp_pairs"  ]] && rm -f "$tmp_pairs"
-    [[ -n "$pull_log"   ]] && rm -f "$pull_log"
-  }
-  trap cleanup_tmp EXIT
+  if ask_yes_no "Czy wyczyścić zatrzymane kontenery Dockera (docker container prune -f)?" "N"; then
+    echo "[INFO] docker container prune -f"
+    sudo docker container prune -f || true
+  else
+    echo "[INFO] Pominięto czyszczenie kontenerów."
+  fi
 
+  if ask_yes_no "Czy wyczyścić nieużywane obrazy Dockera (docker image prune -af)?" "N"; then
+    echo "[INFO] docker image prune -af"
+    sudo docker image prune -af || true
+  else
+    echo "[INFO] Pominięto czyszczenie obrazów."
+  fi
+
+  if ask_yes_no "Czy wyczyścić nieużywane wolumeny Dockera (docker volume prune -f)?" "N"; then
+    echo "[INFO] docker volume prune -f"
+    sudo docker volume prune -f || true
+  else
+    echo "[INFO] Pominięto czyszczenie wolumenów."
+  fi
+
+  if ask_yes_no "Czy usunąć wszystkie wolumeny zwrócone przez 'docker volume ls -q'?" "N"; then
+    echo "[INFO] docker volume ls -q | xargs -r docker volume rm"
+    sudo docker volume ls -q | xargs -r sudo docker volume rm || true
+  else
+    echo "[INFO] Pominięto usuwanie wszystkich wolumenów."
+  fi
+
+  if ask_yes_no "Czy zrestartować usługę docker?" "N"; then
+    if command -v systemctl >/dev/null 2>&1; then
+      echo "[INFO] Restart docker: systemctl restart docker"
+      sudo systemctl restart docker
+    else
+      echo "[WARN] Brak systemctl – pomijam restart usługi docker."
+    fi
+  else
+    echo "[INFO] Pominięto restart dockera."
+  fi
+
+  if [[ ! -f "${ZM_DOCKER_DIR}/docker-compose.yml" && ! -f "${ZM_DOCKER_DIR}/compose.yml" ]]; then
+    echo "[WARN] Brak docker-compose.yml/compose.yml w ${ZM_DOCKER_DIR} – pomijam pull."
+    return 0
+  fi
+
+  local tmp_before="" tmp_after="" tmp_pairs="" pull_log="" services_log=""
   tmp_before="$(mktemp)"
   tmp_after="$(mktemp)"
   tmp_pairs="$(mktemp)"
+  pull_log="$(mktemp)"
+  services_log="$(mktemp)"
 
   snapshot_compose_images >"$tmp_before" || true
+  "${COMPOSE_CMD[@]}" config --services >"$services_log" 2>/dev/null || true
 
   local t0 t1 elapsed
   t0="$(date +%s)"
 
-  echo "[INFO] Pull (cichy jeśli dostępny)..."
+  echo "[INFO] Pull: ${COMPOSE_CMD[*]} pull (log techniczny schowany, na ekranie tylko podsumowanie)"
   if compose_has_flag pull --quiet; then
-    sudo "${COMPOSE_CMD[@]}" pull --quiet
+    if ! sudo "${COMPOSE_CMD[@]}" pull --quiet >"$pull_log" 2>&1; then
+      echo "[ERROR] Pull nieudany, log z pull poniżej:"
+      cat "$pull_log" >&2
+      rm -f "$tmp_before" "$tmp_after" "$tmp_pairs" "$pull_log" "$services_log"
+      return 1
+    fi
   else
-    pull_log="$(mktemp)"
     if ! sudo "${COMPOSE_CMD[@]}" pull >"$pull_log" 2>&1; then
       echo "[ERROR] Pull nieudany, log z pull poniżej:"
       cat "$pull_log" >&2
+      rm -f "$tmp_before" "$tmp_after" "$tmp_pairs" "$pull_log" "$services_log"
       return 1
     fi
   fi
@@ -329,11 +425,18 @@ step_docker_cleanup_restart_and_pull() {
 
   echo
   echo "---------------- PODSUMOWANIE PULL ----------------"
-  echo "[INFO] Czas pull: ${elapsed}s"
+  echo "[INFO] Czas pull: $(format_duration "$elapsed") (${elapsed}s)"
+
+  if [[ -s "$services_log" ]]; then
+    echo "[INFO] Serwisy objęte pull:"
+    sed 's/^/ - /' "$services_log"
+  else
+    echo "[WARN] Nie udało się pobrać listy serwisów z compose."
+  fi
 
   if [[ -s "$tmp_after" ]]; then
     echo "[INFO] Obrazy po pull:"
-    awk -F'\\|' '{printf " - %s (size: %s)\n", $1, $2}' "$tmp_after"
+    awk -F'[|]' '{printf " - %s (size lokalny: %s)\n", $1, $2}' "$tmp_after"
   else
     echo "[WARN] Nie udało się pobrać listy obrazów z compose."
   fi
@@ -350,11 +453,15 @@ step_docker_cleanup_restart_and_pull() {
         total_delta=$((total_delta + (abytes - bbytes)))
       fi
     done <"$tmp_pairs"
-    echo "[INFO] Szac. pobrano (przybliżenie): $(bytes_to_human "$total_delta")"
+
+    echo "[INFO] Szac. pobrano: $(bytes_to_human "$total_delta") (~$(bytes_to_mb "$total_delta") MB)"
+    echo "[INFO] Uwaga: to przybliżenie na podstawie różnicy rozmiarów lokalnych obrazów."
   else
     echo "[WARN] Brak danych do oszacowania pobranych MB."
   fi
   echo "---------------------------------------------------"
+
+  rm -f "$tmp_before" "$tmp_after" "$tmp_pairs" "$pull_log" "$services_log"
 }
 
 run_step "Czyszczenie logów"                               step_clear_logs
@@ -366,6 +473,7 @@ run_step "Ustawianie uprawnień 775"                        step_set_permissions
 run_step "Docker cleanup + restart + compose pull"         step_docker_cleanup_restart_and_pull
 
 echo
-echo "[INFO] Zakończono pomyślnie: $(date)"
-echo "[INFO] Log zapisany w: $LOG_FILE"
+echo "[INFO] Zakończono pomyślnie : $(date '+%F %T')"
+echo "[INFO] Wersja updatera      : ${UPDATER_VERSION}"
+echo "[INFO] Log zapisany w       : ${LOG_FILE}"
 echo "========================================================================"

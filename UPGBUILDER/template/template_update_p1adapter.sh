@@ -6,7 +6,7 @@
 # ==========================================================
 # UPGBUILDER_VERSION={{UPGBUILDER_VERSION}}
 # TEMPLATE_NAME=template_update_p1adapter.sh
-# TEMPLATE_VERSION=1.0.0
+# TEMPLATE_VERSION=1.1.0
 # RULE_NAME=p1adapter
 # GENERATED_AT={{GENERATED_AT}}
 # GENERATED_HOST={{HOSTNAME}}
@@ -14,6 +14,13 @@
 # ==========================================================
 
 set -euo pipefail
+
+UPGBUILDER_VERSION="{{UPGBUILDER_VERSION}}"
+TEMPLATE_NAME="template_update_p1adapter.sh"
+TEMPLATE_VERSION="1.1.0"
+UPDATER_VERSION="${TEMPLATE_VERSION}"
+RULE_NAME="p1adapter"
+TARGET_USER="{{TARGET_USER}}"
 
 SRC_DIR="{{DOCKER_DIR}}"
 UPG_DIR="/home/itgo/UPG/P1ADAPTER"
@@ -33,12 +40,18 @@ mkdir -p "${RUN_LOG_DIR}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
 echo "========================================================================"
-echo "[INFO] Start: $(date)"
-echo "[INFO] Log:   ${LOG_FILE}"
-echo "[INFO] User:  $(whoami)"
-echo "[INFO] SRC_DIR: ${SRC_DIR}"
-echo "[INFO] UPG_DIR: ${UPG_DIR}"
-echo "[INFO] APP_LOG_DIR: ${APP_LOG_DIR}"
+echo "[INFO] Start skryptu      : $(basename "$0")"
+echo "[INFO] Wersja updatera   : ${UPDATER_VERSION}"
+echo "[INFO] Wersja template   : ${TEMPLATE_VERSION}"
+echo "[INFO] Wersja UPGbuilder : ${UPGBUILDER_VERSION}"
+echo "[INFO] Rule              : ${RULE_NAME}"
+echo "[INFO] Log               : ${LOG_FILE}"
+echo "[INFO] Data              : $(date '+%F %T')"
+echo "[INFO] Użytkownik        : $(whoami)"
+echo "[INFO] Host              : $(hostname)"
+echo "[INFO] SRC_DIR           : ${SRC_DIR}"
+echo "[INFO] UPG_DIR           : ${UPG_DIR}"
+echo "[INFO] APP_LOG_DIR       : ${APP_LOG_DIR}"
 echo "========================================================================"
 
 ask_continue() {
@@ -48,6 +61,27 @@ ask_continue() {
     echo "[ABORT] Przerwano na żądanie użytkownika."
     exit 1
   fi
+}
+
+ask_yes_no() {
+  local msg="$1"
+  local default="${2:-N}"
+  local prompt=""
+  local ans=""
+
+  if [[ "$default" =~ ^[TtYy]$ ]]; then
+    prompt="[T/n]"
+  else
+    prompt="[t/N]"
+  fi
+
+  read -r -p "${msg} ${prompt}: " ans
+
+  if [[ -z "$ans" ]]; then
+    [[ "$default" =~ ^[TtYy]$ ]] && return 0 || return 1
+  fi
+
+  [[ "$ans" =~ ^[TtYy]$ ]]
 }
 
 run_step() {
@@ -94,6 +128,14 @@ compose_has_flag() {
 
 have_numfmt() { command -v numfmt >/dev/null 2>&1; }
 
+format_duration() {
+  local total="${1:-0}"
+  local mm ss
+  mm=$((total / 60))
+  ss=$((total % 60))
+  printf "%02dm %02ds" "$mm" "$ss"
+}
+
 to_bytes() {
   local s="${1// /}"
   s="${s//,/\.}"
@@ -123,6 +165,11 @@ bytes_to_human() {
   fi
 }
 
+bytes_to_mb() {
+  local b="${1:-0}"
+  awk -v n="$b" 'BEGIN{printf "%.1f", n/1024/1024}'
+}
+
 snapshot_compose_images() {
   local out
   if ! out="$("${COMPOSE_CMD[@]}" images 2>/dev/null)"; then
@@ -141,14 +188,14 @@ calc_total_delta_bytes() {
   local before_file="$1"
   local after_file="$2"
 
-  awk -F'\\|' '
+  awk -F'[|]' '
     FNR==NR { before[$1]=$2; next }
     { after[$1]=$2 }
     END {
       for (k in after) {
         b=before[k];
         a=after[k];
-        if (a=="" ) continue;
+        if (a == "") continue;
         print k "|" b "|" a
       }
     }' "$before_file" "$after_file"
@@ -197,7 +244,7 @@ step_deploy_upg() {
 }
 
 step_docker_cleanup_and_restart() {
-  echo "[5/6] Cleanup Dockera + restart usługi"
+  echo "[5/6] Docker: akcje interaktywne (kontenery / obrazy / wolumeny / restart)"
 
   command -v docker >/dev/null 2>&1 || { echo "[ERROR] 'docker' nie znaleziony w PATH." >&2; return 1; }
   detect_compose
@@ -205,76 +252,104 @@ step_docker_cleanup_and_restart() {
   echo "[INFO] Compose wykryty: ${COMPOSE_KIND} | ${COMPOSE_VER}"
   echo "[INFO] Katalog roboczy compose: ${SRC_DIR}"
 
-  cd "$SRC_DIR" || { echo "[ERROR] Nie mogę wejść do $SRC_DIR"; return 1; }
+  cd "$SRC_DIR" || { echo "[ERROR] Nie mogę wejść do ${SRC_DIR}"; return 1; }
 
   if [[ -f "${SRC_DIR}/docker-compose.yml" || -f "${SRC_DIR}/compose.yml" ]]; then
-    echo "[INFO] Compose down: --rmi all --volumes --remove-orphans"
-    sudo "${COMPOSE_CMD[@]}" down --rmi all --volumes --remove-orphans || true
+    if ask_yes_no "Czy zatrzymać stack i usunąć kontenery/orphans z compose?" "N"; then
+      echo "[INFO] Compose down: --remove-orphans"
+      sudo "${COMPOSE_CMD[@]}" down --remove-orphans || true
+    else
+      echo "[INFO] Pominięto compose down."
+    fi
   else
     echo "[WARN] Brak docker-compose.yml/compose.yml w ${SRC_DIR} – pomijam compose down."
   fi
 
-  echo "[INFO] docker system prune -af"
-  sudo docker system prune -af || true
-
-  echo "[INFO] docker volume prune -f"
-  sudo docker volume prune -f || true
-
-  echo "[INFO] docker volume rm (wszystkie)"
-  sudo docker volume ls -q | xargs -r sudo docker volume rm || true
-
-  if command -v systemctl >/dev/null 2>&1; then
-    echo "[INFO] Restart docker: systemctl restart docker"
-    sudo systemctl restart docker
+  if ask_yes_no "Czy wyczyścić zatrzymane kontenery Dockera (docker container prune -f)?" "N"; then
+    echo "[INFO] docker container prune -f"
+    sudo docker container prune -f || true
   else
-    echo "[WARN] Brak systemctl – pomijam restart usługi docker."
+    echo "[INFO] Pominięto czyszczenie kontenerów."
+  fi
+
+  if ask_yes_no "Czy wyczyścić nieużywane obrazy Dockera (docker image prune -af)?" "N"; then
+    echo "[INFO] docker image prune -af"
+    sudo docker image prune -af || true
+  else
+    echo "[INFO] Pominięto czyszczenie obrazów."
+  fi
+
+  if ask_yes_no "Czy wyczyścić nieużywane wolumeny Dockera (docker volume prune -f)?" "N"; then
+    echo "[INFO] docker volume prune -f"
+    sudo docker volume prune -f || true
+  else
+    echo "[INFO] Pominięto czyszczenie wolumenów."
+  fi
+
+  if ask_yes_no "Czy usunąć wszystkie wolumeny zwrócone przez 'docker volume ls -q'?" "N"; then
+    echo "[INFO] docker volume ls -q | xargs -r docker volume rm"
+    sudo docker volume ls -q | xargs -r sudo docker volume rm || true
+  else
+    echo "[INFO] Pominięto usuwanie wszystkich wolumenów."
+  fi
+
+  if ask_yes_no "Czy zrestartować usługę docker?" "N"; then
+    if command -v systemctl >/dev/null 2>&1; then
+      echo "[INFO] Restart docker: systemctl restart docker"
+      sudo systemctl restart docker
+    else
+      echo "[WARN] Brak systemctl – pomijam restart usługi docker."
+    fi
+  else
+    echo "[INFO] Pominięto restart dockera."
   fi
 }
 
 step_compose_pull_quiet_summary() {
-  echo "[6/6] Pull obrazów (bez spamowania loga) + podsumowanie"
+  echo "[6/6] Pull obrazów (bez spamu) + podsumowanie"
 
   command -v docker >/dev/null 2>&1 || { echo "[ERROR] 'docker' nie znaleziony w PATH." >&2; return 1; }
   detect_compose
-  cd "$SRC_DIR" || { echo "[ERROR] Nie mogę wejść do $SRC_DIR"; return 1; }
+  cd "$SRC_DIR" || { echo "[ERROR] Nie mogę wejść do ${SRC_DIR}"; return 1; }
 
   if [[ ! -f "${SRC_DIR}/docker-compose.yml" && ! -f "${SRC_DIR}/compose.yml" ]]; then
     echo "[WARN] Brak docker-compose.yml/compose.yml w ${SRC_DIR} – pomijam pull."
     return 0
   fi
 
-  local tmp_before="" tmp_after="" tmp_pairs="" pull_log=""
-  cleanup_tmp() {
-    [[ -n "$tmp_before" ]] && rm -f "$tmp_before"
-    [[ -n "$tmp_after"  ]] && rm -f "$tmp_after"
-    [[ -n "$tmp_pairs"  ]] && rm -f "$tmp_pairs"
-    [[ -n "$pull_log"   ]] && rm -f "$pull_log"
-  }
-  trap cleanup_tmp EXIT
-
+  local tmp_before="" tmp_after="" tmp_pairs="" pull_log="" services_log=""
   tmp_before="$(mktemp)"
   tmp_after="$(mktemp)"
   tmp_pairs="$(mktemp)"
+  pull_log="$(mktemp)"
+  services_log="$(mktemp)"
 
   snapshot_compose_images >"$tmp_before" || true
+  "${COMPOSE_CMD[@]}" config --services >"$services_log" 2>/dev/null || true
 
   local t0 t1 elapsed
   t0="$(date +%s)"
 
-  echo "[INFO] Pull: ${COMPOSE_CMD[*]} pull (tryb cichy jeśli dostępny)"
+  echo "[INFO] Pull: ${COMPOSE_CMD[*]} pull (log techniczny schowany, na ekranie tylko podsumowanie)"
   if compose_has_flag pull --quiet; then
-    sudo "${COMPOSE_CMD[@]}" pull --quiet
-  elif compose_has_flag pull --progress; then
-    pull_log="$(mktemp)"
-    sudo "${COMPOSE_CMD[@]}" pull --progress auto >"$pull_log" 2>&1 || {
+    if ! sudo "${COMPOSE_CMD[@]}" pull --quiet >"$pull_log" 2>&1; then
+      echo "[ERROR] Pull nieudany, log z pull poniżej:"
       cat "$pull_log" >&2
+      rm -f "$tmp_before" "$tmp_after" "$tmp_pairs" "$pull_log" "$services_log"
       return 1
-    }
+    fi
+  elif compose_has_flag pull --progress; then
+    if ! sudo "${COMPOSE_CMD[@]}" pull --progress auto >"$pull_log" 2>&1; then
+      echo "[ERROR] Pull nieudany, log z pull poniżej:"
+      cat "$pull_log" >&2
+      rm -f "$tmp_before" "$tmp_after" "$tmp_pairs" "$pull_log" "$services_log"
+      return 1
+    fi
   else
-    pull_log="$(mktemp)"
     if ! sudo "${COMPOSE_CMD[@]}" pull >"$pull_log" 2>&1; then
       echo "[ERROR] Pull nieudany, log z pull poniżej:"
       cat "$pull_log" >&2
+      rm -f "$tmp_before" "$tmp_after" "$tmp_pairs" "$pull_log" "$services_log"
       return 1
     fi
   fi
@@ -286,13 +361,20 @@ step_compose_pull_quiet_summary() {
 
   echo
   echo "---------------- PODSUMOWANIE PULL ----------------"
-  echo "[INFO] Czas pull: ${elapsed}s"
+  echo "[INFO] Czas pull: $(format_duration "$elapsed") (${elapsed}s)"
+
+  if [[ -s "$services_log" ]]; then
+    echo "[INFO] Serwisy objęte pull:"
+    sed 's/^/ - /' "$services_log"
+  else
+    echo "[WARN] Nie udało się pobrać listy serwisów z compose."
+  fi
 
   if [[ -s "$tmp_after" ]]; then
     echo "[INFO] Obrazy po pull:"
-    awk -F'\\|' '{printf " - %s (size: %s)\n", $1, $2}' "$tmp_after"
+    awk -F'[|]' '{printf " - %s (size lokalny: %s)\n", $1, $2}' "$tmp_after"
   else
-    echo "[WARN] Nie udało się pobrać listy obrazów z compose (brak podsumowania per-image)."
+    echo "[WARN] Nie udało się pobrać listy obrazów z compose."
   fi
 
   if [[ -s "$tmp_before" && -s "$tmp_after" ]]; then
@@ -309,21 +391,26 @@ step_compose_pull_quiet_summary() {
       fi
     done <"$tmp_pairs"
 
-    echo "[INFO] Szac. pobrano (przybliżenie): $(bytes_to_human "$total_delta")"
+    echo "[INFO] Szac. pobrano: $(bytes_to_human "$total_delta") (~$(bytes_to_mb "$total_delta") MB)"
+    echo "[INFO] Uwaga: to przybliżenie na podstawie różnicy rozmiarów lokalnych obrazów."
   else
     echo "[WARN] Brak danych do oszacowania pobranych MB."
   fi
+
   echo "---------------------------------------------------"
+
+  rm -f "$tmp_before" "$tmp_after" "$tmp_pairs" "$pull_log" "$services_log"
 }
 
 run_step "Czyszczenie logów aplikacyjnych"                 step_clear_logs
 run_step "Backup źródła P1ADAPTER"                         step_backup_src
 run_step "Czyszczenie starych backupów"                    step_cleanup_old_backups
 run_step "Deploy UPG -> katalog aplikacji"                 step_deploy_upg
-run_step "Docker: compose down + prune + restart"          step_docker_cleanup_and_restart
+run_step "Docker cleanup + restart (interaktywnie)"        step_docker_cleanup_and_restart
 run_step "Compose pull (bez spamu) + podsumowanie"         step_compose_pull_quiet_summary
 
 echo
-echo "[INFO] Zakończono: $(date)"
-echo "[INFO] Log: ${LOG_FILE}"
+echo "[INFO] Zakończono            : $(date '+%F %T')"
+echo "[INFO] Wersja updatera       : ${UPDATER_VERSION}"
+echo "[INFO] Log zapisany w        : ${LOG_FILE}"
 echo "========================================================================"
