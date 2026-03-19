@@ -6,19 +6,15 @@ Moduł `OFFLINE_BUNDLE` służy do budowania i publikacji paczki offline dla eko
 
 Paczka offline pozwala uruchomić instalację `MASTER` i modułów zależnych na serwerach bez dostępu do GitHub RAW i bez bezpośredniego dostępu do internetu.
 
-## Zawartość paczki
+## Zawartość modułu
 
-Archiwum `itgo-offline-bundle.tar.gz` zawiera:
+Katalog `OFFLINE_BUNDLE` zawiera:
 
-- `install.sh` - linuxowy launcher paczki offline
-- `bundle.manifest.env` - manifest wersji paczki
-- `checksums.sha256` - sumy kontrolne plików w bundle
-- `payload/MASTER`
-- `payload/STATUS`
-- `payload/CLEANUP`
-- `payload/TSEQ`
-- `payload/DOWNLOADER_APP`
-- `payload/UPGBUILDER` razem z `upgbuilder.map` i katalogiem `template`
+- `bundle.version` - wersję modułu offline bundle
+- `release.manifest.psd1` - manifest publikacji do PUBLIC
+- `README.md` - opis działania modułu
+- `CHANGELOG.md` - historia zmian modułu
+- `itgo-offline-bundle.tar.gz` - finalną paczkę offline do publikacji i użycia
 
 ## Budowanie paczki
 
@@ -26,13 +22,12 @@ Budowanie odbywa się z repo DEV poleceniem:
 
     .\build-offline-bundle.ps1
 
-Skrypt tworzy staging:
+Skrypt:
+- tworzy staging w katalogu tymczasowym systemu,
+- składa paczkę offline,
+- zapisuje finalne archiwum bezpośrednio do:
 
-    dist\itgo-offline-bundle\
-
-oraz finalne archiwum:
-
-    dist\itgo-offline-bundle.tar.gz
+    OFFLINE_BUNDLE\itgo-offline-bundle.tar.gz
 
 ## Użycie na serwerze offline
 
@@ -48,8 +43,31 @@ oraz finalne archiwum:
 
 Wersja modułu `OFFLINE_BUNDLE` jest utrzymywana w pliku:
 
-    OFFLINE_BUNDLE/bundle.version
+    OFFLINE_BUNDLE\bundle.version
 
-## Publikacja
+## Publikacja do PUBLIC
 
-Docelowo moduł `OFFLINE_BUNDLE` publikowany jest do repo PUBLIC tak samo jak pozostałe moduły release.
+Publikacja odbywa się tak samo jak dla pozostałych modułów:
+
+    .\release-dev-to-public.ps1 -Module OFFLINE_BUNDLE
+
+## Zalecany workflow po zmianach
+
+1. Zmienić odpowiednie moduły.
+2. Podbić wersje modułów, które realnie się zmieniły.
+3. Uzupełnić changelogi.
+4. Uruchomić:
+
+    .\sync-master-module-versions.ps1
+
+5. Uruchomić:
+
+    .\sync-release-matrix.ps1
+
+6. Zbudować paczkę:
+
+    .\build-offline-bundle.ps1
+
+7. Opublikować moduł offline bundle:
+
+    .\release-dev-to-public.ps1 -Module OFFLINE_BUNDLE
