@@ -37,14 +37,14 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.1.6"
+MASTER_VERSION="1.2.1"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.10"
 CLEANUP_VERSION="1.0.2"
 TSEQ_VERSION="3.12.1"
 DOWNLOADER_APP_VERSION="1.0.1"
-UPGBUILDER_VERSION="0.0.6"
+UPGBUILDER_VERSION="0.1.0"
 
 TARGET_USER="${1:-itgo}"
 
@@ -355,6 +355,11 @@ BEOF
 }
 
 ensure_wget() {
+  if [[ "$OFFLINE_MODE" == "1" ]]; then
+    echo "[$(ts)] OK: offline mode - wget not required."
+    return 0
+  fi
+
   if command -v wget >/dev/null 2>&1; then
     echo "[$(ts)] OK: wget present."
     return 0
@@ -378,11 +383,20 @@ ensure_wget() {
 }
 
 download_to_tmp() {
-  local url="${1:?}" out="${2:?}"
+  local url="${1:?}" out="${2:?}" local_src="${3:-}"
   [[ -d "$TMP_DIR" ]] || { echo "[$(ts)] ERROR: missing $TMP_DIR"; return 1; }
 
-  echo "[$(ts)] DOWNLOAD: $url -> $out"
-  wget -qO "$out" "$url"
+  if [[ "$OFFLINE_MODE" == "1" ]]; then
+    [[ -n "$local_src" ]] || { echo "[$(ts)] ERROR: local source not provided for offline mode."; return 1; }
+    [[ -f "$local_src" ]] || { echo "[$(ts)] ERROR: local source missing: $local_src"; return 1; }
+
+    echo "[$(ts)] COPY(local): $local_src -> $out"
+    cp "$local_src" "$out"
+  else
+    echo "[$(ts)] DOWNLOAD: $url -> $out"
+    wget -qO "$out" "$url"
+  fi
+
   chmod 0755 "$out"
   chown "$TARGET_USER:$TARGET_USER" "$out" 2>/dev/null || true
 }
@@ -436,11 +450,28 @@ install_upgbuilder_script() {
   local dst="$app_dir/upgbuilder.sh"
   local link="/usr/local/bin/upgbuilder"
   local version_file="$app_dir/.upgbuilder_version"
+  local map_dst="$app_dir/upgbuilder.map"
+  local template_dst="$app_dir/template"
 
   echo "[$(ts)] ACTION: install upgbuilder into $app_dir"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$app_dir"
 
   install -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$src" "$dst"
+
+  if [[ -f "$UPGBUILDER_LOCAL_MAP" ]]; then
+    echo "[$(ts)] ACTION: install local upgbuilder.map"
+    install -m 0644 -o "$TARGET_USER" -g "$TARGET_USER" "$UPGBUILDER_LOCAL_MAP" "$map_dst"
+  fi
+
+  if [[ -d "$UPGBUILDER_LOCAL_TEMPLATE_DIR" ]]; then
+    echo "[$(ts)] ACTION: install local template directory"
+    rm -rf "$template_dst"
+    cp -R "$UPGBUILDER_LOCAL_TEMPLATE_DIR" "$template_dst"
+    chown -R "$TARGET_USER:$TARGET_USER" "$template_dst" 2>/dev/null || true
+    find "$template_dst" -type d -exec chmod 0755 {} \; 2>/dev/null || true
+    find "$template_dst" -type f -exec chmod 0644 {} \; 2>/dev/null || true
+    find "$template_dst" -type f -name "*.sh" -exec chmod 0755 {} \; 2>/dev/null || true
+  fi
 
   printf "%s\n" "$UPGBUILDER_VERSION" > "$version_file"
   chown "$TARGET_USER:$TARGET_USER" "$version_file" 2>/dev/null || true
@@ -455,10 +486,12 @@ install_upgbuilder_script() {
   chmod 0755 "$dst" 2>/dev/null || true
 
   echo "[$(ts)] OK: upgbuilder installed:"
-  echo "[$(ts)]   script : $dst"
-  echo "[$(ts)]   symlink: $link"
-  echo "[$(ts)]   verfile: $version_file"
-  echo "[$(ts)]   usage  : upgbuilder"
+  echo "[$(ts)]   script   : $dst"
+  echo "[$(ts)]   map      : $map_dst"
+  echo "[$(ts)]   template : $template_dst"
+  echo "[$(ts)]   symlink  : $link"
+  echo "[$(ts)]   verfile  : $version_file"
+  echo "[$(ts)]   usage    : upgbuilder"
 }
 
 cleanup_downloaded_installers() {
@@ -630,7 +663,7 @@ main() {
   section "SEKCJA 4/6 - MODUŁY CORE"
   if prompt_yn "MODUŁ: Server-Status (systemd + /usr/local + /var/cache)?" "Y"; then
     ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
-    download_to_tmp "$STATUS_URL" "$status_sh"
+    download_to_tmp "$STATUS_URL" "$status_sh" "$STATUS_LOCAL_PATH"
     run_module_root "$status_sh" "$TARGET_USER"
     echo "[$(ts)] OK: Server-Status done."
   else
@@ -639,7 +672,7 @@ main() {
 
   if prompt_yn "MODUŁ: TSEQ (systemd + /usr/local/sbin/tseq + ~/UTILITY/TSEQ)?" "Y"; then
     ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
-    download_to_tmp "$TSEQ_URL" "$tseq_sh"
+    download_to_tmp "$TSEQ_URL" "$tseq_sh" "$TSEQ_LOCAL_PATH"
     run_module_root "$tseq_sh"
     echo "[$(ts)] OK: TSEQ done."
   else
@@ -661,7 +694,7 @@ main() {
 
   if prompt_yn "MODUŁ: Cleanup (usuń ~/UPG/*.xml + czyść ~/.cache przy wylogowaniu z SSH)?" "Y"; then
     ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
-    download_to_tmp "$CLEANUP_URL" "$cleanup_sh"
+    download_to_tmp "$CLEANUP_URL" "$cleanup_sh" "$CLEANUP_LOCAL_PATH"
     run_module_as_itgo "$cleanup_sh"
     echo "[$(ts)] OK: Cleanup done."
   else
@@ -685,7 +718,7 @@ main() {
     [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
     [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
 
-    download_to_tmp "$DOWNLOADER_APP_URL" "$downloader_app_sh"
+    download_to_tmp "$DOWNLOADER_APP_URL" "$downloader_app_sh" "$DOWNLOADER_APP_LOCAL_PATH"
     install_downloader_app_script "$downloader_app_sh"
     echo "[$(ts)] OK: DOWNLOADER_APP done."
   else
@@ -709,7 +742,7 @@ main() {
     [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
     [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
 
-    download_to_tmp "$UPGBUILDER_URL" "$upgbuilder_sh"
+    download_to_tmp "$UPGBUILDER_URL" "$upgbuilder_sh" "$UPGBUILDER_LOCAL_PATH"
     install_upgbuilder_script "$upgbuilder_sh"
 
     if prompt_yn "Uruchomić teraz: upgbuilder --detect jako $TARGET_USER?" "Y"; then
