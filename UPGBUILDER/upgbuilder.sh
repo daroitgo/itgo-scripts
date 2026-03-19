@@ -33,9 +33,13 @@ RULE_ORDER=(
 
 # -------------------- GLOBALS --------------------
 
-UPGBUILDER_VERSION="0.0.6"
+UPGBUILDER_VERSION="0.1.0"
 RAW_REPO_BASE="https://raw.githubusercontent.com/daroitgo/itgo-scripts"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_MAP_PATH="${MODULE_DIR}/upgbuilder.map"
+LOCAL_TEMPLATE_DIR="${MODULE_DIR}/template"
+SOURCE_MODE="remote"
 GITHUB_TAG=""
 GITHUB_BASE_URL=""
 MAP_URL=""
@@ -83,10 +87,16 @@ ensure_dirs() {
   mkdir -p "$MODULE_DIR" "$TMP_DIR" "$BACKUP_DIR" "$OUTPUT_DIR"
 }
 
-set_github_urls() {
+set_source_paths() {
   GITHUB_TAG="upgbuilder-${UPGBUILDER_VERSION}"
   GITHUB_BASE_URL="${RAW_REPO_BASE}/${GITHUB_TAG}/UPGBUILDER"
   MAP_URL="${GITHUB_BASE_URL}/upgbuilder.map"
+
+  if [[ -f "$LOCAL_MAP_PATH" && -d "$LOCAL_TEMPLATE_DIR" ]]; then
+    SOURCE_MODE="local"
+  else
+    SOURCE_MODE="remote"
+  fi
 }
 
 load_version() {
@@ -102,7 +112,7 @@ load_version() {
     fi
   fi
 
-  set_github_urls
+  set_source_paths
 }
 
 download_file() {
@@ -612,8 +622,13 @@ main() {
   cleanup
 
   map_local="${TMP_DIR}/upgbuilder.map"
-  log "[INFO] Pobieram mapę: ${MAP_URL}"
-  download_file "$MAP_URL" "$map_local"
+  if [[ "$SOURCE_MODE" == "local" ]]; then
+    log "[INFO] Używam lokalnej mapy: ${LOCAL_MAP_PATH}"
+    cp "$LOCAL_MAP_PATH" "$map_local"
+  else
+    log "[INFO] Pobieram mapę: ${MAP_URL}"
+    download_file "$MAP_URL" "$map_local"
+  fi
   read_map "$map_local"
 
   scan_dirs
@@ -672,8 +687,15 @@ main() {
   fi
 
   template_local="${TMP_DIR}/$(basename "$MATCHED_TEMPLATE")"
-  log "[INFO] Pobieram template: ${GITHUB_BASE_URL}/${MATCHED_TEMPLATE}"
-  download_file "${GITHUB_BASE_URL}/${MATCHED_TEMPLATE}" "$template_local"
+  if [[ "$SOURCE_MODE" == "local" ]]; then
+    local_template_path="${LOCAL_TEMPLATE_DIR}/$(basename "$MATCHED_TEMPLATE")"
+    [[ -f "$local_template_path" ]] || die "Brak lokalnego template: $local_template_path"
+    log "[INFO] Używam lokalnego template: ${local_template_path}"
+    cp "$local_template_path" "$template_local"
+  else
+    log "[INFO] Pobieram template: ${GITHUB_BASE_URL}/${MATCHED_TEMPLATE}"
+    download_file "${GITHUB_BASE_URL}/${MATCHED_TEMPLATE}" "$template_local"
+  fi
 
   render_template "$template_local" "$output_file"
   print_generate_summary "$output_file"
@@ -690,3 +712,11 @@ case "$MODE" in
     die "Nieznany parametr: $MODE. Dozwolone: --detect"
     ;;
 esac
+
+
+
+
+
+
+
+
