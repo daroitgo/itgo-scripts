@@ -2,6 +2,18 @@
 
 W tym pliku prowadzona jest historia zmian modułu `OFFLINE_BUNDLE`.
 
+
+## [0.1.3] - 2026-03-19
+
+### Fixed
+- Przebudowano paczkę `itgo-offline-bundle.tar.gz` po wykryciu błędu CRLF w wygenerowanym `install.sh`, który przekazywał do `MASTER` argument użytkownika z końcowym `\r`.
+- Potwierdzono, że nowy artefakt zachowuje launcher `install.sh` bit do bita zgodny ze źródłowym `offline-install.sh`.
+
+### Compatibility
+- Zachowano model publikacji modułu `OFFLINE_BUNDLE` przez `release.manifest.psd1`.
+
+### Breaking changes
+- brak
 ## [0.1.2] - 2026-03-19
 
 ### Changed
