@@ -10,7 +10,7 @@ scan.roots=/srv,/opt
 # ==========================================================
 platforms_zm.output=update_platforms_zm.sh
 platforms_zm.template=template/template_update_platforms_zm.sh
-platforms_zm.version=1.0.0
+platforms_zm.version=1.1.0
 platforms_zm.detect_mode=prefix
 platforms_zm.detect_value=IntegrationPlatform
 platforms_zm.detect_mode_2=contains
@@ -22,7 +22,7 @@ platforms_zm.log_path=/var/log/asseco
 # ==========================================================
 platforms.output=update_platforms.sh
 platforms.template=template/template_update_platforms.sh
-platforms.version=1.0.0
+platforms.version=1.1.0
 platforms.detect_mode=prefix
 platforms.detect_value=IntegrationPlatform
 platforms.log_path={{APP_DIR}}/apache-tomcat/logs
@@ -52,7 +52,7 @@ bk.log_path=/var/log/asseco
 # ==========================================================
 amdx.output=update_amdx.sh
 amdx.template=template/template_update_amdx.sh
-amdx.version=1.0.0
+amdx.version=1.1.0
 amdx.detect_mode=contains
 amdx.detect_value=amdx
 amdx.log_path=/var/log/asseco
@@ -62,7 +62,7 @@ amdx.log_path=/var/log/asseco
 # ==========================================================
 mpi.output=update_mpi.sh
 mpi.template=template/template_update_mpi.sh
-mpi.version=1.0.0
+mpi.version=1.1.0
 mpi.detect_mode=contains
 mpi.detect_value=mpi
 mpi.log_path=/var/log/asseco
@@ -72,7 +72,7 @@ mpi.log_path=/var/log/asseco
 # ==========================================================
 p1adapter.output=update_p1adapter.sh
 p1adapter.template=template/template_update_p1adapter.sh
-p1adapter.version=1.0.0
+p1adapter.version=1.1.0
 p1adapter.detect_mode=contains
 p1adapter.detect_value=p1adapter
 p1adapter.log_path=/var/log/asseco
