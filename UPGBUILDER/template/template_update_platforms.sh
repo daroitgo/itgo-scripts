@@ -6,7 +6,7 @@
 # ==========================================================
 # UPGBUILDER_VERSION={{UPGBUILDER_VERSION}}
 # TEMPLATE_NAME=template_update_platforms.sh
-# TEMPLATE_VERSION=1.0.0
+# TEMPLATE_VERSION=1.1.0
 # RULE_NAME=platforms
 # GENERATED_AT={{GENERATED_AT}}
 # GENERATED_HOST={{HOSTNAME}}
@@ -215,12 +215,13 @@ step_chmod_platforms() {
   done
 }
 
-{{ADM_JRXML_STEP}}
+{{SPECIAL_PLATFORM_FUNCTIONS}}
 
 run_step "Wykrywanie platform IntegrationPlatform"              step_discover_platforms
 run_step "Czyszczenie logów Tomcata"                            step_clear_logs
 run_step "Przygotowanie katalogu backupu (dzisiejszy)"          step_prepare_backup
 run_step "Czyszczenie starych backupów (zostają 2)"             step_cleanup_old_backups
+{{SPECIAL_PLATFORM_RUNS}}
 run_step "Przenoszenie IntegrationPlatform_* do backupu"        step_move_platforms_to_backup
 run_step "Kopiowanie manager/tomcat-users.xml do *_NEW"         step_copy_resources_to_new
 run_step "Zmiana nazw katalogów *_NEW -> bez _NEW"              step_rename_new_dirs

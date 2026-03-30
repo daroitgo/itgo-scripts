@@ -33,7 +33,7 @@ RULE_ORDER=(
 
 # -------------------- GLOBALS --------------------
 
-UPGBUILDER_VERSION="0.1.1"
+UPGBUILDER_VERSION="0.1.2"
 RAW_REPO_BASE="https://raw.githubusercontent.com/daroitgo/itgo-scripts"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,7 +65,8 @@ WEBAPPS_DIR=""
 APP_LOG_DIR=""
 ADM_DIR=""
 ADM_NEW_DIR=""
-ADM_JRXML_STEP=""
+SPECIAL_PLATFORM_FUNCTIONS=""
+SPECIAL_PLATFORM_RUNS=""
 
 # -------------------- HELPERS --------------------
 
@@ -137,6 +138,29 @@ trim() {
 
 lower() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+sanitize_identifier() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9_]/_/g' -e 's/__*/_/g'
+}
+
+append_block_var() {
+  local var_name="$1"
+  local block="$2"
+  local current=""
+
+  [[ -n "$block" ]] || return 0
+
+  current="${!var_name:-}"
+  if [[ -n "$current" ]]; then
+    printf -v "$var_name" '%s\n\n%s' "$current" "$block"
+  else
+    printf -v "$var_name" '%s' "$block"
+  fi
 }
 
 array_clear_by_name() {
@@ -293,6 +317,197 @@ find_matches_for_condition() {
   done
 }
 
+dir_has_required_casefold_files() {
+  local dir="$1"
+  shift
+
+  [[ -d "$dir" ]] || return 1
+
+  local nullglob_was_set=0
+  local path name lowered_name req lowered_req
+  declare -A required_counts=()
+
+  shopt -q nullglob && nullglob_was_set=1
+  shopt -s nullglob
+
+  for req in "$@"; do
+    lowered_req="$(lower "$req")"
+    required_counts["$lowered_req"]=0
+  done
+
+  for path in "$dir"/*; do
+    [[ -f "$path" ]] || continue
+    name="$(basename "$path")"
+    lowered_name="$(lower "$name")"
+
+    if [[ -v required_counts["$lowered_name"] ]]; then
+      required_counts["$lowered_name"]=$(( required_counts["$lowered_name"] + 1 ))
+    fi
+  done
+
+  if (( ! nullglob_was_set )); then
+    shopt -u nullglob
+  fi
+
+  for req in "$@"; do
+    lowered_req="$(lower "$req")"
+    (( required_counts["$lowered_req"] == 1 )) || return 1
+  done
+
+  return 0
+}
+
+generate_adm_jrxml_block() {
+  local dir="$1"
+  local platform_label="$2"
+  local platform_key="$3"
+  local fn_name block run_line
+  local src_dir_q dst_dir_q
+
+  fn_name="step_copy_adm_jrxml_${platform_key}"
+  src_dir_q="$(shell_quote "${dir}/apache-tomcat/webapps/DocumentationArchive/WEB-INF/classes")"
+  dst_dir_q="$(shell_quote "${dir}_NEW/apache-tomcat/webapps/DocumentationArchive/WEB-INF/classes")"
+
+  block="$(cat <<'BLOCK_EOF'
+__FN_NAME__() {
+  echo "[2.4] __PLATFORM_LABEL___NEW: kopiowanie plików JRXML do DocumentationArchive/WEB-INF/classes..."
+
+  local JRXML_SRC_DIR JRXML_DST_DIR
+  JRXML_SRC_DIR=__SRC_DIR_Q__
+  JRXML_DST_DIR=__DST_DIR_Q__
+
+  local JRXML_FILES=(
+    "AD_spis_zdawczo_odbiorczy_zm4.jrxml"
+    "AD_spis_zdawczo_odbiorczy_zm6.jrxml"
+  )
+
+  if [[ -d "$JRXML_SRC_DIR" ]]; then
+    mkdir -p "$JRXML_DST_DIR"
+    local f
+    for f in "${JRXML_FILES[@]}"; do
+      if [[ -f "$JRXML_SRC_DIR/$f" ]]; then
+        echo "    cp $JRXML_SRC_DIR/$f -> $JRXML_DST_DIR/"
+        cp -f "$JRXML_SRC_DIR/$f" "$JRXML_DST_DIR/"
+      else
+        echo "    [WARN] Brak pliku źródłowego: $JRXML_SRC_DIR/$f (pomijam)"
+      fi
+    done
+  else
+    echo "    [WARN] Brak katalogu źródłowego: $JRXML_SRC_DIR (pomijam kopię JRXML)"
+  fi
+}
+BLOCK_EOF
+)"
+
+  block="${block//__FN_NAME__/$fn_name}"
+  block="${block//__PLATFORM_LABEL__/$platform_label}"
+  block="${block//__SRC_DIR_Q__/$src_dir_q}"
+  block="${block//__DST_DIR_Q__/$dst_dir_q}"
+
+  run_line="run_step \"Kopiowanie JRXML z ${platform_label} -> ${platform_label}_NEW\" ${fn_name}"
+
+  append_block_var SPECIAL_PLATFORM_FUNCTIONS "$block"
+  append_block_var SPECIAL_PLATFORM_RUNS "$run_line"
+}
+
+generate_nmvs_sync_block() {
+  local dir="$1"
+  local platform_label="$2"
+  local platform_key="$3"
+  local fn_name block run_line
+  local src_dir_q dst_dir_q
+
+  fn_name="step_sync_nmvs_users_${platform_key}"
+  src_dir_q="$(shell_quote "${dir}/apache-tomcat/webapps/nmvs/WEB-INF/users")"
+  dst_dir_q="$(shell_quote "${dir}_NEW/apache-tomcat/webapps/nmvs/WEB-INF/users")"
+
+  block="$(cat <<'BLOCK_EOF'
+__FN_NAME__() {
+  echo "[2.5] __PLATFORM_LABEL___NEW: aktualizacja nmvs/WEB-INF/users..."
+
+  local SRC_USERS DST_USERS
+  SRC_USERS=__SRC_DIR_Q__
+  DST_USERS=__DST_DIR_Q__
+
+  if [[ -d "$SRC_USERS" ]]; then
+    mkdir -p "$DST_USERS"
+    rm -rf --one-file-system -- "$DST_USERS"/* 2>/dev/null || true
+    cp -a "$SRC_USERS"/. "$DST_USERS"/
+  else
+    echo "    [WARN] Brak źródła: $SRC_USERS"
+  fi
+}
+BLOCK_EOF
+)"
+
+  block="${block//__FN_NAME__/$fn_name}"
+  block="${block//__PLATFORM_LABEL__/$platform_label}"
+  block="${block//__SRC_DIR_Q__/$src_dir_q}"
+  block="${block//__DST_DIR_Q__/$dst_dir_q}"
+
+  run_line="run_step \"Synchronizacja nmvs/WEB-INF/users z ${platform_label} -> ${platform_label}_NEW\" ${fn_name}"
+
+  append_block_var SPECIAL_PLATFORM_FUNCTIONS "$block"
+  append_block_var SPECIAL_PLATFORM_RUNS "$run_line"
+}
+
+generate_zsmopl_sync_block() {
+  local dir="$1"
+  local platform_label="$2"
+  local platform_key="$3"
+  local fn_name block run_line
+  local src_certs_q dst_certs_q src_users_q dst_users_q
+
+  fn_name="step_sync_zsmopl_properties_${platform_key}"
+  src_certs_q="$(shell_quote "${dir}/apache-tomcat/webapps/zsmopl/WEB-INF/properties/certs")"
+  dst_certs_q="$(shell_quote "${dir}_NEW/apache-tomcat/webapps/zsmopl/WEB-INF/properties/certs")"
+  src_users_q="$(shell_quote "${dir}/apache-tomcat/webapps/zsmopl/WEB-INF/properties/users")"
+  dst_users_q="$(shell_quote "${dir}_NEW/apache-tomcat/webapps/zsmopl/WEB-INF/properties/users")"
+
+  block="$(cat <<'BLOCK_EOF'
+__FN_NAME__() {
+  echo "[2.6] __PLATFORM_LABEL___NEW: aktualizacja properties/{certs,users}..."
+
+  local SRC_CERTS DST_CERTS SRC_USERS DST_USERS
+  SRC_CERTS=__SRC_CERTS_Q__
+  DST_CERTS=__DST_CERTS_Q__
+  SRC_USERS=__SRC_USERS_Q__
+  DST_USERS=__DST_USERS_Q__
+
+  echo "[INFO] __PLATFORM_LABEL___NEW: aktualizacja properties/certs..."
+  if [[ -d "$SRC_CERTS" ]]; then
+    mkdir -p "$DST_CERTS"
+    rm -rf --one-file-system -- "$DST_CERTS"/* 2>/dev/null || true
+    cp -a "$SRC_CERTS"/. "$DST_CERTS"/
+  else
+    echo "    [WARN] Brak źródła: $SRC_CERTS"
+  fi
+
+  echo "[INFO] __PLATFORM_LABEL___NEW: aktualizacja properties/users..."
+  if [[ -d "$SRC_USERS" ]]; then
+    mkdir -p "$DST_USERS"
+    rm -rf --one-file-system -- "$DST_USERS"/* 2>/dev/null || true
+    cp -a "$SRC_USERS"/. "$DST_USERS"/
+  else
+    echo "    [WARN] Brak źródła: $SRC_USERS"
+  fi
+}
+BLOCK_EOF
+)"
+
+  block="${block//__FN_NAME__/$fn_name}"
+  block="${block//__PLATFORM_LABEL__/$platform_label}"
+  block="${block//__SRC_CERTS_Q__/$src_certs_q}"
+  block="${block//__DST_CERTS_Q__/$dst_certs_q}"
+  block="${block//__SRC_USERS_Q__/$src_users_q}"
+  block="${block//__DST_USERS_Q__/$dst_users_q}"
+
+  run_line="run_step \"Synchronizacja zsmopl properties z ${platform_label} -> ${platform_label}_NEW\" ${fn_name}"
+
+  append_block_var SPECIAL_PLATFORM_FUNCTIONS "$block"
+  append_block_var SPECIAL_PLATFORM_RUNS "$run_line"
+}
+
 evaluate_rule() {
   local rule="$1"
   local mode1 value1 mode2 value2
@@ -353,7 +568,8 @@ assign_rule_paths() {
   APP_LOG_DIR=""
   ADM_DIR=""
   ADM_NEW_DIR=""
-  ADM_JRXML_STEP=""
+  SPECIAL_PLATFORM_FUNCTIONS=""
+  SPECIAL_PLATFORM_RUNS=""
 
   case "$rule" in
     platforms)
@@ -381,56 +597,43 @@ assign_rule_paths() {
 build_special_steps() {
   local rule="$1"
   local hits1_name="$2"
-  local dir base
+  local dir base platform_key
+  local nmvs_users_dir zsmopl_certs_dir zsmopl_users_dir
   local -a hits1_ref=()
+  local idx=0
 
   array_copy_by_name "$hits1_name" hits1_ref
 
   ADM_DIR=""
   ADM_NEW_DIR=""
-  ADM_JRXML_STEP=""
+  SPECIAL_PLATFORM_FUNCTIONS=""
+  SPECIAL_PLATFORM_RUNS=""
 
   [[ "$rule" == "platforms" ]] || return 0
 
   for dir in "${hits1_ref[@]}"; do
     base="$(basename "$dir")"
+    platform_key="$(sanitize_identifier "${base}_${idx}")"
+
     if [[ "$base" == "IntegrationPlatform_ADM" ]]; then
       ADM_DIR="$dir"
       ADM_NEW_DIR="${dir}_NEW"
-      ADM_JRXML_STEP="$(cat <<'EOF'
-step_copy_adm_jrxml() {
-  echo "[0a] Kopiowanie plików JRXML z ADM -> ADM_NEW (przed zmianami)..."
-
-  local JRXML_SRC_DIR JRXML_DST_DIR
-  JRXML_SRC_DIR="${ADM_DIR}/apache-tomcat/webapps/DocumentationArchive/WEB-INF/classes"
-  JRXML_DST_DIR="${ADM_NEW_DIR}/apache-tomcat/webapps/DocumentationArchive/WEB-INF/classes"
-
-  local JRXML_FILES=(
-    "AD_spis_zdawczo_odbiorczy_zm4.jrxml"
-    "AD_spis_zdawczo_odbiorczy_zm6.jrxml"
-  )
-
-  if [[ -d "$JRXML_SRC_DIR" ]]; then
-    mkdir -p "$JRXML_DST_DIR"
-    local f
-    for f in "${JRXML_FILES[@]}"; do
-      if [[ -f "$JRXML_SRC_DIR/$f" ]]; then
-        echo "    cp $JRXML_SRC_DIR/$f -> $JRXML_DST_DIR/"
-        cp -f "$JRXML_SRC_DIR/$f" "$JRXML_DST_DIR/"
-      else
-        echo "    [WARN] Brak pliku źródłowego: $JRXML_SRC_DIR/$f (pomijam)"
-      fi
-    done
-  else
-    echo "    [WARN] Brak katalogu źródłowego: $JRXML_SRC_DIR (pomijam kopię JRXML)"
-  fi
-}
-
-run_step "Kopiowanie plików JRXML z ADM -> ADM_NEW (KROK 0A)" step_copy_adm_jrxml
-EOF
-)"
-      return 0
+      generate_adm_jrxml_block "$dir" "$base" "$platform_key"
     fi
+
+    nmvs_users_dir="${dir}/apache-tomcat/webapps/nmvs/WEB-INF/users"
+    if dir_has_required_casefold_files "$nmvs_users_dir" "user1.properties" "user2.properties"; then
+      generate_nmvs_sync_block "$dir" "$base" "$platform_key"
+    fi
+
+    zsmopl_certs_dir="${dir}/apache-tomcat/webapps/zsmopl/WEB-INF/properties/certs"
+    zsmopl_users_dir="${dir}/apache-tomcat/webapps/zsmopl/WEB-INF/properties/users"
+    if dir_has_required_casefold_files "$zsmopl_certs_dir" "user1sign.properties" "user2sign.properties" && \
+       dir_has_required_casefold_files "$zsmopl_users_dir" "user1.properties" "user2.properties"; then
+      generate_zsmopl_sync_block "$dir" "$base" "$platform_key"
+    fi
+
+    ((idx+=1))
   done
 }
 
@@ -532,11 +735,10 @@ render_template() {
     -e "s/{{ADM_NEW_DIR}}/$(escape_sed_repl "$ADM_NEW_DIR")/g" \
     "$tmp_out"
 
-  if grep -q '{{ADM_JRXML_STEP}}' "$tmp_out"; then
-    rendered_text="$(cat "$tmp_out")"
-    rendered_text="${rendered_text//\{\{ADM_JRXML_STEP\}\}/$ADM_JRXML_STEP}"
-    printf '%s' "$rendered_text" > "$tmp_out"
-  fi
+  rendered_text="$(cat "$tmp_out")"
+  rendered_text="${rendered_text//\{\{SPECIAL_PLATFORM_FUNCTIONS\}\}/$SPECIAL_PLATFORM_FUNCTIONS}"
+  rendered_text="${rendered_text//\{\{SPECIAL_PLATFORM_RUNS\}\}/$SPECIAL_PLATFORM_RUNS}"
+  printf '%s' "$rendered_text" > "$tmp_out"
 
   mv "$tmp_out" "$output_file"
   chmod +x "$output_file"
@@ -615,7 +817,7 @@ print_generate_summary() {
 }
 
 main() {
-  local map_local template_local output_file local_version cmp_result
+  local map_local template_local output_file local_version cmp_result local_template_path
 
   ensure_dirs
   load_version
@@ -712,12 +914,3 @@ case "$MODE" in
     die "Nieznany parametr: $MODE. Dozwolone: --detect"
     ;;
 esac
-
-
-
-
-
-
-
-
-
