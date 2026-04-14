@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.6"
+MASTER_VERSION="1.2.7"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.10"
@@ -306,6 +306,129 @@ ensure_docker_group_membership() {
     echo "[$(ts)] INFO: zmiana zadziała po ponownym logowaniu użytkownika."
   else
     echo "[$(ts)] SKIP: dopięcie do grupy docker."
+  fi
+}
+
+get_target_user_home() {
+  resolve_home
+}
+
+get_amms_secret_file_path() {
+  local target_home
+  target_home="$(get_target_user_home)" || return 1
+  printf "%s\n" "${target_home}/.config/itgo/amms_registry_password"
+}
+
+validate_amms_secret_file() {
+  local secret_file="${1:?}"
+  local config_dir expected_owner dir_mode file_mode dir_owner file_owner
+
+  config_dir="$(dirname "$secret_file")"
+  expected_owner="$TARGET_USER"
+
+  if [[ ! -d "$config_dir" ]]; then
+    echo "[$(ts)] WARN: katalog sekretu nie istnieje: $config_dir"
+    return 1
+  fi
+
+  if [[ ! -f "$secret_file" ]]; then
+    echo "[$(ts)] WARN: plik sekretu nie istnieje: $secret_file"
+    return 1
+  fi
+
+  if [[ ! -s "$secret_file" ]]; then
+    echo "[$(ts)] WARN: plik sekretu jest pusty: $secret_file"
+    return 1
+  fi
+
+  dir_mode="$(stat -c '%a' "$config_dir" 2>/dev/null || echo "")"
+  if [[ "$dir_mode" != "700" ]]; then
+    echo "[$(ts)] WARN: katalog $config_dir ma mode ${dir_mode:-UNKNOWN}, oczekiwano 700."
+    return 1
+  fi
+
+  file_mode="$(stat -c '%a' "$secret_file" 2>/dev/null || echo "")"
+  if [[ "$file_mode" != "600" ]]; then
+    echo "[$(ts)] WARN: plik $secret_file ma mode ${file_mode:-UNKNOWN}, oczekiwano 600."
+    return 1
+  fi
+
+  dir_owner="$(stat -c '%U' "$config_dir" 2>/dev/null || echo "")"
+  if [[ "$dir_owner" != "$expected_owner" ]]; then
+    echo "[$(ts)] WARN: owner katalogu $config_dir to ${dir_owner:-UNKNOWN}, oczekiwano $expected_owner."
+    return 1
+  fi
+
+  file_owner="$(stat -c '%U' "$secret_file" 2>/dev/null || echo "")"
+  if [[ "$file_owner" != "$expected_owner" ]]; then
+    echo "[$(ts)] WARN: owner pliku $secret_file to ${file_owner:-UNKNOWN}, oczekiwano $expected_owner."
+    return 1
+  fi
+
+  return 0
+}
+
+print_amms_secret_instructions() {
+  local secret_file="${1:?}"
+  local config_dir
+
+  config_dir="$(dirname "$secret_file")"
+
+  echo "[$(ts)] INFO: nie znaleziono pliku sekretu: $secret_file"
+  echo "[$(ts)] INFO: aby włączyć docker login do amms.asseco.pl, utwórz sekret jako user '$TARGET_USER':"
+  echo "[$(ts)] INFO:   mkdir -p \"$config_dir\""
+  echo "[$(ts)] INFO:   chmod 700 \"$config_dir\""
+  echo "[$(ts)] INFO:   printf '%s\\n' '<HASLO>' > \"$secret_file\""
+  echo "[$(ts)] INFO:   chmod 600 \"$secret_file\""
+  echo "[$(ts)] INFO:   chown -R \"$TARGET_USER:$TARGET_USER\" \"$config_dir\""
+}
+
+docker_login_amms_registry() {
+  local secret_file config_dir registry username
+
+  registry="amms.asseco.pl"
+  username="wdrozenia"
+
+  if ! have_user; then
+    echo "[$(ts)] WARN: user '$TARGET_USER' nie istnieje. Pomijam docker login do $registry."
+    return 0
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "[$(ts)] SKIP: docker CLI nie istnieje. Pomijam docker login do $registry."
+    return 0
+  fi
+
+  secret_file="$(get_amms_secret_file_path)" || {
+    echo "[$(ts)] WARN: nie udało się ustalić HOME dla '$TARGET_USER'. Pomijam docker login do $registry."
+    return 0
+  }
+  config_dir="$(dirname "$secret_file")"
+
+  if [[ ! -f "$secret_file" ]]; then
+    print_amms_secret_instructions "$secret_file"
+    echo "[$(ts)] SKIP: docker login do $registry."
+    return 0
+  fi
+
+  if ! prompt_yn "Wykonać docker login do $registry jako user '$TARGET_USER'?" "Y"; then
+    echo "[$(ts)] SKIP: docker login do $registry."
+    return 0
+  fi
+
+  if ! validate_amms_secret_file "$secret_file"; then
+    echo "[$(ts)] ERROR: walidacja sekretu nie powiodła się. Pomijam docker login do $registry."
+    echo "[$(ts)] INFO: oczekiwano katalogu $config_dir z mode 700 i pliku $secret_file z mode 600, owner $TARGET_USER."
+    return 0
+  fi
+
+  echo "[$(ts)] ACTION: docker login --username $username --password-stdin $registry (sudo -u $TARGET_USER)"
+  if sudo -u "$TARGET_USER" sh -c 'cat "$1" | docker login --username "$2" --password-stdin "$3"' _ "$secret_file" "$username" "$registry"; then
+    echo "[$(ts)] OK: docker login do $registry wykonany jako '$TARGET_USER'."
+    echo "[$(ts)] INFO: jeśli użytkownik został dopiero co dodany do grupy docker, może być wymagana nowa sesja."
+  else
+    echo "[$(ts)] WARN: docker login do $registry nie powiódł się dla usera '$TARGET_USER'."
+    echo "[$(ts)] INFO: jeśli użytkownik został dopiero co dodany do grupy docker, może być wymagana nowa sesja."
   fi
 }
 
@@ -608,6 +731,7 @@ bootstrap_block() {
   ensure_sudo_nopasswd_block
   ensure_acls_block
   ensure_docker_group_membership
+  docker_login_amms_registry
 }
 
 prepare_dirs_after_skip_bootstrap() {
