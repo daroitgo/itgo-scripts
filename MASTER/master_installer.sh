@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.7"
+MASTER_VERSION="1.2.8"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.10"
@@ -145,6 +145,7 @@ LOG_OTHER=""
 LOG_UPDATE=""
 TMP_DIR=""
 FINAL_LOG=""
+MODULE_DECISION=""
 
 start_final_logging_if_possible() {
   [[ -n "${LOG_OTHER:-}" && -d "$LOG_OTHER" ]] || return 0
@@ -172,6 +173,201 @@ start_final_logging_if_possible() {
     cat "$TMP_LOG" || true
     echo "[$(ts)] --- end pre-log ---"
   fi
+}
+
+read_version_file() {
+  local version_file="${1:?}"
+  if [[ -f "$version_file" ]]; then
+    head -n1 "$version_file" 2>/dev/null | tr -d '\r'
+  else
+    echo ""
+  fi
+}
+
+version_file_for_module() {
+  local module="${1:?}"
+
+  [[ -n "${ITGO_HOME:-}" ]] || return 1
+
+  case "$module" in
+    STATUS)         printf "%s\n" "$ITGO_HOME/UTILITY/STATUS/.status_installer_version" ;;
+    CLEANUP)        printf "%s\n" "$ITGO_HOME/UTILITY/UPG_CLEANUP/.upg_cleanup_version" ;;
+    TSEQ)           printf "%s\n" "$ITGO_HOME/UTILITY/TSEQ/.tseq_version" ;;
+    DOWNLOADER_APP) printf "%s\n" "$ITGO_HOME/UTILITY/DOWNLOADER_APP/.downloader_version" ;;
+    UPGBUILDER)     printf "%s\n" "$ITGO_HOME/UTILITY/UPGbuilder/.upgbuilder_version" ;;
+    *) return 1 ;;
+  esac
+}
+
+target_version_for_module() {
+  local module="${1:?}"
+
+  case "$module" in
+    STATUS)         printf "%s\n" "$STATUS_VERSION" ;;
+    CLEANUP)        printf "%s\n" "$CLEANUP_VERSION" ;;
+    TSEQ)           printf "%s\n" "$TSEQ_VERSION" ;;
+    DOWNLOADER_APP) printf "%s\n" "$DOWNLOADER_APP_VERSION" ;;
+    UPGBUILDER)     printf "%s\n" "$UPGBUILDER_VERSION" ;;
+    *) return 1 ;;
+  esac
+}
+
+installed_version_for_module() {
+  local module="${1:?}" version_file
+  version_file="$(version_file_for_module "$module")" || return 1
+  read_version_file "$version_file"
+}
+
+module_is_installed() {
+  local module="${1:?}" version_file
+  version_file="$(version_file_for_module "$module")" || return 1
+  [[ -f "$version_file" ]]
+}
+
+module_health_for_module() {
+  local module="${1:?}" version_file
+
+  if [[ -z "${ITGO_HOME:-}" ]]; then
+    echo "UNKNOWN"
+    return 0
+  fi
+
+  version_file="$(version_file_for_module "$module")" || {
+    echo "UNKNOWN"
+    return 0
+  }
+
+  if [[ ! -f "$version_file" ]]; then
+    echo "UNKNOWN"
+    return 0
+  fi
+
+  case "$module" in
+    STATUS)
+      [[ -d "$ITGO_HOME/UTILITY/STATUS" && -x /usr/local/bin/status ]] && echo "OK" || echo "BROKEN"
+      ;;
+    TSEQ)
+      [[ -d "$ITGO_HOME/UTILITY/TSEQ" && -x /usr/local/sbin/tseq && -f /etc/systemd/system/tseq.service ]] && echo "OK" || echo "BROKEN"
+      ;;
+    CLEANUP)
+      [[ -d "$ITGO_HOME/UTILITY/UPG_CLEANUP" ]] && echo "OK" || echo "BROKEN"
+      ;;
+    DOWNLOADER_APP)
+      [[ -x "$ITGO_HOME/UTILITY/DOWNLOADER_APP/upg_installer.sh" && -L /usr/local/bin/dwupg ]] && echo "OK" || echo "BROKEN"
+      ;;
+    UPGBUILDER)
+      [[ -x "$ITGO_HOME/UTILITY/UPGbuilder/upgbuilder.sh" && -L /usr/local/bin/upgbuilder ]] && echo "OK" || echo "BROKEN"
+      ;;
+    *)
+      echo "UNKNOWN"
+      ;;
+  esac
+}
+
+module_is_healthy() {
+  [[ "$(module_health_for_module "${1:?}")" == "OK" ]]
+}
+
+compare_versions() {
+  local installed="${1:-}" target="${2:-}"
+
+  if [[ -z "$installed" || -z "$target" ]]; then
+    echo "unknown"
+  elif [[ "$installed" == "$target" ]]; then
+    echo "eq"
+  elif [[ "$(printf '%s\n%s\n' "$installed" "$target" | sort -V | tail -n 1)" == "$target" ]]; then
+    echo "lt"
+  else
+    echo "gt"
+  fi
+}
+
+detect_installed_modules() {
+  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER)
+  local module installed_version target_version health
+
+  for module in "${modules[@]}"; do
+    if module_is_installed "$module"; then
+      installed_version="$(installed_version_for_module "$module")"
+      target_version="$(target_version_for_module "$module")"
+      health="$(module_health_for_module "$module")"
+      echo "${module}|${installed_version:-UNKNOWN}|${target_version:-UNKNOWN}|${health:-UNKNOWN}"
+    fi
+  done
+}
+
+any_itgo_module_installed() {
+  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER)
+  local module
+
+  for module in "${modules[@]}"; do
+    if module_is_installed "$module"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+print_detected_modules_summary() {
+  local rows="${1:-}"
+  local line module installed_version target_version health
+
+  [[ -n "$rows" ]] || return 0
+
+  echo "[$(ts)] Wykryte moduły ITGO:"
+  printf "%-16s %-18s %-18s %s\n" "MODULE" "INSTALLED" "TARGET" "HEALTH"
+  printf "%-16s %-18s %-18s %s\n" "----------------" "------------------" "------------------" "--------"
+
+  while IFS= read -r line; do
+    [[ -n "${line:-}" ]] || continue
+    IFS='|' read -r module installed_version target_version health <<< "$line"
+    printf "%-16s %-18s %-18s %s\n" \
+      "$module" "${installed_version:-UNKNOWN}" "${target_version:-UNKNOWN}" "${health:-UNKNOWN}"
+  done <<< "$rows"
+}
+
+should_install_or_update_module() {
+  local module="${1:?}"
+  local installed_version target_version health version_cmp
+
+  MODULE_DECISION="install"
+
+  if ! module_is_installed "$module"; then
+    return 0
+  fi
+
+  installed_version="$(installed_version_for_module "$module")"
+  target_version="$(target_version_for_module "$module")"
+  health="$(module_health_for_module "$module")"
+  version_cmp="$(compare_versions "$installed_version" "$target_version")"
+
+  if [[ "$version_cmp" == "eq" && "$health" == "OK" ]]; then
+    MODULE_DECISION="skip"
+    echo "[$(ts)] SKIP: $module już zainstalowany w wersji docelowej $target_version i health=OK."
+    return 1
+  fi
+
+  if [[ "$version_cmp" == "eq" && "$health" == "BROKEN" ]]; then
+    if prompt_yn "MODUŁ: $module ma wersję $target_version, ale health=BROKEN. Wykonać repair/reinstall?" "Y"; then
+      MODULE_DECISION="repair"
+      return 0
+    fi
+    MODULE_DECISION="skip"
+    echo "[$(ts)] SKIP: repair/reinstall $module."
+    return 1
+  fi
+
+  if [[ "$version_cmp" == "lt" || "$version_cmp" == "gt" || "$version_cmp" == "unknown" ]]; then
+    if prompt_yn "MODUŁ: $module ma wersję '${installed_version:-UNKNOWN}', docelowa to '${target_version:-UNKNOWN}'. Aktualizować?" "Y"; then
+      MODULE_DECISION="update"
+      return 0
+    fi
+    MODULE_DECISION="skip"
+    echo "[$(ts)] SKIP: update $module."
+    return 1
+  fi
+
+  return 0
 }
 
 safe_backup() {
@@ -725,6 +921,192 @@ BEOF
   echo "[$(ts)] OK: installed single SSH prompt+status block. Backup: ${bp}.bak"
 }
 
+install_status_step() {
+  local status_sh="${1:?}"
+
+  if should_install_or_update_module "STATUS"; then
+    if [[ "$MODULE_DECISION" == "install" ]]; then
+      if prompt_yn "MODUŁ: Server-Status (systemd + /usr/local + /var/cache)?" "Y"; then
+        ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+        download_to_tmp "$STATUS_URL" "$status_sh" "$STATUS_LOCAL_PATH"
+        run_module_root "$status_sh" "$TARGET_USER"
+        echo "[$(ts)] OK: Server-Status done."
+      else
+        echo "[$(ts)] SKIP: Server-Status."
+      fi
+    else
+      ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+      download_to_tmp "$STATUS_URL" "$status_sh" "$STATUS_LOCAL_PATH"
+      run_module_root "$status_sh" "$TARGET_USER"
+      echo "[$(ts)] OK: Server-Status done."
+    fi
+  fi
+}
+
+install_tseq_step() {
+  local tseq_sh="${1:?}"
+
+  if should_install_or_update_module "TSEQ"; then
+    if [[ "$MODULE_DECISION" == "install" ]]; then
+      if prompt_yn "MODUŁ: TSEQ (systemd + /usr/local/sbin/tseq + ~/UTILITY/TSEQ)?" "Y"; then
+        ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+        download_to_tmp "$TSEQ_URL" "$tseq_sh" "$TSEQ_LOCAL_PATH"
+        run_module_root "$tseq_sh"
+        echo "[$(ts)] OK: TSEQ done."
+      else
+        echo "[$(ts)] SKIP: TSEQ."
+      fi
+    else
+      ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+      download_to_tmp "$TSEQ_URL" "$tseq_sh" "$TSEQ_LOCAL_PATH"
+      run_module_root "$tseq_sh"
+      echo "[$(ts)] OK: TSEQ done."
+    fi
+  fi
+}
+
+install_cleanup_step() {
+  local cleanup_sh="${1:?}"
+
+  if should_install_or_update_module "CLEANUP"; then
+    if [[ "$MODULE_DECISION" == "install" ]]; then
+      if prompt_yn "MODUŁ: Cleanup (usuń ~/UPG/*.xml + czyść ~/.cache przy wylogowaniu z SSH)?" "Y"; then
+        ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+        download_to_tmp "$CLEANUP_URL" "$cleanup_sh" "$CLEANUP_LOCAL_PATH"
+        run_module_as_itgo "$cleanup_sh"
+        echo "[$(ts)] OK: Cleanup done."
+      else
+        echo "[$(ts)] SKIP: Cleanup."
+      fi
+    else
+      ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+      download_to_tmp "$CLEANUP_URL" "$cleanup_sh" "$CLEANUP_LOCAL_PATH"
+      run_module_as_itgo "$cleanup_sh"
+      echo "[$(ts)] OK: Cleanup done."
+    fi
+  fi
+}
+
+install_downloader_app_step() {
+  local downloader_app_sh="${1:?}"
+
+  if should_install_or_update_module "DOWNLOADER_APP"; then
+    if [[ "$MODULE_DECISION" == "install" ]]; then
+      if prompt_yn "MODUŁ: DOWNLOADER_APP (zainstalować ~/UTILITY/DOWNLOADER_APP/upg_installer.sh i symlink /usr/local/bin/dwupg)?" "Y"; then
+        ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+
+        if ! have_user; then
+          echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+          exit 1
+        fi
+
+        ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+        [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+        UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+        TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+
+        [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+        [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+
+        download_to_tmp "$DOWNLOADER_APP_URL" "$downloader_app_sh" "$DOWNLOADER_APP_LOCAL_PATH"
+        install_downloader_app_script "$downloader_app_sh"
+        echo "[$(ts)] OK: DOWNLOADER_APP done."
+      else
+        echo "[$(ts)] SKIP: DOWNLOADER_APP."
+      fi
+    else
+      ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+
+      if ! have_user; then
+        echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+        exit 1
+      fi
+
+      ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+      [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+      UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+      TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+
+      [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+      [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+
+      download_to_tmp "$DOWNLOADER_APP_URL" "$downloader_app_sh" "$DOWNLOADER_APP_LOCAL_PATH"
+      install_downloader_app_script "$downloader_app_sh"
+      echo "[$(ts)] OK: DOWNLOADER_APP done."
+    fi
+  fi
+}
+
+install_upgbuilder_step() {
+  local upgbuilder_sh="${1:?}"
+
+  if should_install_or_update_module "UPGBUILDER"; then
+    if [[ "$MODULE_DECISION" == "install" ]]; then
+      if prompt_yn "MODUŁ: UPGbuilder (zainstalować ~/UTILITY/UPGbuilder/upgbuilder.sh i symlink /usr/local/bin/upgbuilder)?" "Y"; then
+        ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+
+        if ! have_user; then
+          echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+          exit 1
+        fi
+
+        ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+        [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+        UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+        TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+
+        [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+        [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+
+        download_to_tmp "$UPGBUILDER_URL" "$upgbuilder_sh" "$UPGBUILDER_LOCAL_PATH"
+        install_upgbuilder_script "$upgbuilder_sh"
+
+        if prompt_yn "Uruchomić teraz: upgbuilder --detect jako $TARGET_USER?" "Y"; then
+          echo "[$(ts)] RUN(itgo): sudo -u $TARGET_USER /usr/local/bin/upgbuilder --detect"
+          sudo -u "$TARGET_USER" /usr/local/bin/upgbuilder --detect
+        else
+          echo "[$(ts)] SKIP: upgbuilder --detect."
+        fi
+
+        echo "[$(ts)] OK: UPGbuilder done."
+      else
+        echo "[$(ts)] SKIP: UPGbuilder."
+      fi
+    else
+      ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+
+      if ! have_user; then
+        echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+        exit 1
+      fi
+
+      ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+      [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+      UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+      TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+
+      [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+      [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+
+      download_to_tmp "$UPGBUILDER_URL" "$upgbuilder_sh" "$UPGBUILDER_LOCAL_PATH"
+      install_upgbuilder_script "$upgbuilder_sh"
+
+      if prompt_yn "Uruchomić teraz: upgbuilder --detect jako $TARGET_USER?" "Y"; then
+        echo "[$(ts)] RUN(itgo): sudo -u $TARGET_USER /usr/local/bin/upgbuilder --detect"
+        sudo -u "$TARGET_USER" /usr/local/bin/upgbuilder --detect
+      else
+        echo "[$(ts)] SKIP: upgbuilder --detect."
+      fi
+
+      echo "[$(ts)] OK: UPGbuilder done."
+    fi
+  fi
+}
+
 bootstrap_block() {
   ensure_user_and_password_if_missing
   ensure_home_dirs
@@ -755,8 +1137,31 @@ section() {
 }
 
 main() {
+  local detected_modules=""
+  local status_sh cleanup_sh tseq_sh downloader_app_sh upgbuilder_sh
+
   need_root
   prelog "BEGIN: ITGO Master Installer v$MASTER_VERSION user=$TARGET_USER"
+
+  if have_user; then
+    ITGO_HOME="$(resolve_home)" || true
+    if [[ -n "${ITGO_HOME:-}" ]]; then
+      UTILITY_DIR="$ITGO_HOME/UTILITY"
+      LOG_DIR="$UTILITY_DIR/LOG"
+      LOG_OTHER="$LOG_DIR/OTHER"
+      LOG_UPDATE="$LOG_DIR/UPDATE"
+      TMP_DIR="$UTILITY_DIR/TMP"
+    fi
+  fi
+
+  detected_modules="$(detect_installed_modules)"
+  if any_itgo_module_installed; then
+    print_detected_modules_summary "$detected_modules"
+    if prompt_yn "Wykryto istniejącą instalację ITGO. Czy chcesz odinstalować?" "N"; then
+      echo "[$(ts)] INFO: pełny uninstall zostanie dodany w etapie 2B."
+      exit 0
+    fi
+  fi
 
   section "SEKCJA 1/6 - BOOTSTRAP"
   if prompt_yn "BOOTSTRAP: user '$TARGET_USER' + katalogi HOME + (opcjonalnie) sudoers + ACL + docker group?" "Y"; then
@@ -798,30 +1203,15 @@ main() {
     fi
   fi
 
-  local status_sh="$TMP_DIR/status_installer_public.sh"
-  local cleanup_sh="$TMP_DIR/cleanup_installer_public.sh"
-  local tseq_sh="$TMP_DIR/tseq_installer_public.sh"
-  local downloader_app_sh="$TMP_DIR/upg_installer.sh"
-  local upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
+  status_sh="$TMP_DIR/status_installer_public.sh"
+  cleanup_sh="$TMP_DIR/cleanup_installer_public.sh"
+  tseq_sh="$TMP_DIR/tseq_installer_public.sh"
+  downloader_app_sh="$TMP_DIR/upg_installer.sh"
+  upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
 
   section "SEKCJA 4/6 - MODUŁY CORE"
-  if prompt_yn "MODUŁ: Server-Status (systemd + /usr/local + /var/cache)?" "Y"; then
-    ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
-    download_to_tmp "$STATUS_URL" "$status_sh" "$STATUS_LOCAL_PATH"
-    run_module_root "$status_sh" "$TARGET_USER"
-    echo "[$(ts)] OK: Server-Status done."
-  else
-    echo "[$(ts)] SKIP: Server-Status."
-  fi
-
-  if prompt_yn "MODUŁ: TSEQ (systemd + /usr/local/sbin/tseq + ~/UTILITY/TSEQ)?" "Y"; then
-    ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
-    download_to_tmp "$TSEQ_URL" "$tseq_sh" "$TSEQ_LOCAL_PATH"
-    run_module_root "$tseq_sh"
-    echo "[$(ts)] OK: TSEQ done."
-  else
-    echo "[$(ts)] SKIP: TSEQ."
-  fi
+  install_status_step "$status_sh"
+  install_tseq_step "$tseq_sh"
 
   section "SEKCJA 5/6 - HOOKI I NARZĘDZIA UŻYTKOWE"
   if prompt_yn "MODUŁ: SSH login prompt: pytać czy zapisywać historię + potem status (bez dubli)?" "Y"; then
@@ -836,70 +1226,9 @@ main() {
     echo "[$(ts)] SKIP: SSH history prompt."
   fi
 
-  if prompt_yn "MODUŁ: Cleanup (usuń ~/UPG/*.xml + czyść ~/.cache przy wylogowaniu z SSH)?" "Y"; then
-    ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
-    download_to_tmp "$CLEANUP_URL" "$cleanup_sh" "$CLEANUP_LOCAL_PATH"
-    run_module_as_itgo "$cleanup_sh"
-    echo "[$(ts)] OK: Cleanup done."
-  else
-    echo "[$(ts)] SKIP: Cleanup."
-  fi
-
-  if prompt_yn "MODUŁ: DOWNLOADER_APP (zainstalować ~/UTILITY/DOWNLOADER_APP/upg_installer.sh i symlink /usr/local/bin/dwupg)?" "Y"; then
-    ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
-
-    if ! have_user; then
-      echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
-      exit 1
-    fi
-
-    ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
-    [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
-
-    UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
-    TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
-
-    [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
-    [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
-
-    download_to_tmp "$DOWNLOADER_APP_URL" "$downloader_app_sh" "$DOWNLOADER_APP_LOCAL_PATH"
-    install_downloader_app_script "$downloader_app_sh"
-    echo "[$(ts)] OK: DOWNLOADER_APP done."
-  else
-    echo "[$(ts)] SKIP: DOWNLOADER_APP."
-  fi
-
-  if prompt_yn "MODUŁ: UPGbuilder (zainstalować ~/UTILITY/UPGbuilder/upgbuilder.sh i symlink /usr/local/bin/upgbuilder)?" "Y"; then
-    ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
-
-    if ! have_user; then
-      echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
-      exit 1
-    fi
-
-    ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
-    [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
-
-    UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
-    TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
-
-    [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
-    [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
-
-    download_to_tmp "$UPGBUILDER_URL" "$upgbuilder_sh" "$UPGBUILDER_LOCAL_PATH"
-    install_upgbuilder_script "$upgbuilder_sh"
-
-    if prompt_yn "Uruchomić teraz: upgbuilder --detect jako $TARGET_USER?" "Y"; then
-      echo "[$(ts)] RUN(itgo): sudo -u $TARGET_USER /usr/local/bin/upgbuilder --detect"
-      sudo -u "$TARGET_USER" /usr/local/bin/upgbuilder --detect
-    else
-      echo "[$(ts)] SKIP: upgbuilder --detect."
-    fi
-
-    echo "[$(ts)] OK: UPGbuilder done."
-  else
-    echo "[$(ts)] SKIP: UPGbuilder."
-  fi
+  install_cleanup_step "$cleanup_sh"
+  install_downloader_app_step "$downloader_app_sh"
+  install_upgbuilder_step "$upgbuilder_sh"
 
   section "SEKCJA 6/6 - PORZĄDKI KOŃCOWE"
   cleanup_downloaded_installers
