@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.12"
+MASTER_VERSION="1.2.13"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.11"
@@ -154,6 +154,8 @@ LOG_UPDATE=""
 TMP_DIR=""
 FINAL_LOG=""
 MODULE_DECISION=""
+HISTORY_CLEAR_ON_LOGOUT_ENABLED=0
+SUMMARY_ITEMS=()
 
 start_final_logging_if_possible() {
   [[ -n "${LOG_OTHER:-}" && -d "$LOG_OTHER" ]] || return 0
@@ -181,6 +183,30 @@ start_final_logging_if_possible() {
     cat "$TMP_LOG" || true
     echo "[$(ts)] --- end pre-log ---"
   fi
+}
+
+add_summary() {
+  local item="${1:-}"
+  [[ -n "$item" ]] || return 0
+  SUMMARY_ITEMS+=("$item")
+}
+
+print_summary() {
+  local item
+
+  echo
+  echo "===================================================="
+  echo "[$(ts)] PODSUMOWANIE MASTER"
+  echo "===================================================="
+
+  if [[ "${#SUMMARY_ITEMS[@]}" -eq 0 ]]; then
+    echo "[$(ts)] Brak wpisów podsumowania."
+    return 0
+  fi
+
+  for item in "${SUMMARY_ITEMS[@]}"; do
+    echo "[$(ts)] - $item"
+  done
 }
 
 read_version_file() {
@@ -331,6 +357,7 @@ print_detected_modules_summary() {
     IFS='|' read -r module installed_version target_version health <<< "$line"
     printf "%-16s %-18s %-18s %s\n" \
       "$module" "${installed_version:-UNKNOWN}" "${target_version:-UNKNOWN}" "${health:-UNKNOWN}"
+    add_summary "Wykryto na starcie: $module installed=${installed_version:-UNKNOWN} target=${target_version:-UNKNOWN} health=${health:-UNKNOWN}"
   done <<< "$rows"
 }
 
@@ -341,6 +368,7 @@ should_install_or_update_module() {
   MODULE_DECISION="install"
 
   if ! module_is_installed "$module"; then
+    add_summary "$module: install (brak instalacji)"
     return 0
   fi
 
@@ -351,6 +379,7 @@ should_install_or_update_module() {
 
   if [[ "$version_cmp" == "eq" && "$health" == "OK" ]]; then
     MODULE_DECISION="skip"
+    add_summary "$module: skip (version=$target_version, health=OK)"
     echo "[$(ts)] SKIP: $module już zainstalowany w wersji docelowej $target_version i health=OK."
     return 1
   fi
@@ -358,9 +387,11 @@ should_install_or_update_module() {
   if [[ "$version_cmp" == "eq" && "$health" == "BROKEN" ]]; then
     if prompt_yn "MODUŁ: $module ma wersję $target_version, ale health=BROKEN. Wykonać repair/reinstall?" "Y"; then
       MODULE_DECISION="repair"
+      add_summary "$module: repair/reinstall"
       return 0
     fi
     MODULE_DECISION="skip"
+    add_summary "$module: skip (health=BROKEN, repair skipped)"
     echo "[$(ts)] SKIP: repair/reinstall $module."
     return 1
   fi
@@ -368,9 +399,11 @@ should_install_or_update_module() {
   if [[ "$version_cmp" == "lt" || "$version_cmp" == "gt" || "$version_cmp" == "unknown" ]]; then
     if prompt_yn "MODUŁ: $module ma wersję '${installed_version:-UNKNOWN}', docelowa to '${target_version:-UNKNOWN}'. Aktualizować?" "Y"; then
       MODULE_DECISION="update"
+      add_summary "$module: update (${installed_version:-UNKNOWN} -> ${target_version:-UNKNOWN})"
       return 0
     fi
     MODULE_DECISION="skip"
+    add_summary "$module: skip update (${installed_version:-UNKNOWN} -> ${target_version:-UNKNOWN})"
     echo "[$(ts)] SKIP: update $module."
     return 1
   fi
@@ -595,16 +628,19 @@ docker_login_amms_registry() {
 
   if ! have_user; then
     echo "[$(ts)] WARN: user '$TARGET_USER' nie istnieje. Pomijam docker login do $registry."
+    add_summary "Docker login: SKIP (user missing)"
     return 0
   fi
 
   if ! command -v docker >/dev/null 2>&1; then
     echo "[$(ts)] SKIP: docker CLI nie istnieje. Pomijam docker login do $registry."
+    add_summary "Docker login: SKIP (docker CLI missing)"
     return 0
   fi
 
   secret_file="$(get_amms_secret_file_path)" || {
     echo "[$(ts)] WARN: nie udało się ustalić HOME dla '$TARGET_USER'. Pomijam docker login do $registry."
+    add_summary "Docker login: WARN (cannot resolve HOME)"
     return 0
   }
   config_dir="$(dirname "$secret_file")"
@@ -612,17 +648,20 @@ docker_login_amms_registry() {
   if [[ ! -f "$secret_file" ]]; then
     print_amms_secret_instructions "$secret_file"
     echo "[$(ts)] SKIP: docker login do $registry."
+    add_summary "Docker login: SKIP (secret file missing)"
     return 0
   fi
 
   if ! prompt_yn "Wykonać docker login do $registry jako user '$TARGET_USER'?" "Y"; then
     echo "[$(ts)] SKIP: docker login do $registry."
+    add_summary "Docker login: SKIP (user declined)"
     return 0
   fi
 
   if ! validate_amms_secret_file "$secret_file"; then
     echo "[$(ts)] ERROR: walidacja sekretu nie powiodła się. Pomijam docker login do $registry."
     echo "[$(ts)] INFO: oczekiwano katalogu $config_dir z mode 700 i pliku $secret_file z mode 600, owner $TARGET_USER."
+    add_summary "Docker login: WARN (secret validation failed)"
     return 0
   fi
 
@@ -630,9 +669,11 @@ docker_login_amms_registry() {
   if sudo -H -u "$TARGET_USER" sh -c 'cat "$1" | docker login --username "$2" --password-stdin "$3"' _ "$secret_file" "$username" "$registry"; then
     echo "[$(ts)] OK: docker login do $registry wykonany jako '$TARGET_USER'."
     echo "[$(ts)] INFO: jeśli użytkownik został dopiero co dodany do grupy docker, może być wymagana nowa sesja."
+    add_summary "Docker login: OK"
   else
     echo "[$(ts)] WARN: docker login do $registry nie powiódł się dla usera '$TARGET_USER'."
     echo "[$(ts)] INFO: jeśli użytkownik został dopiero co dodany do grupy docker, może być wymagana nowa sesja."
+    add_summary "Docker login: WARN (login failed)"
   fi
 }
 
@@ -853,6 +894,68 @@ cleanup_downloaded_installers() {
       echo "[$(ts)] SKIP: keeping downloaded installers."
     fi
   fi
+}
+
+cleanup_tmp_installers_after_uninstall() {
+  if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
+    rm -f -- "$TMP_DIR"/*.sh 2>/dev/null || true
+    add_summary "TMP cleanup po uninstall: wykonane ($TMP_DIR/*.sh)"
+  else
+    add_summary "TMP cleanup po uninstall: SKIP (TMP_DIR unavailable)"
+  fi
+}
+
+remove_block_from_file() {
+  local file="${1:?}" start="${2:?}" end="${3:?}"
+  local tmp
+
+  [[ -f "$file" ]] || return 0
+  tmp="$(mktemp)"
+  awk -v start="$start" -v end="$end" '
+    $0==start {inside=1; next}
+    $0==end   {inside=0; next}
+    !inside   {print}
+  ' "$file" > "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
+restore_master_shell_settings() {
+  local bp bl
+  local bp_start="# >>> ITGO SSH HISTORY PROMPT (auto) >>>"
+  local bp_end="# <<< ITGO SSH HISTORY PROMPT (auto) <<<"
+  local bl_start="# >>> ITGO HISTORY CLEAR ON LOGOUT (auto) >>>"
+  local bl_end="# <<< ITGO HISTORY CLEAR ON LOGOUT (auto) <<<"
+
+  if ! have_user; then
+    add_summary "Restore shell settings MASTER: SKIP (user missing)"
+    return 0
+  fi
+
+  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+  if [[ -z "${ITGO_HOME:-}" ]]; then
+    add_summary "Restore shell settings MASTER: SKIP (cannot resolve home)"
+    return 0
+  fi
+
+  bp="$ITGO_HOME/.bash_profile"
+  bl="$ITGO_HOME/.bash_logout"
+
+  if [[ -f "$bp" ]]; then
+    safe_backup "$bp"
+    remove_block_from_file "$bp" "$bp_start" "$bp_end"
+    chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
+    chmod 0644 "$bp" 2>/dev/null || true
+  fi
+
+  if [[ -f "$bl" ]]; then
+    safe_backup "$bl"
+    remove_block_from_file "$bl" "$bl_start" "$bl_end"
+    chown "$TARGET_USER:$TARGET_USER" "$bl" 2>/dev/null || true
+    chmod 0644 "$bl" 2>/dev/null || true
+  fi
+
+  add_summary "Restore shell settings MASTER: wykonane"
 }
 
 install_ssh_history_prompt_block() {
@@ -1164,18 +1267,20 @@ prompt_uninstall_scope() {
   local ans=""
 
   echo "Wybierz zakres uninstall:" >&2
-  echo "1) Odinstaluj wszystko" >&2
+  echo "1) Odinstaluj wszystkie moduły + przywróć ustawienia MASTER" >&2
   echo "2) Odinstaluj pojedynczy moduł" >&2
+  echo "3) Przywróć tylko ustawienia shell dodane przez MASTER" >&2
   echo "q) Anuluj uninstall" >&2
 
   while true; do
-    printf "%s" "Wybierz [1-2/q]: " >&2
+    printf "%s" "Wybierz [1-3/q]: " >&2
     read -r ans || true
     case "${ans,,}" in
       1) echo "all"; return 0 ;;
       2) echo "single"; return 0 ;;
+      3) echo "master-shell"; return 0 ;;
       q) echo "cancel"; return 0 ;;
-      *) echo "Wpisz: 1, 2 albo q." >&2 ;;
+      *) echo "Wpisz: 1, 2, 3 albo q." >&2 ;;
     esac
   done
 }
@@ -1213,6 +1318,7 @@ uninstall_status_step() {
   download_to_tmp "$STATUS_URL" "$status_sh" "$STATUS_LOCAL_PATH"
   run_module_root "$status_sh" --uninstall "$TARGET_USER"
   echo "[$(ts)] OK: STATUS uninstall done."
+  add_summary "Uninstall: STATUS"
 }
 
 uninstall_tseq_step() {
@@ -1222,6 +1328,7 @@ uninstall_tseq_step() {
   download_to_tmp "$TSEQ_URL" "$tseq_sh" "$TSEQ_LOCAL_PATH"
   run_module_root "$tseq_sh" --uninstall
   echo "[$(ts)] OK: TSEQ uninstall done."
+  add_summary "Uninstall: TSEQ"
 }
 
 uninstall_cleanup_step() {
@@ -1231,6 +1338,7 @@ uninstall_cleanup_step() {
   download_to_tmp "$CLEANUP_URL" "$cleanup_sh" "$CLEANUP_LOCAL_PATH"
   run_module_as_itgo "$cleanup_sh" --uninstall
   echo "[$(ts)] OK: CLEANUP uninstall done."
+  add_summary "Uninstall: CLEANUP"
 }
 
 uninstall_downloader_app_step() {
@@ -1251,6 +1359,7 @@ uninstall_downloader_app_step() {
   rm -rf "$app_dir" 2>/dev/null || true
 
   echo "[$(ts)] OK: DOWNLOADER_APP uninstall done."
+  add_summary "Uninstall: DOWNLOADER_APP"
 }
 
 uninstall_upgbuilder_step() {
@@ -1271,6 +1380,7 @@ uninstall_upgbuilder_step() {
   rm -rf "$app_dir" 2>/dev/null || true
 
   echo "[$(ts)] OK: UPGbuilder uninstall done."
+  add_summary "Uninstall: UPGBUILDER"
 }
 
 run_single_module_uninstall() {
@@ -1327,18 +1437,33 @@ main() {
 
       uninstall_scope="$(prompt_uninstall_scope)"
       if [[ "$uninstall_scope" == "all" ]]; then
+        add_summary "Wybrany uninstall scope: all"
         run_all_module_uninstalls "$status_sh" "$cleanup_sh" "$tseq_sh"
+        restore_master_shell_settings
+        cleanup_tmp_installers_after_uninstall
+        print_summary
         exit 0
       elif [[ "$uninstall_scope" == "single" ]]; then
+        add_summary "Wybrany uninstall scope: single"
         uninstall_module="$(prompt_uninstall_module_choice)"
         if [[ "$uninstall_module" == "cancel" ]]; then
           echo "[$(ts)] SKIP: uninstall cancelled."
+          add_summary "Uninstall: cancelled at module selection"
         else
           run_single_module_uninstall "$uninstall_module" "$status_sh" "$cleanup_sh" "$tseq_sh"
+          cleanup_tmp_installers_after_uninstall
+          print_summary
           exit 0
         fi
+      elif [[ "$uninstall_scope" == "master-shell" ]]; then
+        add_summary "Wybrany uninstall scope: master-shell"
+        restore_master_shell_settings
+        cleanup_tmp_installers_after_uninstall
+        print_summary
+        exit 0
       else
         echo "[$(ts)] SKIP: uninstall cancelled."
+        add_summary "Uninstall: cancelled at scope selection"
       fi
     fi
   fi
@@ -1367,8 +1492,11 @@ main() {
     ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
     [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
     install_bash_logout_history_clear
+    HISTORY_CLEAR_ON_LOGOUT_ENABLED=1
+    add_summary "Shell: history clear on logout enabled"
   else
     echo "[$(ts)] SKIP: ~/.bash_logout history clear."
+    add_summary "Shell: history clear on logout skipped"
   fi
 
   if [[ -z "${TMP_DIR:-}" || ! -d "${TMP_DIR:-/nonexistent}" ]]; then
@@ -1394,16 +1522,23 @@ main() {
   install_tseq_step "$tseq_sh"
 
   section "SEKCJA 5/6 - HOOKI I NARZĘDZIA UŻYTKOWE"
-  if prompt_yn "MODUŁ: SSH login prompt: pytać czy zapisywać historię + potem status (bez dubli)?" "Y"; then
-    if ! have_user; then
-      echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
-      exit 1
-    fi
-    ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
-    [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
-    install_ssh_history_prompt_block
+  if [[ "$HISTORY_CLEAR_ON_LOGOUT_ENABLED" == "1" ]]; then
+    echo "[$(ts)] SKIP: SSH history prompt pominięty, bo włączono czyszczenie historii przy wylogowaniu."
+    add_summary "Shell: SSH history prompt skipped because history clear on logout is enabled"
   else
-    echo "[$(ts)] SKIP: SSH history prompt."
+    if prompt_yn "MODUŁ: SSH login prompt: pytać czy zapisywać historię + potem status (bez dubli)?" "Y"; then
+      if ! have_user; then
+        echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+        exit 1
+      fi
+      ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+      [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+      install_ssh_history_prompt_block
+      add_summary "Shell: SSH history prompt installed"
+    else
+      echo "[$(ts)] SKIP: SSH history prompt."
+      add_summary "Shell: SSH history prompt skipped"
+    fi
   fi
 
   install_cleanup_step "$cleanup_sh"
@@ -1415,6 +1550,7 @@ main() {
 
   echo "[$(ts)] DONE."
   [[ -n "${FINAL_LOG:-}" ]] && echo "[$(ts)] Master log: $FINAL_LOG"
+  print_summary
 }
 
 main "$@"
