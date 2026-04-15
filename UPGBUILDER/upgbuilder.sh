@@ -33,7 +33,7 @@ RULE_ORDER=(
 
 # -------------------- GLOBALS --------------------
 
-UPGBUILDER_VERSION="0.1.4"
+UPGBUILDER_VERSION="0.1.5"
 RAW_REPO_BASE="https://raw.githubusercontent.com/daroitgo/itgo-scripts"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -278,7 +278,15 @@ match_name() {
 
   case "$mode" in
     prefix)
-      [[ "$name" == "$value"* ]]
+      split_csv "$value" items
+      for item in "${items[@]}"; do
+        item="$(trim "$item")"
+        [[ -z "$item" ]] && continue
+        if [[ "$name" == "$item"* ]]; then
+          return 0
+        fi
+      done
+      return 1
       ;;
     contains)
       split_csv "$value" items

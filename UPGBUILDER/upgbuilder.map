@@ -32,9 +32,9 @@ platforms.log_path={{APP_DIR}}/apache-tomcat/logs
 # ==========================================================
 wildfly.output=update_wildfly.sh
 wildfly.template=template/template_update_wildfly.sh
-wildfly.version=1.0.0
+wildfly.version=1.1.0
 wildfly.detect_mode=prefix
-wildfly.detect_value=Wildfly
+wildfly.detect_value=Wildfly,WildFly
 wildfly.log_path={{APP_DIR}}/wildfly-26.0.1.Final/standalone/log
 
 # ==========================================================
