@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.9"
+MASTER_VERSION="1.2.10"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.11"
@@ -101,8 +101,8 @@ prompt_yn() {
       ans="${ans:-N}"
     fi
     case "${ans,,}" in
-      y|yes) return 0 ;;
-      n|no)  return 1 ;;
+      y|yes|t|tak)   return 0 ;;
+      n|no|nie)      return 1 ;;
       *) echo "Wpisz: y albo n." ;;
     esac
   done
@@ -1155,12 +1155,18 @@ ensure_tmp_dir_for_module_actions() {
 prompt_uninstall_scope() {
   local ans=""
 
+  echo "Wybierz zakres uninstall:"
+  echo "1) Odinstaluj wszystko"
+  echo "2) Odinstaluj pojedynczy moduł"
+  echo "q) Anuluj uninstall"
+
   while true; do
-    read -r -p "Odinstalować wszystko czy pojedynczy moduł? [a/o]: " ans || true
+    read -r -p "Wybierz [1-2/q]: " ans || true
     case "${ans,,}" in
-      a|all|wszystko) echo "all"; return 0 ;;
-      o|one|single|pojedynczy) echo "single"; return 0 ;;
-      *) echo "Wpisz: a albo o." ;;
+      1) echo "all"; return 0 ;;
+      2) echo "single"; return 0 ;;
+      q) echo "cancel"; return 0 ;;
+      *) echo "Wpisz: 1, 2 albo q." ;;
     esac
   done
 }
@@ -1174,16 +1180,18 @@ prompt_uninstall_module_choice() {
   echo "3) TSEQ"
   echo "4) DOWNLOADER_APP"
   echo "5) UPGBUILDER"
+  echo "q) Anuluj uninstall"
 
   while true; do
-    read -r -p "Wybierz [1-5]: " ans || true
+    read -r -p "Wybierz [1-5/q]: " ans || true
     case "$ans" in
       1) echo "STATUS"; return 0 ;;
       2) echo "CLEANUP"; return 0 ;;
       3) echo "TSEQ"; return 0 ;;
       4) echo "DOWNLOADER_APP"; return 0 ;;
       5) echo "UPGBUILDER"; return 0 ;;
-      *) echo "Wpisz liczbę od 1 do 5." ;;
+      q|Q) echo "cancel"; return 0 ;;
+      *) echo "Wpisz liczbę od 1 do 5 albo q." ;;
     esac
   done
 }
@@ -1310,11 +1318,18 @@ main() {
       uninstall_scope="$(prompt_uninstall_scope)"
       if [[ "$uninstall_scope" == "all" ]]; then
         run_all_module_uninstalls "$status_sh" "$cleanup_sh" "$tseq_sh"
-      else
+        exit 0
+      elif [[ "$uninstall_scope" == "single" ]]; then
         uninstall_module="$(prompt_uninstall_module_choice)"
-        run_single_module_uninstall "$uninstall_module" "$status_sh" "$cleanup_sh" "$tseq_sh"
+        if [[ "$uninstall_module" == "cancel" ]]; then
+          echo "[$(ts)] SKIP: uninstall cancelled."
+        else
+          run_single_module_uninstall "$uninstall_module" "$status_sh" "$cleanup_sh" "$tseq_sh"
+          exit 0
+        fi
+      else
+        echo "[$(ts)] SKIP: uninstall cancelled."
       fi
-      exit 0
     fi
   fi
 
