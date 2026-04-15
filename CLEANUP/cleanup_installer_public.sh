@@ -18,7 +18,8 @@ set -euo pipefail
 # - ścieżka /home/itgo/UPG jest na stałe
 # ==========================================================
 
-VERSION="1.0.2"
+VERSION="1.0.3"
+MODE="${1:-install}"
 
 UTILITY_DIR="${HOME}/UTILITY"
 MODULE_DIR="${UTILITY_DIR}/UPG_CLEANUP"
@@ -92,7 +93,22 @@ append_fresh_block() {
   printf "\n%s\n" "$SNIPPET" >> "$BASHRC"
 }
 
+uninstall_cleanup() {
+  touch "$BASHRC"
+  remove_old_block_if_exists
+  rm -rf "$MODULE_DIR" 2>/dev/null || true
+
+  echo "OK: usunięto blok CLEANUP z $BASHRC (jeśli istniał)."
+  echo "OK: usunięto katalog $MODULE_DIR (jeśli istniał)."
+  echo "DONE"
+}
+
 main() {
+  if [[ "$MODE" == "--uninstall" ]]; then
+    uninstall_cleanup
+    exit 0
+  fi
+
   ensure_dirs
   write_version_file
 
