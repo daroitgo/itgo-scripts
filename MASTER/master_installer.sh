@@ -37,12 +37,12 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.8"
+MASTER_VERSION="1.2.9"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
-STATUS_VERSION="3.12.10"
-CLEANUP_VERSION="1.0.2"
-TSEQ_VERSION="3.12.1"
+STATUS_VERSION="3.12.11"
+CLEANUP_VERSION="1.0.3"
+TSEQ_VERSION="3.12.2"
 DOWNLOADER_APP_VERSION="1.0.1"
 UPGBUILDER_VERSION="0.1.4"
 
@@ -618,8 +618,8 @@ docker_login_amms_registry() {
     return 0
   fi
 
-  echo "[$(ts)] ACTION: docker login --username $username --password-stdin $registry (sudo -u $TARGET_USER)"
-  if sudo -u "$TARGET_USER" sh -c 'cat "$1" | docker login --username "$2" --password-stdin "$3"' _ "$secret_file" "$username" "$registry"; then
+  echo "[$(ts)] ACTION: docker login --username $username --password-stdin $registry (sudo -H -u $TARGET_USER)"
+  if sudo -H -u "$TARGET_USER" sh -c 'cat "$1" | docker login --username "$2" --password-stdin "$3"' _ "$secret_file" "$username" "$registry"; then
     echo "[$(ts)] OK: docker login do $registry wykonany jako '$TARGET_USER'."
     echo "[$(ts)] INFO: jeśli użytkownik został dopiero co dodany do grupy docker, może być wymagana nowa sesja."
   else
@@ -741,15 +741,17 @@ download_to_tmp() {
 }
 
 run_module_root() {
-  local script="${1:?}" args="${2:-}"
-  echo "[$(ts)] RUN(root): bash $script $args"
-  bash "$script" $args
+  local script="${1:?}"
+  shift || true
+  echo "[$(ts)] RUN(root): bash $script $*"
+  bash "$script" "$@"
 }
 
 run_module_as_itgo() {
-  local script="${1:?}" args="${2:-}"
-  echo "[$(ts)] RUN(itgo): sudo -u $TARGET_USER bash $script $args"
-  sudo -u "$TARGET_USER" bash "$script" $args
+  local script="${1:?}"
+  shift || true
+  echo "[$(ts)] RUN(itgo): sudo -H -u $TARGET_USER bash $script $*"
+  sudo -H -u "$TARGET_USER" bash "$script" "$@"
 }
 
 install_downloader_app_script() {
@@ -1065,8 +1067,8 @@ install_upgbuilder_step() {
         install_upgbuilder_script "$upgbuilder_sh"
 
         if prompt_yn "Uruchomić teraz: upgbuilder --detect jako $TARGET_USER?" "Y"; then
-          echo "[$(ts)] RUN(itgo): sudo -u $TARGET_USER /usr/local/bin/upgbuilder --detect"
-          sudo -u "$TARGET_USER" /usr/local/bin/upgbuilder --detect
+          echo "[$(ts)] RUN(itgo): sudo -H -u $TARGET_USER /usr/local/bin/upgbuilder --detect"
+          sudo -H -u "$TARGET_USER" /usr/local/bin/upgbuilder --detect
         else
           echo "[$(ts)] SKIP: upgbuilder --detect."
         fi
@@ -1096,8 +1098,8 @@ install_upgbuilder_step() {
       install_upgbuilder_script "$upgbuilder_sh"
 
       if prompt_yn "Uruchomić teraz: upgbuilder --detect jako $TARGET_USER?" "Y"; then
-        echo "[$(ts)] RUN(itgo): sudo -u $TARGET_USER /usr/local/bin/upgbuilder --detect"
-        sudo -u "$TARGET_USER" /usr/local/bin/upgbuilder --detect
+        echo "[$(ts)] RUN(itgo): sudo -H -u $TARGET_USER /usr/local/bin/upgbuilder --detect"
+        sudo -H -u "$TARGET_USER" /usr/local/bin/upgbuilder --detect
       else
         echo "[$(ts)] SKIP: upgbuilder --detect."
       fi
@@ -1129,20 +1131,7 @@ prepare_dirs_after_skip_bootstrap() {
   fi
 }
 
-section() {
-  echo
-  echo "===================================================="
-  echo "[$(ts)] $*"
-  echo "===================================================="
-}
-
-main() {
-  local detected_modules=""
-  local status_sh cleanup_sh tseq_sh downloader_app_sh upgbuilder_sh
-
-  need_root
-  prelog "BEGIN: ITGO Master Installer v$MASTER_VERSION user=$TARGET_USER"
-
+prepare_user_paths_if_possible() {
   if have_user; then
     ITGO_HOME="$(resolve_home)" || true
     if [[ -n "${ITGO_HOME:-}" ]]; then
@@ -1153,12 +1142,178 @@ main() {
       TMP_DIR="$UTILITY_DIR/TMP"
     fi
   fi
+}
+
+ensure_tmp_dir_for_module_actions() {
+  [[ -n "${TMP_DIR:-}" ]] || return 1
+
+  if [[ ! -d "$TMP_DIR" ]]; then
+    install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+  fi
+}
+
+prompt_uninstall_scope() {
+  local ans=""
+
+  while true; do
+    read -r -p "Odinstalować wszystko czy pojedynczy moduł? [a/o]: " ans || true
+    case "${ans,,}" in
+      a|all|wszystko) echo "all"; return 0 ;;
+      o|one|single|pojedynczy) echo "single"; return 0 ;;
+      *) echo "Wpisz: a albo o." ;;
+    esac
+  done
+}
+
+prompt_uninstall_module_choice() {
+  local ans=""
+
+  echo "Wybierz moduł do odinstalowania:"
+  echo "1) STATUS"
+  echo "2) CLEANUP"
+  echo "3) TSEQ"
+  echo "4) DOWNLOADER_APP"
+  echo "5) UPGBUILDER"
+
+  while true; do
+    read -r -p "Wybierz [1-5]: " ans || true
+    case "$ans" in
+      1) echo "STATUS"; return 0 ;;
+      2) echo "CLEANUP"; return 0 ;;
+      3) echo "TSEQ"; return 0 ;;
+      4) echo "DOWNLOADER_APP"; return 0 ;;
+      5) echo "UPGBUILDER"; return 0 ;;
+      *) echo "Wpisz liczbę od 1 do 5." ;;
+    esac
+  done
+}
+
+uninstall_status_step() {
+  local status_sh="${1:?}"
+
+  ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module uninstall."; exit 1; }
+  download_to_tmp "$STATUS_URL" "$status_sh" "$STATUS_LOCAL_PATH"
+  run_module_root "$status_sh" --uninstall "$TARGET_USER"
+  echo "[$(ts)] OK: STATUS uninstall done."
+}
+
+uninstall_tseq_step() {
+  local tseq_sh="${1:?}"
+
+  ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module uninstall."; exit 1; }
+  download_to_tmp "$TSEQ_URL" "$tseq_sh" "$TSEQ_LOCAL_PATH"
+  run_module_root "$tseq_sh" --uninstall
+  echo "[$(ts)] OK: TSEQ uninstall done."
+}
+
+uninstall_cleanup_step() {
+  local cleanup_sh="${1:?}"
+
+  ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module uninstall."; exit 1; }
+  download_to_tmp "$CLEANUP_URL" "$cleanup_sh" "$CLEANUP_LOCAL_PATH"
+  run_module_as_itgo "$cleanup_sh" --uninstall
+  echo "[$(ts)] OK: CLEANUP uninstall done."
+}
+
+uninstall_downloader_app_step() {
+  local app_dir link
+
+  if ! have_user; then
+    echo "[$(ts)] WARN: user '$TARGET_USER' missing. Pomijam DOWNLOADER_APP uninstall."
+    return 0
+  fi
+
+  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+  [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] WARN: cannot resolve home for '$TARGET_USER'. Pomijam DOWNLOADER_APP uninstall."; return 0; }
+
+  app_dir="$ITGO_HOME/UTILITY/DOWNLOADER_APP"
+  link="/usr/local/bin/dwupg"
+
+  rm -f "$link" 2>/dev/null || true
+  rm -rf "$app_dir" 2>/dev/null || true
+
+  echo "[$(ts)] OK: DOWNLOADER_APP uninstall done."
+}
+
+uninstall_upgbuilder_step() {
+  local app_dir link
+
+  if ! have_user; then
+    echo "[$(ts)] WARN: user '$TARGET_USER' missing. Pomijam UPGbuilder uninstall."
+    return 0
+  fi
+
+  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+  [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] WARN: cannot resolve home for '$TARGET_USER'. Pomijam UPGbuilder uninstall."; return 0; }
+
+  app_dir="$ITGO_HOME/UTILITY/UPGbuilder"
+  link="/usr/local/bin/upgbuilder"
+
+  rm -f "$link" 2>/dev/null || true
+  rm -rf "$app_dir" 2>/dev/null || true
+
+  echo "[$(ts)] OK: UPGbuilder uninstall done."
+}
+
+run_single_module_uninstall() {
+  local module="${1:?}" status_sh="${2:?}" cleanup_sh="${3:?}" tseq_sh="${4:?}"
+
+  case "$module" in
+    STATUS)         uninstall_status_step "$status_sh" ;;
+    CLEANUP)        uninstall_cleanup_step "$cleanup_sh" ;;
+    TSEQ)           uninstall_tseq_step "$tseq_sh" ;;
+    DOWNLOADER_APP) uninstall_downloader_app_step ;;
+    UPGBUILDER)     uninstall_upgbuilder_step ;;
+    *) echo "[$(ts)] ERROR: unknown module for uninstall: $module"; exit 1 ;;
+  esac
+}
+
+run_all_module_uninstalls() {
+  local status_sh="${1:?}" cleanup_sh="${2:?}" tseq_sh="${3:?}"
+
+  uninstall_status_step "$status_sh"
+  uninstall_cleanup_step "$cleanup_sh"
+  uninstall_tseq_step "$tseq_sh"
+  uninstall_downloader_app_step
+  uninstall_upgbuilder_step
+}
+
+section() {
+  echo
+  echo "===================================================="
+  echo "[$(ts)] $*"
+  echo "===================================================="
+}
+
+main() {
+  local detected_modules="" uninstall_scope="" uninstall_module=""
+  local status_sh cleanup_sh tseq_sh downloader_app_sh upgbuilder_sh
+
+  need_root
+  prelog "BEGIN: ITGO Master Installer v$MASTER_VERSION user=$TARGET_USER"
+
+  prepare_user_paths_if_possible
 
   detected_modules="$(detect_installed_modules)"
   if any_itgo_module_installed; then
     print_detected_modules_summary "$detected_modules"
     if prompt_yn "Wykryto istniejącą instalację ITGO. Czy chcesz odinstalować?" "N"; then
-      echo "[$(ts)] INFO: pełny uninstall zostanie dodany w etapie 2B."
+      [[ -n "${TMP_DIR:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve TMP_DIR for uninstall."; exit 1; }
+      ensure_tmp_dir_for_module_actions
+
+      status_sh="$TMP_DIR/status_installer_public.sh"
+      cleanup_sh="$TMP_DIR/cleanup_installer_public.sh"
+      tseq_sh="$TMP_DIR/tseq_installer_public.sh"
+      downloader_app_sh="$TMP_DIR/upg_installer.sh"
+      upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
+
+      uninstall_scope="$(prompt_uninstall_scope)"
+      if [[ "$uninstall_scope" == "all" ]]; then
+        run_all_module_uninstalls "$status_sh" "$cleanup_sh" "$tseq_sh"
+      else
+        uninstall_module="$(prompt_uninstall_module_choice)"
+        run_single_module_uninstall "$uninstall_module" "$status_sh" "$cleanup_sh" "$tseq_sh"
+      fi
       exit 0
     fi
   fi
