@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.13"
+MASTER_VERSION="1.2.14"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.11"
@@ -620,6 +620,39 @@ print_amms_secret_instructions() {
   echo "[$(ts)] INFO:   chown -R \"$TARGET_USER:$TARGET_USER\" \"$config_dir\""
 }
 
+create_amms_secret_file() {
+  local secret_file="${1:?}"
+  local config_dir password=""
+
+  config_dir="$(dirname "$secret_file")"
+
+  echo "[$(ts)] INFO: sekret AMMS docker registry zostanie zapisany do: $secret_file"
+  if ! prompt_yn "Utworzyć teraz sekret AMMS docker registry dla user '$TARGET_USER'?" "Y"; then
+    add_summary "Docker login: secret creation skipped"
+    return 1
+  fi
+
+  install -d -m 0700 -o "$TARGET_USER" -g "$TARGET_USER" "$config_dir"
+
+  printf "%s" "Hasło do amms.asseco.pl dla usera wdrozenia: " >&2
+  read -r -s password || true
+  printf "\n" >&2
+
+  if [[ -z "${password:-}" ]]; then
+    echo "[$(ts)] WARN: puste hasło. Pomijam utworzenie sekretu i docker login."
+    add_summary "Docker login: empty secret skipped"
+    return 1
+  fi
+
+  printf "%s\n" "$password" > "$secret_file"
+  chown "$TARGET_USER:$TARGET_USER" "$secret_file" 2>/dev/null || true
+  chmod 0600 "$secret_file" 2>/dev/null || true
+  unset password
+
+  add_summary "Docker login: secret created"
+  return 0
+}
+
 docker_login_amms_registry() {
   local secret_file config_dir registry username
 
@@ -646,10 +679,12 @@ docker_login_amms_registry() {
   config_dir="$(dirname "$secret_file")"
 
   if [[ ! -f "$secret_file" ]]; then
-    print_amms_secret_instructions "$secret_file"
-    echo "[$(ts)] SKIP: docker login do $registry."
-    add_summary "Docker login: SKIP (secret file missing)"
-    return 0
+    echo "[$(ts)] INFO: nie znaleziono pliku sekretu: $secret_file"
+    if ! create_amms_secret_file "$secret_file"; then
+      print_amms_secret_instructions "$secret_file"
+      echo "[$(ts)] SKIP: docker login do $registry."
+      return 0
+    fi
   fi
 
   if ! prompt_yn "Wykonać docker login do $registry jako user '$TARGET_USER'?" "Y"; then
