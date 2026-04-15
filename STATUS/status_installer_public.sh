@@ -22,8 +22,16 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.10"
-TARGET_USER="${1:-itgo}"
+VERSION="3.12.11"
+MODE="install"
+TARGET_USER="itgo"
+
+if [[ "${1:-}" == "--uninstall" ]]; then
+  MODE="uninstall"
+  TARGET_USER="${2:-itgo}"
+else
+  TARGET_USER="${1:-itgo}"
+fi
 
 CACHE_DIR="/var/cache/server-status"
 EOL_DB_DIR="/usr/local/share/server-status"
@@ -1003,7 +1011,26 @@ EOF_CMD
   chmod 0755 /usr/local/bin/status
 }
 
+remove_block_from_file() {
+  local file="${1:?}" start_marker="${2:?}" end_marker="${3:?}"
+  local tmp
+
+  [[ -f "$file" ]] || return 0
+
+  tmp="$(mktemp)"
+  awk -v start="$start_marker" -v end="$end_marker" '
+    $0==start {inside=1; next}
+    $0==end   {inside=0; next}
+    !inside   {print}
+  ' "$file" > "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
 patch_bash_profile() {
+  local start_marker="# --- system-audit on SSH login (background) ---"
+  local end_marker="# --- /system-audit ---"
+
   touch "$BASH_PROFILE"
   chown "$TARGET_USER:$TARGET_USER" "$BASH_PROFILE"
   chmod 0644 "$BASH_PROFILE" 2>/dev/null || true
@@ -1011,7 +1038,7 @@ patch_bash_profile() {
   cleanup_old_legacy_backups
   safe_backup "$BASH_PROFILE"
 
-  perl -0777 -i -pe 's/\n# --- system-audit on SSH login \(background\) ---.*?# --- \/system-audit ---\n/\n/sms' "$BASH_PROFILE"
+  remove_block_from_file "$BASH_PROFILE" "$start_marker" "$end_marker"
 
   cat >> "$BASH_PROFILE" <<'EOF_BP'
 
@@ -1025,10 +1052,66 @@ command -v status >/dev/null 2>&1 && status 2>/dev/null || true
 EOF_BP
 }
 
+remove_status_profile_block() {
+  local start_marker="# --- system-audit on SSH login (background) ---"
+  local end_marker="# --- /system-audit ---"
+
+  [[ -f "$BASH_PROFILE" ]] || return 0
+
+  remove_block_from_file "$BASH_PROFILE" "$start_marker" "$end_marker"
+}
+
+uninstall_status() {
+  need_root
+  ensure_user
+  resolve_home
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop server-status-collect.timer 2>/dev/null || true
+    systemctl stop server-status-collect.service 2>/dev/null || true
+    systemctl stop server-status-apps-collect.timer 2>/dev/null || true
+    systemctl stop server-status-apps-collect.service 2>/dev/null || true
+
+    systemctl disable server-status-collect.timer 2>/dev/null || true
+    systemctl disable server-status-apps-collect.timer 2>/dev/null || true
+
+    systemctl reset-failed server-status-collect.service 2>/dev/null || true
+    systemctl reset-failed server-status-apps-collect.service 2>/dev/null || true
+    systemctl reset-failed server-status-collect.timer 2>/dev/null || true
+    systemctl reset-failed server-status-apps-collect.timer 2>/dev/null || true
+  fi
+
+  rm -f "$UNIT_SERVICE" "$UNIT_TIMER" "$UNIT_APPS_SERVICE" "$UNIT_APPS_TIMER" 2>/dev/null || true
+  rm -f /usr/local/bin/status "$SYSTEMD_COLLECT" "$SYSTEMD_APPS_COLLECT" 2>/dev/null || true
+  rm -rf "$STATUS_DIR" 2>/dev/null || true
+
+  if [[ -d "$CACHE_DIR" && ! -L "$CACHE_DIR" ]]; then
+    rm -rf "$CACHE_DIR" 2>/dev/null || true
+  fi
+
+  if [[ -d "$EOL_DB_DIR" && ! -L "$EOL_DB_DIR" ]]; then
+    rm -rf "$EOL_DB_DIR" 2>/dev/null || true
+  fi
+
+  remove_status_profile_block
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+
+  echo "OK: STATUS uninstall finished for user $TARGET_USER"
+}
+
 main() {
   need_root
   ensure_user
   resolve_home
+
+  if [[ "$MODE" == "uninstall" ]]; then
+    uninstall_status
+    exit 0
+  fi
+
   setup_dirs
   write_installer_version_file
   write_eol_db
