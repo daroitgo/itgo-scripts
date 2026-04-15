@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.14"
+MASTER_VERSION="1.2.15"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.11"
@@ -144,6 +144,61 @@ install_packages() {
     echo "[$(ts)] ERROR: brak dnf/yum."
     return 1
   fi
+}
+
+install_master_launcher() {
+  local launcher="/usr/local/bin/master-install"
+
+  cat > "$launcher" <<'EOF_MASTER_LAUNCHER'
+#!/usr/bin/env bash
+set -eu
+set -o pipefail 2>/dev/null || true
+
+target_user="${1:-itgo}"
+repo_api="https://api.github.com/repos/daroitgo/itgo-scripts/tags?per_page=100"
+tmp_script="$(mktemp)"
+
+cleanup() {
+  rm -f "$tmp_script" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+if ! command -v wget >/dev/null 2>&1; then
+  echo "ERROR: wget is required for master-install" >&2
+  exit 1
+fi
+
+latest_tag="$(
+  wget -qO- "$repo_api" \
+    | grep -o '"name":[[:space:]]*"master-[^"]*"' \
+    | sed 's/.*"name":[[:space:]]*"\(master-[^"]*\)"/\1/' \
+    | sort -V \
+    | tail -n1
+)"
+
+if [[ -z "${latest_tag:-}" ]]; then
+  echo "ERROR: cannot determine latest master-* tag from daroitgo/itgo-scripts" >&2
+  exit 1
+fi
+
+script_url="https://raw.githubusercontent.com/daroitgo/itgo-scripts/${latest_tag}/MASTER/master_installer.sh"
+
+if ! wget -qO "$tmp_script" "$script_url"; then
+  echo "ERROR: cannot download MASTER/master_installer.sh from tag ${latest_tag}" >&2
+  exit 1
+fi
+
+chmod 0755 "$tmp_script" 2>/dev/null || true
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  bash "$tmp_script" "$target_user"
+else
+  sudo bash "$tmp_script" "$target_user"
+fi
+EOF_MASTER_LAUNCHER
+
+  chmod 0755 "$launcher"
+  add_summary "MASTER launcher installed: $launcher"
 }
 
 ITGO_HOME=""
@@ -1510,6 +1565,8 @@ main() {
     echo "[$(ts)] SKIP: bootstrap."
     prepare_dirs_after_skip_bootstrap
   fi
+
+  install_master_launcher
 
   section "SEKCJA 2/6 - NARZĘDZIA SYSTEMOWE"
   if prompt_yn "KROK: sprawdzić nano, mc, rsync, dos2unix, jq, wget i doinstalować brakujące?" "Y"; then
