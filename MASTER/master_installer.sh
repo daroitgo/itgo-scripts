@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.10"
+MASTER_VERSION="1.2.11"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.11"
@@ -94,16 +94,24 @@ prompt_yn() {
   local q="${1:?}" def="${2:-N}" ans=""
   while true; do
     if [[ "$def" == "Y" ]]; then
-      read -r -p "$q [Y/n]: " ans || true
+      printf "%s" "$q [Y/n]: " >&2
+      read -r ans || true
       ans="${ans:-Y}"
     else
-      read -r -p "$q [y/N]: " ans || true
+      printf "%s" "$q [y/N]: " >&2
+      read -r ans || true
       ans="${ans:-N}"
     fi
-    case "${ans,,}" in
+
+    ans="${ans//$'\r'/}"
+    ans="${ans#"${ans%%[![:space:]]*}"}"
+    ans="${ans%"${ans##*[![:space:]]}"}"
+    ans="${ans,,}"
+
+    case "$ans" in
       y|yes|t|tak)   return 0 ;;
       n|no|nie)      return 1 ;;
-      *) echo "Wpisz: y albo n." ;;
+      *) echo "Wpisz: y/yes/t/tak albo n/no/nie." >&2 ;;
     esac
   done
 }
@@ -1155,18 +1163,19 @@ ensure_tmp_dir_for_module_actions() {
 prompt_uninstall_scope() {
   local ans=""
 
-  echo "Wybierz zakres uninstall:"
-  echo "1) Odinstaluj wszystko"
-  echo "2) Odinstaluj pojedynczy moduł"
-  echo "q) Anuluj uninstall"
+  echo "Wybierz zakres uninstall:" >&2
+  echo "1) Odinstaluj wszystko" >&2
+  echo "2) Odinstaluj pojedynczy moduł" >&2
+  echo "q) Anuluj uninstall" >&2
 
   while true; do
-    read -r -p "Wybierz [1-2/q]: " ans || true
+    printf "%s" "Wybierz [1-2/q]: " >&2
+    read -r ans || true
     case "${ans,,}" in
       1) echo "all"; return 0 ;;
       2) echo "single"; return 0 ;;
       q) echo "cancel"; return 0 ;;
-      *) echo "Wpisz: 1, 2 albo q." ;;
+      *) echo "Wpisz: 1, 2 albo q." >&2 ;;
     esac
   done
 }
@@ -1174,16 +1183,17 @@ prompt_uninstall_scope() {
 prompt_uninstall_module_choice() {
   local ans=""
 
-  echo "Wybierz moduł do odinstalowania:"
-  echo "1) STATUS"
-  echo "2) CLEANUP"
-  echo "3) TSEQ"
-  echo "4) DOWNLOADER_APP"
-  echo "5) UPGBUILDER"
-  echo "q) Anuluj uninstall"
+  echo "Wybierz moduł do odinstalowania:" >&2
+  echo "1) STATUS" >&2
+  echo "2) CLEANUP" >&2
+  echo "3) TSEQ" >&2
+  echo "4) DOWNLOADER_APP" >&2
+  echo "5) UPGBUILDER" >&2
+  echo "q) Anuluj uninstall" >&2
 
   while true; do
-    read -r -p "Wybierz [1-5/q]: " ans || true
+    printf "%s" "Wybierz [1-5/q]: " >&2
+    read -r ans || true
     case "$ans" in
       1) echo "STATUS"; return 0 ;;
       2) echo "CLEANUP"; return 0 ;;
@@ -1191,7 +1201,7 @@ prompt_uninstall_module_choice() {
       4) echo "DOWNLOADER_APP"; return 0 ;;
       5) echo "UPGBUILDER"; return 0 ;;
       q|Q) echo "cancel"; return 0 ;;
-      *) echo "Wpisz liczbę od 1 do 5 albo q." ;;
+      *) echo "Wpisz liczbę od 1 do 5 albo q." >&2 ;;
     esac
   done
 }
