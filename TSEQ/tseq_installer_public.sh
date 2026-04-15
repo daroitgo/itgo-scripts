@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # ========= TSEQ (Tomcat Sequencer) Installer v3.12.1 =========
-VERSION="3.12.1"
+VERSION="3.12.2"
 BASE_USER="itgo"
+MODE="${1:-install}"
 
 UTILITY_DIRNAME="UTILITY"
 APP_DIRNAME="TSEQ"
@@ -139,6 +140,35 @@ pre_cleanup_if_newer() {
 
   echo "INFO: tseq already installed version=$inst, installer version=$VERSION -> no changes"
   return 1
+}
+
+uninstall_tseq() {
+  need_root
+
+  log "UNINSTALL v$VERSION: begin"
+  log "USER: $BASE_USER"
+  log "HOME: $BASE_HOME"
+  log "BASE: $BASE_DIR"
+  log "SERVICE: tseq.service"
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop tseq 2>/dev/null || true
+    systemctl disable tseq 2>/dev/null || true
+    systemctl reset-failed tseq 2>/dev/null || true
+  fi
+
+  rm -f "$SYSTEMD_UNIT" 2>/dev/null || true
+  rm -f "$WRAPPER_BIN" 2>/dev/null || true
+  rm -rf "$BASE_DIR" 2>/dev/null || true
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+
+  log "UNINSTALL: removed unit $SYSTEMD_UNIT (if present)"
+  log "UNINSTALL: removed wrapper $WRAPPER_BIN (if present)"
+  log "UNINSTALL: removed base dir $BASE_DIR (if present)"
+  log "UNINSTALL: done"
 }
 
 ensure_dirs() {
@@ -578,6 +608,11 @@ write_default_order_if_missing() {
 
 main() {
   need_root
+
+  if [[ "$MODE" == "--uninstall" ]]; then
+    uninstall_tseq
+    exit 0
+  fi
 
   if ! pre_cleanup_if_newer; then
     exit 0
