@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.16"
+MASTER_VERSION="1.2.17"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.11"
@@ -46,7 +46,16 @@ TSEQ_VERSION="3.12.2"
 DOWNLOADER_APP_VERSION="1.0.1"
 UPGBUILDER_VERSION="0.1.5"
 
-TARGET_USER="${1:-itgo}"
+MODE="install"
+UPDATE_ONLY_MODE="0"
+
+if [[ "${1:-}" == "--update-only" ]]; then
+  MODE="update-only"
+  UPDATE_ONLY_MODE="1"
+  TARGET_USER="${2:-itgo}"
+else
+  TARGET_USER="${1:-itgo}"
+fi
 
 GITHUB_OWNER="daroitgo"
 GITHUB_REPO="itgo-scripts"
@@ -147,7 +156,9 @@ install_packages() {
 }
 
 install_master_launcher() {
-  local launcher_dir launcher bp legacy_launcher="/usr/local/bin/master-install"
+  local launcher_dir install_launcher update_launcher bp
+  local legacy_install_launcher="/usr/local/bin/master-install"
+  local legacy_update_launcher="/usr/local/bin/master-update"
   local path_start="# >>> ITGO MASTER PATH (auto) >>>"
   local path_end="# <<< ITGO MASTER PATH (auto) <<<"
 
@@ -160,19 +171,27 @@ install_master_launcher() {
   [[ -n "${ITGO_HOME:-}" ]] || { add_summary "MASTER launcher installed: SKIP (cannot resolve home)"; return 0; }
 
   launcher_dir="$ITGO_HOME/UTILITY/MASTER"
-  launcher="$launcher_dir/master-install"
+  install_launcher="$launcher_dir/master-install"
+  update_launcher="$launcher_dir/master-update"
   bp="$ITGO_HOME/.bash_profile"
 
-  if [[ -e "$legacy_launcher" || -L "$legacy_launcher" ]]; then
-    rm -f "$legacy_launcher" 2>/dev/null || true
-    add_summary "MASTER legacy launcher removed: $legacy_launcher"
+  if [[ -e "$legacy_install_launcher" || -L "$legacy_install_launcher" ]]; then
+    rm -f "$legacy_install_launcher" 2>/dev/null || true
+    add_summary "MASTER legacy launcher removed: $legacy_install_launcher"
   else
-    add_summary "MASTER legacy launcher removed: SKIP ($legacy_launcher not present)"
+    add_summary "MASTER legacy launcher removed: SKIP ($legacy_install_launcher not present)"
+  fi
+
+  if [[ -e "$legacy_update_launcher" || -L "$legacy_update_launcher" ]]; then
+    rm -f "$legacy_update_launcher" 2>/dev/null || true
+    add_summary "MASTER legacy launcher removed: $legacy_update_launcher"
+  else
+    add_summary "MASTER legacy launcher removed: SKIP ($legacy_update_launcher not present)"
   fi
 
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$launcher_dir"
 
-  cat > "$launcher" <<'EOF_MASTER_LAUNCHER'
+  cat > "$install_launcher" <<'EOF_MASTER_INSTALL_LAUNCHER'
 #!/usr/bin/env bash
 set -eu
 set -o pipefail 2>/dev/null || true
@@ -218,10 +237,58 @@ if [[ "$(id -u)" -eq 0 ]]; then
 else
   sudo bash "$tmp_script" "$target_user"
 fi
-EOF_MASTER_LAUNCHER
+EOF_MASTER_INSTALL_LAUNCHER
 
-  chown "$TARGET_USER:$TARGET_USER" "$launcher" 2>/dev/null || true
-  chmod 0755 "$launcher"
+  cat > "$update_launcher" <<'EOF_MASTER_UPDATE_LAUNCHER'
+#!/usr/bin/env bash
+set -eu
+set -o pipefail 2>/dev/null || true
+
+target_user="${1:-itgo}"
+repo_api="https://api.github.com/repos/daroitgo/itgo-scripts/tags?per_page=100"
+tmp_script="$(mktemp)"
+
+cleanup() {
+  rm -f "$tmp_script" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+if ! command -v wget >/dev/null 2>&1; then
+  echo "ERROR: wget is required for master-update" >&2
+  exit 1
+fi
+
+latest_tag="$(
+  wget -qO- "$repo_api" \
+    | grep -o '"name":[[:space:]]*"master-[^"]*"' \
+    | sed 's/.*"name":[[:space:]]*"\(master-[^"]*\)"/\1/' \
+    | sort -V \
+    | tail -n1
+)"
+
+if [[ -z "${latest_tag:-}" ]]; then
+  echo "ERROR: cannot determine latest master-* tag from daroitgo/itgo-scripts" >&2
+  exit 1
+fi
+
+script_url="https://raw.githubusercontent.com/daroitgo/itgo-scripts/${latest_tag}/MASTER/master_installer.sh"
+
+if ! wget -qO "$tmp_script" "$script_url"; then
+  echo "ERROR: cannot download MASTER/master_installer.sh from tag ${latest_tag}" >&2
+  exit 1
+fi
+
+chmod 0755 "$tmp_script" 2>/dev/null || true
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  bash "$tmp_script" --update-only "$target_user"
+else
+  sudo bash "$tmp_script" --update-only "$target_user"
+fi
+EOF_MASTER_UPDATE_LAUNCHER
+
+  chown "$TARGET_USER:$TARGET_USER" "$install_launcher" "$update_launcher" 2>/dev/null || true
+  chmod 0755 "$install_launcher" "$update_launcher"
 
   touch "$bp"
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
@@ -233,6 +300,7 @@ EOF_MASTER_LAUNCHER
   chmod 0644 "$bp" 2>/dev/null || true
 
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-install"
+  add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-update"
 }
 
 ITGO_HOME=""
@@ -457,6 +525,10 @@ should_install_or_update_module() {
   MODULE_DECISION="install"
 
   if ! module_is_installed "$module"; then
+    if [[ "$UPDATE_ONLY_MODE" == "1" ]]; then
+      add_summary "$module: skip (not installed in update-only mode)"
+      return 1
+    fi
     add_summary "$module: install (brak instalacji)"
     return 0
   fi
@@ -1029,6 +1101,15 @@ cleanup_tmp_installers_after_uninstall() {
   fi
 }
 
+cleanup_tmp_installers_no_prompt() {
+  if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
+    rm -f -- "$TMP_DIR"/*.sh 2>/dev/null || true
+    add_summary "TMP cleanup: wykonane ($TMP_DIR/*.sh)"
+  else
+    add_summary "TMP cleanup: SKIP (TMP_DIR unavailable)"
+  fi
+}
+
 remove_block_from_file() {
   local file="${1:?}" start="${2:?}" end="${3:?}"
   local tmp
@@ -1045,7 +1126,9 @@ remove_block_from_file() {
 }
 
 restore_master_shell_settings() {
-  local bp bl launcher_dir launcher legacy_launcher="/usr/local/bin/master-install"
+  local bp bl launcher_dir install_launcher update_launcher
+  local legacy_install_launcher="/usr/local/bin/master-install"
+  local legacy_update_launcher="/usr/local/bin/master-update"
   local bp_start="# >>> ITGO SSH HISTORY PROMPT (auto) >>>"
   local bp_end="# <<< ITGO SSH HISTORY PROMPT (auto) <<<"
   local path_start="# >>> ITGO MASTER PATH (auto) >>>"
@@ -1067,7 +1150,8 @@ restore_master_shell_settings() {
   bp="$ITGO_HOME/.bash_profile"
   bl="$ITGO_HOME/.bash_logout"
   launcher_dir="$ITGO_HOME/UTILITY/MASTER"
-  launcher="$launcher_dir/master-install"
+  install_launcher="$launcher_dir/master-install"
+  update_launcher="$launcher_dir/master-update"
 
   if [[ -f "$bp" ]]; then
     safe_backup "$bp"
@@ -1084,22 +1168,36 @@ restore_master_shell_settings() {
     chmod 0644 "$bl" 2>/dev/null || true
   fi
 
-  if [[ -f "$launcher" ]]; then
-    rm -f "$launcher" 2>/dev/null || true
-    add_summary "MASTER launcher removed"
+  if [[ -f "$install_launcher" ]]; then
+    rm -f "$install_launcher" 2>/dev/null || true
+    add_summary "MASTER launcher removed: master-install"
   else
-    add_summary "MASTER launcher removed: SKIP (not present)"
+    add_summary "MASTER launcher removed: SKIP (master-install not present)"
+  fi
+
+  if [[ -f "$update_launcher" ]]; then
+    rm -f "$update_launcher" 2>/dev/null || true
+    add_summary "MASTER launcher removed: master-update"
+  else
+    add_summary "MASTER launcher removed: SKIP (master-update not present)"
   fi
 
   if [[ -d "$launcher_dir" ]]; then
     rmdir "$launcher_dir" 2>/dev/null || true
   fi
 
-  if [[ -e "$legacy_launcher" || -L "$legacy_launcher" ]]; then
-    rm -f "$legacy_launcher" 2>/dev/null || true
-    add_summary "MASTER legacy launcher removed: $legacy_launcher"
+  if [[ -e "$legacy_install_launcher" || -L "$legacy_install_launcher" ]]; then
+    rm -f "$legacy_install_launcher" 2>/dev/null || true
+    add_summary "MASTER legacy launcher removed: $legacy_install_launcher"
   else
-    add_summary "MASTER legacy launcher removed: SKIP ($legacy_launcher not present)"
+    add_summary "MASTER legacy launcher removed: SKIP ($legacy_install_launcher not present)"
+  fi
+
+  if [[ -e "$legacy_update_launcher" || -L "$legacy_update_launcher" ]]; then
+    rm -f "$legacy_update_launcher" 2>/dev/null || true
+    add_summary "MASTER legacy launcher removed: $legacy_update_launcher"
+  else
+    add_summary "MASTER legacy launcher removed: SKIP ($legacy_update_launcher not present)"
   fi
 
   add_summary "Restore shell settings MASTER: wykonane"
@@ -1566,6 +1664,52 @@ main() {
 
   need_root
   prelog "BEGIN: ITGO Master Installer v$MASTER_VERSION user=$TARGET_USER"
+
+  if [[ "$UPDATE_ONLY_MODE" == "1" ]]; then
+    add_summary "MODE: update-only"
+    if ! have_user; then
+      echo "[$(ts)] WARN: user '$TARGET_USER' nie istnieje. Pomijam update-only."
+      add_summary "Update-only: SKIP (user missing: $TARGET_USER)"
+      print_summary
+      exit 0
+    fi
+
+    prepare_user_paths_if_possible
+    if [[ -z "${ITGO_HOME:-}" ]]; then
+      echo "[$(ts)] WARN: nie udało się ustalić HOME dla '$TARGET_USER'. Pomijam update-only."
+      add_summary "Update-only: SKIP (cannot resolve home)"
+      print_summary
+      exit 0
+    fi
+
+    detected_modules="$(detect_installed_modules)"
+    print_detected_modules_summary "$detected_modules"
+
+    if ! ensure_tmp_dir_for_module_actions; then
+      echo "[$(ts)] WARN: nie udało się przygotować TMP_DIR dla update-only. Pomijam update-only."
+      add_summary "Update-only: SKIP (cannot prepare TMP_DIR)"
+      print_summary
+      exit 0
+    fi
+
+    status_sh="$TMP_DIR/status_installer_public.sh"
+    cleanup_sh="$TMP_DIR/cleanup_installer_public.sh"
+    tseq_sh="$TMP_DIR/tseq_installer_public.sh"
+    downloader_app_sh="$TMP_DIR/upg_installer.sh"
+    upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
+
+    section "UPDATE-ONLY - MODUŁY"
+    install_status_step "$status_sh"
+    install_tseq_step "$tseq_sh"
+    install_cleanup_step "$cleanup_sh"
+    install_downloader_app_step "$downloader_app_sh"
+    install_upgbuilder_step "$upgbuilder_sh"
+
+    cleanup_tmp_installers_no_prompt
+    echo "[$(ts)] DONE."
+    print_summary
+    exit 0
+  fi
 
   prepare_user_paths_if_possible
 
