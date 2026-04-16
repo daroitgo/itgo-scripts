@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.15"
+MASTER_VERSION="1.2.16"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.11"
@@ -147,7 +147,30 @@ install_packages() {
 }
 
 install_master_launcher() {
-  local launcher="/usr/local/bin/master-install"
+  local launcher_dir launcher bp legacy_launcher="/usr/local/bin/master-install"
+  local path_start="# >>> ITGO MASTER PATH (auto) >>>"
+  local path_end="# <<< ITGO MASTER PATH (auto) <<<"
+
+  if ! have_user; then
+    add_summary "MASTER launcher installed: SKIP (user missing)"
+    return 0
+  fi
+
+  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+  [[ -n "${ITGO_HOME:-}" ]] || { add_summary "MASTER launcher installed: SKIP (cannot resolve home)"; return 0; }
+
+  launcher_dir="$ITGO_HOME/UTILITY/MASTER"
+  launcher="$launcher_dir/master-install"
+  bp="$ITGO_HOME/.bash_profile"
+
+  if [[ -e "$legacy_launcher" || -L "$legacy_launcher" ]]; then
+    rm -f "$legacy_launcher" 2>/dev/null || true
+    add_summary "MASTER legacy launcher removed: $legacy_launcher"
+  else
+    add_summary "MASTER legacy launcher removed: SKIP ($legacy_launcher not present)"
+  fi
+
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$launcher_dir"
 
   cat > "$launcher" <<'EOF_MASTER_LAUNCHER'
 #!/usr/bin/env bash
@@ -197,8 +220,19 @@ else
 fi
 EOF_MASTER_LAUNCHER
 
+  chown "$TARGET_USER:$TARGET_USER" "$launcher" 2>/dev/null || true
   chmod 0755 "$launcher"
-  add_summary "MASTER launcher installed: $launcher"
+
+  touch "$bp"
+  chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
+  chmod 0644 "$bp" 2>/dev/null || true
+  safe_backup "$bp"
+  remove_block_from_file "$bp" "$path_start" "$path_end"
+  printf "\n%s\nexport PATH=\"\$HOME/UTILITY/MASTER:\$PATH\"\n%s\n" "$path_start" "$path_end" >> "$bp"
+  chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
+  chmod 0644 "$bp" 2>/dev/null || true
+
+  add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-install"
 }
 
 ITGO_HOME=""
@@ -1011,9 +1045,11 @@ remove_block_from_file() {
 }
 
 restore_master_shell_settings() {
-  local bp bl
+  local bp bl launcher_dir launcher legacy_launcher="/usr/local/bin/master-install"
   local bp_start="# >>> ITGO SSH HISTORY PROMPT (auto) >>>"
   local bp_end="# <<< ITGO SSH HISTORY PROMPT (auto) <<<"
+  local path_start="# >>> ITGO MASTER PATH (auto) >>>"
+  local path_end="# <<< ITGO MASTER PATH (auto) <<<"
   local bl_start="# >>> ITGO HISTORY CLEAR ON LOGOUT (auto) >>>"
   local bl_end="# <<< ITGO HISTORY CLEAR ON LOGOUT (auto) <<<"
 
@@ -1030,10 +1066,13 @@ restore_master_shell_settings() {
 
   bp="$ITGO_HOME/.bash_profile"
   bl="$ITGO_HOME/.bash_logout"
+  launcher_dir="$ITGO_HOME/UTILITY/MASTER"
+  launcher="$launcher_dir/master-install"
 
   if [[ -f "$bp" ]]; then
     safe_backup "$bp"
     remove_block_from_file "$bp" "$bp_start" "$bp_end"
+    remove_block_from_file "$bp" "$path_start" "$path_end"
     chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
     chmod 0644 "$bp" 2>/dev/null || true
   fi
@@ -1043,6 +1082,24 @@ restore_master_shell_settings() {
     remove_block_from_file "$bl" "$bl_start" "$bl_end"
     chown "$TARGET_USER:$TARGET_USER" "$bl" 2>/dev/null || true
     chmod 0644 "$bl" 2>/dev/null || true
+  fi
+
+  if [[ -f "$launcher" ]]; then
+    rm -f "$launcher" 2>/dev/null || true
+    add_summary "MASTER launcher removed"
+  else
+    add_summary "MASTER launcher removed: SKIP (not present)"
+  fi
+
+  if [[ -d "$launcher_dir" ]]; then
+    rmdir "$launcher_dir" 2>/dev/null || true
+  fi
+
+  if [[ -e "$legacy_launcher" || -L "$legacy_launcher" ]]; then
+    rm -f "$legacy_launcher" 2>/dev/null || true
+    add_summary "MASTER legacy launcher removed: $legacy_launcher"
+  else
+    add_summary "MASTER legacy launcher removed: SKIP ($legacy_launcher not present)"
   fi
 
   add_summary "Restore shell settings MASTER: wykonane"
