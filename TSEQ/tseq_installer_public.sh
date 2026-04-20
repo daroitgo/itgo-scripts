@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ========= TSEQ (Tomcat Sequencer) Installer baseline 3.12.3 / planned docs 3.12.4 =========
-VERSION="3.12.4"
+VERSION="3.12.5"
 BASE_USER="itgo"
 MODE="${1:-install}"
 
@@ -352,6 +352,22 @@ collect_sorted_discovered_entries() {
   rm -f "$tmp"
 }
 
+show_detected_order_candidates() {
+  local pos=10 rank platform svc base
+
+  echo
+  echo "Wykryte usługi/platformy TSEQ (po sortowaniu):"
+  printf "  %-6s %-6s %-10s %-40s %s\n" "POS" "RANK" "PLATFORM" "SERVICE" "BASE"
+
+  while IFS=$'\t' read -r rank platform svc base; do
+    [[ -n "${svc:-}" ]] || continue
+    printf "  %-6s %-6s %-10s %-40s %s\n" "$pos" "$rank" "$platform" "$svc" "$base"
+    pos=$((pos+10))
+  done < <(collect_sorted_discovered_entries)
+
+  echo
+}
+
 show_existing_order() {
   [[ -f "$ORDER_FILE" ]] || return 1
 
@@ -366,6 +382,7 @@ interactive_configure_order() {
   [[ -f "$DISCOVERED_TSV" ]] || { log "ORDER: missing discovered.tsv -> skip"; return 0; }
 
   log "ORDER: interactive setup started"
+  show_detected_order_candidates
 
   if [[ -f "$ORDER_FILE" ]]; then
     show_existing_order
@@ -722,6 +739,22 @@ collect_sorted_discovered_entries() {
   rm -f "\$tmp"
 }
 
+show_detected_order_candidates() {
+  local pos=10 rank platform svc base
+
+  echo
+  echo "Wykryte usługi/platformy TSEQ (po sortowaniu):"
+  printf "  %-6s %-6s %-10s %-40s %s\\n" "POS" "RANK" "PLATFORM" "SERVICE" "BASE"
+
+  while IFS=\$'\\t' read -r rank platform svc base; do
+    [[ -n "\${svc:-}" ]] || continue
+    printf "  %-6s %-6s %-10s %-40s %s\\n" "\$pos" "\$rank" "\$platform" "\$svc" "\$base"
+    pos=\$((pos+10))
+  done < <(collect_sorted_discovered_entries)
+
+  echo
+}
+
 show_existing_order() {
   [[ -f "\$ORDER_FILE" ]] || return 1
   echo
@@ -739,6 +772,8 @@ interactive_configure_order() {
     echo "ERROR: brak wykrytych platform do ustawienia kolejności" >&2
     exit 1
   fi
+
+  show_detected_order_candidates
 
   if [[ -f "\$ORDER_FILE" ]]; then
     show_existing_order
