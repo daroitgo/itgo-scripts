@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ========= TSEQ (Tomcat Sequencer) Installer v3.12.3 =========
-VERSION="3.12.3"
+# ========= TSEQ (Tomcat Sequencer) Installer baseline 3.12.3 / planned docs 3.12.4 =========
+VERSION="3.12.4"
 BASE_USER="itgo"
 MODE="${1:-install}"
 
@@ -10,8 +10,9 @@ UTILITY_DIRNAME="UTILITY"
 APP_DIRNAME="TSEQ"
 
 SYSTEMD_UNIT="/etc/systemd/system/tseq.service"
-WRAPPER_BIN="/usr/local/sbin/tseq"
-WRAPPER_LINK="/usr/local/bin/tseq"
+LAUNCHER_BIN=""
+LEGACY_WRAPPER_BIN="/usr/local/sbin/tseq"
+LEGACY_WRAPPER_LINK="/usr/local/bin/tseq"
 
 READY_REGEX_DEFAULT='Catalina\.start Server startup in \[[0-9]+\] milliseconds'
 TIMEOUT_DEFAULT=0
@@ -33,6 +34,7 @@ BASE_DIR="${BASE_HOME}/${UTILITY_DIRNAME}/${APP_DIRNAME}"
 BIN_DIR="$BASE_DIR/bin"
 CFG_DIR="$BASE_DIR/config"
 LOG_DIR="$BASE_DIR/logs"
+LAUNCHER_BIN="$BIN_DIR/tseq"
 
 REPORT_FILE="$LOG_DIR/tseq.log"
 DISCOVERED_TSV="$CFG_DIR/discovered.tsv"
@@ -45,9 +47,24 @@ ORDER_TOOL_SH="$BIN_DIR/tseq-order.sh"
 
 VERSION_FILE="$BASE_DIR/.tseq_version"
 
+secure_data_file() {
+  local f="$1"
+  [[ -e "$f" ]] || return 0
+  chown "$BASE_USER:$BASE_USER" "$f" 2>/dev/null || true
+  chmod 0600 "$f" 2>/dev/null || true
+}
+
+secure_exec_file() {
+  local f="$1"
+  [[ -e "$f" ]] || return 0
+  chown "$BASE_USER:$BASE_USER" "$f" 2>/dev/null || true
+  chmod 0700 "$f" 2>/dev/null || true
+}
+
 log() {
   mkdir -p "$LOG_DIR"
   printf "%s %s\n" "$(date "+%F %T")" "$*" | tee -a "$REPORT_FILE"
+  secure_data_file "$REPORT_FILE"
 }
 
 TTY="/dev/tty"
@@ -98,10 +115,19 @@ installed_version() {
   [[ -f "$VERSION_FILE" ]] && cat "$VERSION_FILE" || echo "0"
 }
 
+legacy_installation_present() {
+  [[ -e "$LEGACY_WRAPPER_BIN" || -L "$LEGACY_WRAPPER_BIN" ]] && return 0
+  [[ -e "$LEGACY_WRAPPER_LINK" || -L "$LEGACY_WRAPPER_LINK" ]] && return 0
+  [[ -f "$SYSTEMD_UNIT" ]] && grep -Fq "$LEGACY_WRAPPER_BIN" "$SYSTEMD_UNIT" 2>/dev/null && return 0
+  return 1
+}
+
 cleanup_old_legacy_backups() {
   rm -rf "${BASE_DIR}"_bak_* 2>/dev/null || true
-  rm -f "${WRAPPER_BIN}.bak."* 2>/dev/null || true
-  rm -f "${WRAPPER_LINK}.bak."* 2>/dev/null || true
+  rm -f "${LEGACY_WRAPPER_BIN}.bak" 2>/dev/null || true
+  rm -f "${LEGACY_WRAPPER_LINK}.bak" 2>/dev/null || true
+  rm -f "${LEGACY_WRAPPER_BIN}.bak."* 2>/dev/null || true
+  rm -f "${LEGACY_WRAPPER_LINK}.bak."* 2>/dev/null || true
   rm -f "${SYSTEMD_UNIT}.bak."* 2>/dev/null || true
 }
 
@@ -110,6 +136,12 @@ safe_backup_file() {
   [[ -e "$f" ]] || return 0
   rm -f "${f}.bak" 2>/dev/null || true
   cp -a "$f" "${f}.bak"
+}
+
+cleanup_legacy_launchers() {
+  rm -f "$LEGACY_WRAPPER_BIN" "$LEGACY_WRAPPER_LINK" 2>/dev/null || true
+  rm -f "${LEGACY_WRAPPER_BIN}.bak" "${LEGACY_WRAPPER_LINK}.bak" 2>/dev/null || true
+  rm -f "${LEGACY_WRAPPER_BIN}.bak."* "${LEGACY_WRAPPER_LINK}.bak."* 2>/dev/null || true
 }
 
 pre_cleanup_if_newer() {
@@ -125,12 +157,11 @@ pre_cleanup_if_newer() {
     systemctl reset-failed tseq 2>/dev/null || true
 
     safe_backup_file "$SYSTEMD_UNIT"
-    safe_backup_file "$WRAPPER_BIN"
-    safe_backup_file "$WRAPPER_LINK"
+    safe_backup_file "$LEGACY_WRAPPER_BIN"
+    safe_backup_file "$LEGACY_WRAPPER_LINK"
 
     rm -f "$SYSTEMD_UNIT" 2>/dev/null || true
-    rm -f "$WRAPPER_BIN" 2>/dev/null || true
-    rm -f "$WRAPPER_LINK" 2>/dev/null || true
+    cleanup_legacy_launchers
     systemctl daemon-reload 2>/dev/null || true
 
     if [[ -d "$BASE_DIR" ]]; then
@@ -140,6 +171,16 @@ pre_cleanup_if_newer() {
       rm -rf "$BASE_DIR"
     fi
 
+    return 0
+  fi
+
+  if legacy_installation_present; then
+    echo "INFO: tseq version=$inst matches installer version=$VERSION, but legacy global launchers were detected -> running local migration"
+    cleanup_old_legacy_backups
+    safe_backup_file "$SYSTEMD_UNIT"
+    cleanup_legacy_launchers
+    rm -f "$SYSTEMD_UNIT" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
     return 0
   fi
 
@@ -163,8 +204,8 @@ uninstall_tseq() {
   fi
 
   rm -f "$SYSTEMD_UNIT" 2>/dev/null || true
-  rm -f "$WRAPPER_BIN" 2>/dev/null || true
-  rm -f "$WRAPPER_LINK" 2>/dev/null || true
+  rm -f "$LAUNCHER_BIN" 2>/dev/null || true
+  cleanup_legacy_launchers
   rm -rf "$BASE_DIR" 2>/dev/null || true
 
   if command -v systemctl >/dev/null 2>&1; then
@@ -172,15 +213,16 @@ uninstall_tseq() {
   fi
 
   echo "UNINSTALL: removed unit $SYSTEMD_UNIT (if present)"
-  echo "UNINSTALL: removed wrapper $WRAPPER_BIN (if present)"
-  echo "UNINSTALL: removed launcher link $WRAPPER_LINK (if present)"
+  echo "UNINSTALL: removed launcher $LAUNCHER_BIN (if present)"
+  echo "UNINSTALL: removed legacy launcher $LEGACY_WRAPPER_BIN (if present)"
+  echo "UNINSTALL: removed legacy launcher $LEGACY_WRAPPER_LINK (if present)"
   echo "UNINSTALL: removed base dir $BASE_DIR (if present)"
   echo "UNINSTALL: done"
 }
 
 ensure_dirs() {
   mkdir -p "$BASE_DIR" "$BIN_DIR" "$CFG_DIR" "$LOG_DIR"
-  chmod 0755 "$BASE_DIR" "$BIN_DIR" "$CFG_DIR" "$LOG_DIR" 2>/dev/null || true
+  chmod 0700 "$BASE_DIR" "$BIN_DIR" "$CFG_DIR" "$LOG_DIR" 2>/dev/null || true
 }
 
 list_services() {
@@ -225,7 +267,7 @@ write_discovered_tsv() {
     fi
   done < <(discover_tomcat_bases)
 
-  chmod 0644 "$DISCOVERED_TSV"
+  secure_data_file "$DISCOVERED_TSV"
   [[ "$mapped" -eq 1 ]] || log "WARN: no Tomcat instances mapped to services."
 }
 
@@ -362,7 +404,7 @@ interactive_configure_order() {
   done < <(collect_sorted_discovered_entries)
 
   mv "$tmp" "$ORDER_FILE"
-  chmod 0644 "$ORDER_FILE"
+  secure_data_file "$ORDER_FILE"
   log "ORDER: written $ORDER_FILE"
 }
 
@@ -372,6 +414,7 @@ write_builder() {
 set -euo pipefail
 
 BASE_DIR="${BASE_DIR}"
+BASE_USER="${BASE_USER}"
 CFG_DIR="\$BASE_DIR/config"
 LOG_DIR="\$BASE_DIR/logs"
 
@@ -387,9 +430,17 @@ ROTATE_LOGS_DEFAULT=${ROTATE_LOGS_DEFAULT}
 POST_DELAY_DEFAULT=${POST_DELAY_DEFAULT}
 LOGS_PREV_KEEP_DEFAULT=${LOGS_PREV_KEEP_DEFAULT}
 
+secure_data_file() {
+  local f="\$1"
+  [[ -e "\$f" ]] || return 0
+  chown "\$BASE_USER:\$BASE_USER" "\$f" 2>/dev/null || true
+  chmod 0600 "\$f" 2>/dev/null || true
+}
+
 log() {
   mkdir -p "\$LOG_DIR"
   printf "%s %s\\n" "\$(date "+%F %T")" "\$*" | tee -a "\$REPORT_FILE"
+  secure_data_file "\$REPORT_FILE"
 }
 
 [[ -f "\$DISCOVERED_TSV" ]] || { echo "ERROR: missing \$DISCOVERED_TSV" >&2; exit 1; }
@@ -466,11 +517,11 @@ mkdir -p "\$CFG_DIR"
   echo ")"
 } >"\$CONF_FILE"
 
-chmod 0644 "\$CONF_FILE"
+secure_data_file "\$CONF_FILE"
 log "CONF: generated \$CONF_FILE"
 EOF_BUILDER
 
-  chmod 0755 "$BUILDER_SH"
+  secure_exec_file "$BUILDER_SH"
   log "OK: wrote builder $BUILDER_SH"
 }
 
@@ -480,6 +531,7 @@ write_order_tool() {
 set -euo pipefail
 
 BASE_DIR="${BASE_DIR}"
+BASE_USER="${BASE_USER}"
 CFG_DIR="\$BASE_DIR/config"
 LOG_DIR="\$BASE_DIR/logs"
 
@@ -490,9 +542,17 @@ BUILDER="\$BASE_DIR/bin/tseq-build-conf.sh"
 POST_DELAY_DEFAULT=${POST_DELAY_DEFAULT}
 TTY="/dev/tty"
 
+secure_data_file() {
+  local f="\$1"
+  [[ -e "\$f" ]] || return 0
+  chown "\$BASE_USER:\$BASE_USER" "\$f" 2>/dev/null || true
+  chmod 0600 "\$f" 2>/dev/null || true
+}
+
 log() {
   mkdir -p "\$LOG_DIR"
   printf "%s %s\\n" "\$(date "+%F %T")" "\$*" | tee -a "\$REPORT_FILE"
+  secure_data_file "\$REPORT_FILE"
 }
 
 read_tty() {
@@ -577,7 +637,7 @@ write_discovered_tsv() {
     fi
   done < <(discover_tomcat_bases)
 
-  chmod 0644 "\$DISCOVERED_TSV"
+  secure_data_file "\$DISCOVERED_TSV"
   [[ "\$mapped" -eq 1 ]] || log "WARN: no Tomcat instances mapped to services."
 }
 
@@ -712,7 +772,7 @@ interactive_configure_order() {
   done < <(collect_sorted_discovered_entries)
 
   mv "\$tmp" "\$ORDER_FILE"
-  chmod 0644 "\$ORDER_FILE"
+  secure_data_file "\$ORDER_FILE"
   log "ORDER: written \$ORDER_FILE"
 
   if [[ -x "\$BUILDER" ]]; then
@@ -724,7 +784,7 @@ interactive_configure_order() {
 interactive_configure_order
 EOF_ORDER
 
-  chmod 0755 "$ORDER_TOOL_SH"
+  secure_exec_file "$ORDER_TOOL_SH"
   log "OK: wrote order tool $ORDER_TOOL_SH"
 }
 
@@ -881,12 +941,12 @@ done
 log "DONE all instances started"
 EOF_SEQ
 
-  chmod 0755 "$SEQUENCER_SH"
+  secure_exec_file "$SEQUENCER_SH"
   log "OK: wrote sequencer $SEQUENCER_SH"
 }
 
-write_wrapper_and_unit() {
-  cat >"$WRAPPER_BIN" <<EOF_WR
+write_launcher_and_unit() {
+  cat >"$LAUNCHER_BIN" <<EOF_WR
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -900,8 +960,7 @@ case "\${1:-}" in
     ;;
 esac
 EOF_WR
-  chmod 0755 "$WRAPPER_BIN"
-  ln -sfn "$WRAPPER_BIN" "$WRAPPER_LINK"
+  secure_exec_file "$LAUNCHER_BIN"
 
   cat >"$SYSTEMD_UNIT" <<EOF_UNIT
 [Unit]
@@ -911,7 +970,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$WRAPPER_BIN
+ExecStart=$LAUNCHER_BIN
 
 [Install]
 WantedBy=multi-user.target
@@ -920,8 +979,8 @@ EOF_UNIT
   chmod 0644 "$SYSTEMD_UNIT"
   systemctl daemon-reload
   log "OK: installed unit $SYSTEMD_UNIT"
-  log "OK: installed launcher $WRAPPER_BIN"
-  log "OK: installed launcher link $WRAPPER_LINK -> $WRAPPER_BIN"
+  log "OK: installed launcher $LAUNCHER_BIN"
+  log "OK: removed legacy launchers $LEGACY_WRAPPER_BIN and $LEGACY_WRAPPER_LINK"
 }
 
 restore_preserved_config() {
@@ -932,15 +991,18 @@ restore_preserved_config() {
 
   if [[ ! -f "$ORDER_FILE" && -f "$backup_dir/config/order.txt" ]]; then
     cp -a "$backup_dir/config/order.txt" "$ORDER_FILE"
-    chmod 0644 "$ORDER_FILE" 2>/dev/null || true
+    secure_data_file "$ORDER_FILE"
     log "CONFIG: restored order.txt from $backup_dir/config/order.txt"
   fi
 }
 fix_permissions() {
   if id "$BASE_USER" >/dev/null 2>&1; then
     chown -R "$BASE_USER:$BASE_USER" "$BASE_DIR"
-    chmod -R u+rwX,go+rX "$BASE_DIR"
+    find "$BASE_DIR" -type d -exec chmod 0700 {} \; 2>/dev/null || true
+    find "$BASE_DIR" -type f -exec chmod 0600 {} \; 2>/dev/null || true
+    chmod 0700 "$SEQUENCER_SH" "$BUILDER_SH" "$ORDER_TOOL_SH" "$LAUNCHER_BIN" 2>/dev/null || true
     log "PERMS: ownership set to $BASE_USER:$BASE_USER for $BASE_DIR"
+    log "PERMS: restrictive mode applied (dirs 0700, files 0600, executables 0700)"
   else
     log "PERMS: user '$BASE_USER' not found — ownership unchanged"
   fi
@@ -948,8 +1010,7 @@ fix_permissions() {
 
 write_version_file() {
   printf "%s\n" "$VERSION" > "$VERSION_FILE"
-  chmod 0644 "$VERSION_FILE" 2>/dev/null || true
-  chown "$BASE_USER:$BASE_USER" "$VERSION_FILE" 2>/dev/null || true
+  secure_data_file "$VERSION_FILE"
 }
 
 write_default_order_if_missing() {
@@ -966,7 +1027,7 @@ write_default_order_if_missing() {
       n=$((n+10))
     done < <(collect_sorted_discovered_entries)
   } >"$ORDER_FILE"
-  chmod 0644 "$ORDER_FILE"
+  secure_data_file "$ORDER_FILE"
 }
 
 main() {
@@ -988,6 +1049,7 @@ main() {
   log "HOME: $BASE_HOME"
   log "BASE: $BASE_DIR"
   log "SERVICE: tseq.service"
+  log "LAUNCHER: $LAUNCHER_BIN"
   log "DISCOVERY: /srv/IntegrationPlatform*/**/bin/catalina.sh"
   log "IGNORE: create <tomcat_base>/.sequencer-ignore"
   log "ORDER: supports third column POST_DELAY_S"
@@ -1002,7 +1064,8 @@ main() {
   write_builder
   write_order_tool
   write_sequencer
-  write_wrapper_and_unit
+  cleanup_legacy_launchers
+  write_launcher_and_unit
   "$BUILDER_SH" >/dev/null || true
   write_version_file
   fix_permissions
@@ -1012,8 +1075,7 @@ main() {
   echo "User:      $BASE_USER"
   echo "Base:      $BASE_DIR"
   echo "Service:   tseq"
-  echo "Wrapper:   $WRAPPER_BIN"
-  echo "Launcher:  $WRAPPER_LINK -> $WRAPPER_BIN"
+  echo "Launcher:  $LAUNCHER_BIN"
   echo "Mapowanie: $DISCOVERED_TSV"
   echo "Kolejność: $ORDER_FILE"
   echo "Config:    $CONF_FILE (auto)"
@@ -1021,8 +1083,8 @@ main() {
   echo "Version:   $(cat "$VERSION_FILE" 2>/dev/null || echo "?")"
   echo
   echo "Uruchomienie:"
-  echo "  sudo tseq"
-  echo "  sudo tseq --order"
+  echo "  sudo $LAUNCHER_BIN"
+  echo "  sudo $LAUNCHER_BIN --order"
   echo "  sudo systemctl start tseq --no-block"
   echo
 }
