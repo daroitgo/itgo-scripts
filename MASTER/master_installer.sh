@@ -37,12 +37,12 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.18"
+MASTER_VERSION="1.2.19"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.11"
 CLEANUP_VERSION="1.0.3"
-TSEQ_VERSION="3.12.3"
+TSEQ_VERSION="3.12.4"
 DOWNLOADER_APP_VERSION="1.0.1"
 UPGBUILDER_VERSION="0.1.5"
 
@@ -438,7 +438,7 @@ module_health_for_module() {
       [[ -d "$ITGO_HOME/UTILITY/STATUS" && -x /usr/local/bin/status ]] && echo "OK" || echo "BROKEN"
       ;;
     TSEQ)
-      [[ -d "$ITGO_HOME/UTILITY/TSEQ" && -x /usr/local/sbin/tseq && -f /etc/systemd/system/tseq.service ]] && echo "OK" || echo "BROKEN"
+      [[ -d "$ITGO_HOME/UTILITY/TSEQ" && -f "$version_file" && -x "$ITGO_HOME/UTILITY/TSEQ/bin/tseq" && -f /etc/systemd/system/tseq.service ]] && echo "OK" || echo "BROKEN"
       ;;
     CLEANUP)
       [[ -d "$ITGO_HOME/UTILITY/UPG_CLEANUP" ]] && echo "OK" || echo "BROKEN"
@@ -1306,7 +1306,7 @@ install_tseq_step() {
 
   if should_install_or_update_module "TSEQ"; then
     if [[ "$MODULE_DECISION" == "install" ]]; then
-      if prompt_yn "MODUŁ: TSEQ (systemd + /usr/local/sbin/tseq + ~/UTILITY/TSEQ)?" "Y"; then
+      if prompt_yn "MODUŁ: TSEQ (systemd + ~/UTILITY/TSEQ/bin/tseq + ~/UTILITY/TSEQ)?" "Y"; then
         ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
         download_to_tmp "$TSEQ_URL" "$tseq_sh" "$TSEQ_LOCAL_PATH"
         run_module_root "$tseq_sh"
