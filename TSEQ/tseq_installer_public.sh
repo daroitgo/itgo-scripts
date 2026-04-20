@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ========= TSEQ (Tomcat Sequencer) Installer baseline 3.12.3 / planned docs 3.12.4 =========
-VERSION="3.12.5"
+VERSION="3.12.6"
 BASE_USER="itgo"
 MODE="${1:-install}"
 
@@ -271,34 +271,44 @@ write_discovered_tsv() {
   [[ "$mapped" -eq 1 ]] || log "WARN: no Tomcat instances mapped to services."
 }
 
+matches_platform_key() {
+  local haystack="${1:?}" key="${2:?}"
+  [[ "$haystack" =~ (^|[^A-Z0-9])(INTEGRATIONPLATFORM([^A-Z0-9]+)?)?${key}([^A-Z0-9]|$) ]]
+}
+
+matches_platform_prefix_key() {
+  local haystack="${1:?}" key="${2:?}"
+  [[ "$haystack" =~ (^|[^A-Z0-9])INTEGRATIONPLATFORM([^A-Z0-9]+)?${key}([^A-Z0-9]|$) ]]
+}
+
 platform_key_for_entry() {
   local svc="${1:-}" base="${2:-}" haystack
   haystack="$(printf '%s %s\n' "$svc" "$base" | tr '[:lower:]' '[:upper:]')"
 
-  if [[ "$haystack" =~ INTEGRATIONPLATFORMNFZ|(^|[^A-Z0-9])NFZ([^A-Z0-9]|$) ]]; then
+  if matches_platform_key "$haystack" "NFZ"; then
     echo "NFZ"
-  elif [[ "$haystack" =~ INTEGRATIONPLATFORMPI|(^|[^A-Z0-9])PI([^A-Z0-9]|$) ]]; then
-    echo "PI"
-  elif [[ "$haystack" =~ INTEGRATIONPLATFORMADM|(^|[^A-Z0-9])ADM([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "$haystack" "ADM"; then
     echo "ADM"
-  elif [[ "$haystack" =~ INTEGRATIONPLATFORMSSO|(^|[^A-Z0-9])SSO([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "$haystack" "SSO"; then
     echo "SSO"
-  elif [[ "$haystack" =~ INTEGRATIONPLATFORMEUSL|(^|[^A-Z0-9])EUSL([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "$haystack" "EUSL"; then
     echo "EUSL"
-  elif [[ "$haystack" =~ INTEGRATIONPLATFORMEREC|(^|[^A-Z0-9])EREC([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "$haystack" "EREC"; then
     echo "EREC"
-  elif [[ "$haystack" =~ INTEGRATIONPLATFORMMPI|(^|[^A-Z0-9])MPI([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "$haystack" "MPI"; then
     echo "MPI"
-  elif [[ "$haystack" =~ INTEGRATIONPLATFORMHL7([^A-Z0-9]|$)|(^|[^A-Z0-9])HL7([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "$haystack" "HL7"; then
     echo "HL7"
-  elif [[ "$haystack" =~ INTEGRATIONPLATFORMHL7[A-Z0-9]+|(^|[^A-Z0-9])HL7[A-Z0-9]+([^A-Z0-9]|$) ]]; then
+  elif matches_platform_prefix_key "$haystack" "HL7[A-Z0-9]+" || [[ "$haystack" =~ (^|[^A-Z0-9])HL7[A-Z0-9]+([^A-Z0-9]|$) ]]; then
     echo "HL7*"
-  elif [[ "$haystack" =~ INTEGRATIONPLATFORMERP|(^|[^A-Z0-9])ERP([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "$haystack" "ERP"; then
     echo "ERP"
-  elif [[ "$haystack" =~ INTEGRATIONPLATFORMZSMOPL|(^|[^A-Z0-9])ZSMOPL([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "$haystack" "ZSMOPL"; then
     echo "ZSMOPL"
-  elif [[ "$haystack" =~ INTEGRATIONPLATFORMTS([^A-Z0-9]|$)|(^|[^A-Z0-9])TS([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "$haystack" "TS"; then
     echo "TS"
+  elif matches_platform_key "$haystack" "PI"; then
+    echo "PI"
   else
     echo "OTHER"
   fi
@@ -658,34 +668,44 @@ write_discovered_tsv() {
   [[ "\$mapped" -eq 1 ]] || log "WARN: no Tomcat instances mapped to services."
 }
 
+matches_platform_key() {
+  local haystack="\${1:?}" key="\${2:?}"
+  [[ "\$haystack" =~ (^|[^A-Z0-9])(INTEGRATIONPLATFORM([^A-Z0-9]+)?)?\${key}([^A-Z0-9]|$) ]]
+}
+
+matches_platform_prefix_key() {
+  local haystack="\${1:?}" key="\${2:?}"
+  [[ "\$haystack" =~ (^|[^A-Z0-9])INTEGRATIONPLATFORM([^A-Z0-9]+)?\${key}([^A-Z0-9]|$) ]]
+}
+
 platform_key_for_entry() {
   local svc="\${1:-}" base="\${2:-}" haystack
   haystack="\$(printf '%s %s\\n' "\$svc" "\$base" | tr '[:lower:]' '[:upper:]')"
 
-  if [[ "\$haystack" =~ INTEGRATIONPLATFORMNFZ|(^|[^A-Z0-9])NFZ([^A-Z0-9]|$) ]]; then
+  if matches_platform_key "\$haystack" "NFZ"; then
     echo "NFZ"
-  elif [[ "\$haystack" =~ INTEGRATIONPLATFORMPI|(^|[^A-Z0-9])PI([^A-Z0-9]|$) ]]; then
-    echo "PI"
-  elif [[ "\$haystack" =~ INTEGRATIONPLATFORMADM|(^|[^A-Z0-9])ADM([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "\$haystack" "ADM"; then
     echo "ADM"
-  elif [[ "\$haystack" =~ INTEGRATIONPLATFORMSSO|(^|[^A-Z0-9])SSO([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "\$haystack" "SSO"; then
     echo "SSO"
-  elif [[ "\$haystack" =~ INTEGRATIONPLATFORMEUSL|(^|[^A-Z0-9])EUSL([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "\$haystack" "EUSL"; then
     echo "EUSL"
-  elif [[ "\$haystack" =~ INTEGRATIONPLATFORMEREC|(^|[^A-Z0-9])EREC([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "\$haystack" "EREC"; then
     echo "EREC"
-  elif [[ "\$haystack" =~ INTEGRATIONPLATFORMMPI|(^|[^A-Z0-9])MPI([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "\$haystack" "MPI"; then
     echo "MPI"
-  elif [[ "\$haystack" =~ INTEGRATIONPLATFORMHL7([^A-Z0-9]|$)|(^|[^A-Z0-9])HL7([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "\$haystack" "HL7"; then
     echo "HL7"
-  elif [[ "\$haystack" =~ INTEGRATIONPLATFORMHL7[A-Z0-9]+|(^|[^A-Z0-9])HL7[A-Z0-9]+([^A-Z0-9]|$) ]]; then
+  elif matches_platform_prefix_key "\$haystack" "HL7[A-Z0-9]+" || [[ "\$haystack" =~ (^|[^A-Z0-9])HL7[A-Z0-9]+([^A-Z0-9]|$) ]]; then
     echo "HL7*"
-  elif [[ "\$haystack" =~ INTEGRATIONPLATFORMERP|(^|[^A-Z0-9])ERP([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "\$haystack" "ERP"; then
     echo "ERP"
-  elif [[ "\$haystack" =~ INTEGRATIONPLATFORMZSMOPL|(^|[^A-Z0-9])ZSMOPL([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "\$haystack" "ZSMOPL"; then
     echo "ZSMOPL"
-  elif [[ "\$haystack" =~ INTEGRATIONPLATFORMTS([^A-Z0-9]|$)|(^|[^A-Z0-9])TS([^A-Z0-9]|$) ]]; then
+  elif matches_platform_key "\$haystack" "TS"; then
     echo "TS"
+  elif matches_platform_key "\$haystack" "PI"; then
+    echo "PI"
   else
     echo "OTHER"
   fi
