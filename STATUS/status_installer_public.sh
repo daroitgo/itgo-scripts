@@ -12,8 +12,8 @@ set -o pipefail 2>/dev/null || true
 #   <HOME>/UTILITY/STATUS/
 #
 # Cache:
-#   /var/cache/server-status/system.txt   (hourly)
-#   /var/cache/server-status/apps.txt     (nightly; discovery + logs sizes)
+#   <HOME>/UTILITY/STATUS/cache/system.txt   (hourly)
+#   <HOME>/UTILITY/STATUS/cache/apps.txt     (nightly; discovery + logs sizes)
 #
 # Live:
 #   - service state (systemctl is-active)
@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.11"
+VERSION="3.12.12"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -33,12 +33,16 @@ else
   TARGET_USER="${1:-itgo}"
 fi
 
-CACHE_DIR="/var/cache/server-status"
-EOL_DB_DIR="/usr/local/share/server-status"
-EOL_DB_FILE="/usr/local/share/server-status/eol-db.tsv"
+CACHE_DIR=""
+EOL_DB_DIR=""
+EOL_DB_FILE=""
 
-SYSTEMD_COLLECT="/usr/local/sbin/system_inventory_collect"
-SYSTEMD_APPS_COLLECT="/usr/local/sbin/apps_inventory_collect"
+SYSTEMD_COLLECT=""
+SYSTEMD_APPS_COLLECT=""
+
+LEGACY_STATUS_CMD="/usr/local/bin/status"
+LEGACY_SYSTEMD_COLLECT="/usr/local/sbin/system_inventory_collect"
+LEGACY_SYSTEMD_APPS_COLLECT="/usr/local/sbin/apps_inventory_collect"
 
 UNIT_SERVICE="/etc/systemd/system/server-status-collect.service"
 UNIT_TIMER="/etc/systemd/system/server-status-collect.timer"
@@ -66,10 +70,17 @@ resolve_home() {
 
   UTILITY_DIR="$TARGET_HOME/UTILITY"
   STATUS_DIR="$UTILITY_DIR/STATUS"
+  STATUS_BIN_DIR="$STATUS_DIR/bin"
+  CACHE_DIR="$STATUS_DIR/cache"
+  EOL_DB_DIR="$STATUS_DIR/eol-db"
+  EOL_DB_FILE="$EOL_DB_DIR/eol-db.tsv"
   VERSION_FILE="$STATUS_DIR/.status_installer_version"
 
-  COLLECTOR_SRC="$STATUS_DIR/system_inventory_collect.sh"
-  APPS_COLLECTOR_SRC="$STATUS_DIR/apps_inventory_collect.sh"
+  COLLECTOR_SRC="$STATUS_BIN_DIR/system_inventory_collect"
+  APPS_COLLECTOR_SRC="$STATUS_BIN_DIR/apps_inventory_collect"
+  SYSTEMD_COLLECT="$COLLECTOR_SRC"
+  SYSTEMD_APPS_COLLECT="$APPS_COLLECTOR_SRC"
+  STATUS_LAUNCHER="$STATUS_BIN_DIR/status"
   VIEWER="$STATUS_DIR/server_status_view.sh"
 
   BASH_PROFILE="$TARGET_HOME/.bash_profile"
@@ -78,10 +89,23 @@ resolve_home() {
 setup_dirs() {
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$STATUS_DIR"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$STATUS_BIN_DIR"
 
-  install -d -m 0755 "$CACHE_DIR"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$CACHE_DIR"
   chmod 0755 "$CACHE_DIR"
-  install -d -m 0755 "$EOL_DB_DIR"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$EOL_DB_DIR"
+}
+
+cleanup_legacy_global_artifacts() {
+  rm -f "$LEGACY_STATUS_CMD" \
+        "${LEGACY_STATUS_CMD}.bak" \
+        "${LEGACY_STATUS_CMD}.bak."* \
+        "$LEGACY_SYSTEMD_COLLECT" \
+        "${LEGACY_SYSTEMD_COLLECT}.bak" \
+        "${LEGACY_SYSTEMD_COLLECT}.bak."* \
+        "$LEGACY_SYSTEMD_APPS_COLLECT" \
+        "${LEGACY_SYSTEMD_APPS_COLLECT}.bak" \
+        "${LEGACY_SYSTEMD_APPS_COLLECT}.bak."* 2>/dev/null || true
 }
 
 write_installer_version_file() {
@@ -103,6 +127,7 @@ write_eol_db() {
     printf "centos-stream\t9\t2027-05-31\n"
   } > "$EOL_DB_FILE"
   chmod 0644 "$EOL_DB_FILE"
+  chown "$TARGET_USER:$TARGET_USER" "$EOL_DB_FILE" 2>/dev/null || true
   awk -F $'\t' 'BEGIN{ok=0} $0 ~ /^[[:space:]]*#/ {next} NF==3 {ok=1} END{exit ok?0:1}' "$EOL_DB_FILE" \
     || { echo "ERROR: EOL DB format broken" >&2; exit 1; }
 }
@@ -113,9 +138,9 @@ cat > "$COLLECTOR_SRC" <<'COL'
 set -eu
 set -o pipefail 2>/dev/null || true
 
-OUTDIR="/var/cache/server-status"
+OUTDIR="__STATUS_CACHE_DIR__"
 SYS="$OUTDIR/system.txt"
-EOL_DB="/usr/local/share/server-status/eol-db.tsv"
+EOL_DB="__STATUS_EOL_DB_FILE__"
 
 tmp_sys="$(mktemp)"
 mkdir -p "$OUTDIR"
@@ -333,6 +358,10 @@ mv "$tmp_sys" "$SYS"
 chmod 0644 "$SYS"
 chown root:root "$SYS"
 COL
+sed -i \
+  -e "s|__STATUS_CACHE_DIR__|$CACHE_DIR|g" \
+  -e "s|__STATUS_EOL_DB_FILE__|$EOL_DB_FILE|g" \
+  "$COLLECTOR_SRC"
 chmod 0755 "$COLLECTOR_SRC"
 }
 
@@ -342,7 +371,7 @@ cat > "$APPS_COLLECTOR_SRC" <<'APPCOL'
 set -eu
 set -o pipefail 2>/dev/null || true
 
-OUTDIR="/var/cache/server-status"
+OUTDIR="__STATUS_CACHE_DIR__"
 APPS="$OUTDIR/apps.txt"
 tmp="$(mktemp)"
 mkdir -p "$OUTDIR"
@@ -640,6 +669,9 @@ mv "$tmp" "$APPS"
 chmod 0644 "$APPS"
 chown root:root "$APPS"
 APPCOL
+sed -i \
+  -e "s|__STATUS_CACHE_DIR__|$CACHE_DIR|g" \
+  "$APPS_COLLECTOR_SRC"
 chmod 0755 "$APPS_COLLECTOR_SRC"
 }
 
@@ -649,8 +681,8 @@ cat > "$VIEWER" <<'VIEW'
 set -eu
 set -o pipefail 2>/dev/null || true
 
-SYS="/var/cache/server-status/system.txt"
-APPS="/var/cache/server-status/apps.txt"
+SYS="__STATUS_CACHE_DIR__/system.txt"
+APPS="__STATUS_CACHE_DIR__/apps.txt"
 [[ -f "$SYS" ]] || exit 0
 
 getv(){ local key="$1"; awk -v k="$key" '$0 ~ "^"k"[[:space:]]*:"{sub("^"k"[[:space:]]*:[[:space:]]*","",$0); print; exit}' "$SYS"; }
@@ -881,12 +913,16 @@ done | sort
 
 echo
 VIEW
+sed -i \
+  -e "s|__STATUS_CACHE_DIR__|$CACHE_DIR|g" \
+  "$VIEWER"
 chmod 0755 "$VIEWER"
 }
 
-install_collectors_to_usr_local() {
-  install -m 0755 -o root -g root "$COLLECTOR_SRC" "$SYSTEMD_COLLECT"
-  install -m 0755 -o root -g root "$APPS_COLLECTOR_SRC" "$SYSTEMD_APPS_COLLECT"
+install_collectors_local() {
+  chown "$TARGET_USER:$TARGET_USER" "$COLLECTOR_SRC" "$APPS_COLLECTOR_SRC" 2>/dev/null || true
+  chmod 0755 "$COLLECTOR_SRC" "$APPS_COLLECTOR_SRC" 2>/dev/null || true
+  cleanup_legacy_global_artifacts
 }
 
 install_systemd_units() {
@@ -951,13 +987,13 @@ EOF_TMR
 }
 
 install_status_command() {
-  cat > /usr/local/bin/status <<'EOF_CMD'
+  cat > "$STATUS_LAUNCHER" <<'EOF_CMD'
 #!/usr/bin/env bash
 set -eu
 set -o pipefail 2>/dev/null || true
 
-SYS="/var/cache/server-status/system.txt"
-APPS="/var/cache/server-status/apps.txt"
+SYS="__STATUS_CACHE_DIR__/system.txt"
+APPS="__STATUS_CACHE_DIR__/apps.txt"
 
 TTL_SYS=600
 TTL_APPS=86400
@@ -1000,15 +1036,21 @@ if command -v systemctl >/dev/null 2>&1; then
   fi
 fi
 
-viewer="$HOME/UTILITY/STATUS/server_status_view.sh"
+viewer="__STATUS_VIEWER__"
 if [[ -x "$viewer" ]]; then
   exec "$viewer"
 fi
 
-echo "ERROR: $HOME/UTILITY/STATUS/server_status_view.sh not found/executable" >&2
+echo "ERROR: __STATUS_VIEWER__ not found/executable" >&2
 exit 1
 EOF_CMD
-  chmod 0755 /usr/local/bin/status
+  sed -i \
+    -e "s|__STATUS_CACHE_DIR__|$CACHE_DIR|g" \
+    -e "s|__STATUS_VIEWER__|$VIEWER|g" \
+    "$STATUS_LAUNCHER"
+  chown "$TARGET_USER:$TARGET_USER" "$STATUS_LAUNCHER" 2>/dev/null || true
+  chmod 0755 "$STATUS_LAUNCHER"
+  cleanup_legacy_global_artifacts
 }
 
 remove_block_from_file() {
@@ -1047,9 +1089,12 @@ case "$-" in *i*) : ;; *) return 0 ;; esac
 [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_CLIENT:-}" || -n "${SSH_TTY:-}" ]] || return 0
 
 sleep 0.05
-command -v status >/dev/null 2>&1 && status 2>/dev/null || true
+if [[ -x "__STATUS_LAUNCHER__" ]]; then
+  "__STATUS_LAUNCHER__" 2>/dev/null || true
+fi
 # --- /system-audit ---
 EOF_BP
+  sed -i -e "s|__STATUS_LAUNCHER__|$STATUS_LAUNCHER|g" "$BASH_PROFILE"
 }
 
 remove_status_profile_block() {
@@ -1082,7 +1127,8 @@ uninstall_status() {
   fi
 
   rm -f "$UNIT_SERVICE" "$UNIT_TIMER" "$UNIT_APPS_SERVICE" "$UNIT_APPS_TIMER" 2>/dev/null || true
-  rm -f /usr/local/bin/status "$SYSTEMD_COLLECT" "$SYSTEMD_APPS_COLLECT" 2>/dev/null || true
+  rm -f "$SYSTEMD_COLLECT" "$SYSTEMD_APPS_COLLECT" "$STATUS_LAUNCHER" 2>/dev/null || true
+  cleanup_legacy_global_artifacts
   rm -rf "$STATUS_DIR" 2>/dev/null || true
 
   if [[ -d "$CACHE_DIR" && ! -L "$CACHE_DIR" ]]; then
@@ -1121,7 +1167,7 @@ main() {
 
   chown "$TARGET_USER:$TARGET_USER" "$COLLECTOR_SRC" "$APPS_COLLECTOR_SRC" "$VIEWER"
 
-  install_collectors_to_usr_local
+  install_collectors_local
   install_systemd_units
   install_apps_systemd_units
   install_status_command
