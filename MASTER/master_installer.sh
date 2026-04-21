@@ -37,10 +37,10 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.25"
+MASTER_VERSION="1.2.26"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
-STATUS_VERSION="3.12.12"
+STATUS_VERSION="3.12.13"
 CLEANUP_VERSION="1.0.3"
 TSEQ_VERSION="3.12.6"
 DOWNLOADER_APP_VERSION="1.0.2"
@@ -188,8 +188,10 @@ install_master_launcher() {
   local launcher_dir install_launcher update_launcher bp
   local legacy_install_launcher="/usr/local/bin/master-install"
   local legacy_update_launcher="/usr/local/bin/master-update"
-  local path_start="# >>> ITGO MASTER PATH (auto) >>>"
-  local path_end="# <<< ITGO MASTER PATH (auto) <<<"
+  local legacy_path_start="# >>> ITGO MASTER PATH (auto) >>>"
+  local legacy_path_end="# <<< ITGO MASTER PATH (auto) <<<"
+  local path_start="# >>> ITGO LOCAL MODULE PATHS (auto) >>>"
+  local path_end="# <<< ITGO LOCAL MODULE PATHS (auto) <<<"
 
   if ! have_user; then
     add_summary "MASTER launcher installed: SKIP (user missing)"
@@ -323,13 +325,15 @@ EOF_MASTER_UPDATE_LAUNCHER
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
   chmod 0644 "$bp" 2>/dev/null || true
   safe_backup "$bp"
+  remove_block_from_file "$bp" "$legacy_path_start" "$legacy_path_end"
   remove_block_from_file "$bp" "$path_start" "$path_end"
-  printf "\n%s\nexport PATH=\"\$HOME/UTILITY/MASTER:\$PATH\"\n%s\n" "$path_start" "$path_end" >> "$bp"
+  printf "\n%s\nexport PATH=\"\$HOME/UTILITY/MASTER:\$HOME/UTILITY/STATUS/bin:\$HOME/UTILITY/TSEQ/bin:\$HOME/UTILITY/DOWNLOADER_APP/bin:\$HOME/UTILITY/UPGbuilder/bin:\$PATH\"\n%s\n" "$path_start" "$path_end" >> "$bp"
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
   chmod 0644 "$bp" 2>/dev/null || true
 
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-install"
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-update"
+  add_summary "User-local PATH updated for MASTER, STATUS, TSEQ, DOWNLOADER_APP, UPGbuilder"
 }
 
 ITGO_HOME=""
@@ -1176,8 +1180,10 @@ restore_master_shell_settings() {
   local legacy_update_launcher="/usr/local/bin/master-update"
   local bp_start="# >>> ITGO SSH HISTORY PROMPT (auto) >>>"
   local bp_end="# <<< ITGO SSH HISTORY PROMPT (auto) <<<"
-  local path_start="# >>> ITGO MASTER PATH (auto) >>>"
-  local path_end="# <<< ITGO MASTER PATH (auto) <<<"
+  local legacy_path_start="# >>> ITGO MASTER PATH (auto) >>>"
+  local legacy_path_end="# <<< ITGO MASTER PATH (auto) <<<"
+  local path_start="# >>> ITGO LOCAL MODULE PATHS (auto) >>>"
+  local path_end="# <<< ITGO LOCAL MODULE PATHS (auto) <<<"
   local bl_start="# >>> ITGO HISTORY CLEAR ON LOGOUT (auto) >>>"
   local bl_end="# <<< ITGO HISTORY CLEAR ON LOGOUT (auto) <<<"
 
@@ -1201,6 +1207,7 @@ restore_master_shell_settings() {
   if [[ -f "$bp" ]]; then
     safe_backup "$bp"
     remove_block_from_file "$bp" "$bp_start" "$bp_end"
+    remove_block_from_file "$bp" "$legacy_path_start" "$legacy_path_end"
     remove_block_from_file "$bp" "$path_start" "$path_end"
     chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
     chmod 0644 "$bp" 2>/dev/null || true
