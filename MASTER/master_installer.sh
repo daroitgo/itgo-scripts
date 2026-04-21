@@ -37,13 +37,13 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.21"
+MASTER_VERSION="1.2.22"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.11"
 CLEANUP_VERSION="1.0.3"
 TSEQ_VERSION="3.12.6"
-DOWNLOADER_APP_VERSION="1.0.1"
+DOWNLOADER_APP_VERSION="1.0.2"
 UPGBUILDER_VERSION="0.1.5"
 
 MODE="install"
@@ -444,7 +444,7 @@ module_health_for_module() {
       [[ -d "$ITGO_HOME/UTILITY/UPG_CLEANUP" ]] && echo "OK" || echo "BROKEN"
       ;;
     DOWNLOADER_APP)
-      [[ -x "$ITGO_HOME/UTILITY/DOWNLOADER_APP/upg_installer.sh" && -L /usr/local/bin/dwupg ]] && echo "OK" || echo "BROKEN"
+      [[ -d "$ITGO_HOME/UTILITY/DOWNLOADER_APP" && -f "$version_file" && -x "$ITGO_HOME/UTILITY/DOWNLOADER_APP/upg_installer.sh" && -x "$ITGO_HOME/UTILITY/DOWNLOADER_APP/bin/dwupg" ]] && echo "OK" || echo "BROKEN"
       ;;
     UPGBUILDER)
       [[ -x "$ITGO_HOME/UTILITY/UPGbuilder/upgbuilder.sh" && -L /usr/local/bin/upgbuilder ]] && echo "OK" || echo "BROKEN"
@@ -1002,12 +1002,15 @@ run_module_as_itgo() {
 install_downloader_app_script() {
   local src="${1:?}"
   local app_dir="$UTILITY_DIR/DOWNLOADER_APP"
+  local bin_dir="$app_dir/bin"
   local dst="$app_dir/upg_installer.sh"
-  local link="/usr/local/bin/dwupg"
+  local launcher="$bin_dir/dwupg"
+  local legacy_link="/usr/local/bin/dwupg"
   local version_file="$app_dir/.downloader_version"
 
   echo "[$(ts)] ACTION: install downloader app into $app_dir"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$app_dir"
+  install -d -m 0700 -o "$TARGET_USER" -g "$TARGET_USER" "$bin_dir"
 
   install -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$src" "$dst"
 
@@ -1015,19 +1018,21 @@ install_downloader_app_script() {
   chown "$TARGET_USER:$TARGET_USER" "$version_file" 2>/dev/null || true
   chmod 0644 "$version_file" 2>/dev/null || true
 
-  if [[ -L "$link" || -e "$link" ]]; then
-    echo "[$(ts)] ACTION: remove existing $link"
-    rm -f "$link"
-  fi
+  cat > "$launcher" <<EOF_DOWNLOADER_APP_LAUNCHER
+#!/usr/bin/env bash
+exec "$dst" "\$@"
+EOF_DOWNLOADER_APP_LAUNCHER
+  chown "$TARGET_USER:$TARGET_USER" "$launcher" 2>/dev/null || true
+  chmod 0700 "$launcher" 2>/dev/null || true
 
-  ln -s "$dst" "$link"
-  chmod 0755 "$dst" 2>/dev/null || true
+  echo "[$(ts)] ACTION: cleanup legacy $legacy_link and backups"
+  rm -f "$legacy_link" "${legacy_link}.bak" "${legacy_link}.bak."* 2>/dev/null || true
 
   echo "[$(ts)] OK: downloader app installed:"
   echo "[$(ts)]   script : $dst"
-  echo "[$(ts)]   symlink: $link"
+  echo "[$(ts)]   launcher: $launcher"
   echo "[$(ts)]   verfile: $version_file"
-  echo "[$(ts)]   usage  : dwupg"
+  echo "[$(ts)]   usage  : $launcher"
 }
 
 install_upgbuilder_script() {
@@ -1350,7 +1355,7 @@ install_downloader_app_step() {
 
   if should_install_or_update_module "DOWNLOADER_APP"; then
     if [[ "$MODULE_DECISION" == "install" ]]; then
-      if prompt_yn "MODUŁ: DOWNLOADER_APP (zainstalować ~/UTILITY/DOWNLOADER_APP/upg_installer.sh i symlink /usr/local/bin/dwupg)?" "Y"; then
+      if prompt_yn "MODUŁ: DOWNLOADER_APP (lokalnie: ~/UTILITY/DOWNLOADER_APP/upg_installer.sh + ~/UTILITY/DOWNLOADER_APP/bin/dwupg)?" "Y"; then
         ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
 
         if ! have_user; then
@@ -1587,7 +1592,7 @@ uninstall_cleanup_step() {
 }
 
 uninstall_downloader_app_step() {
-  local app_dir link
+  local app_dir legacy_link
 
   if ! have_user; then
     echo "[$(ts)] WARN: user '$TARGET_USER' missing. Pomijam DOWNLOADER_APP uninstall."
@@ -1598,9 +1603,9 @@ uninstall_downloader_app_step() {
   [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] WARN: cannot resolve home for '$TARGET_USER'. Pomijam DOWNLOADER_APP uninstall."; return 0; }
 
   app_dir="$ITGO_HOME/UTILITY/DOWNLOADER_APP"
-  link="/usr/local/bin/dwupg"
+  legacy_link="/usr/local/bin/dwupg"
 
-  rm -f "$link" 2>/dev/null || true
+  rm -f "$legacy_link" "${legacy_link}.bak" "${legacy_link}.bak."* 2>/dev/null || true
   rm -rf "$app_dir" 2>/dev/null || true
 
   echo "[$(ts)] OK: DOWNLOADER_APP uninstall done."
