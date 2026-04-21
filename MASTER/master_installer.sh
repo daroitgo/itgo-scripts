@@ -37,14 +37,14 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.22"
+MASTER_VERSION="1.2.23"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.11"
 CLEANUP_VERSION="1.0.3"
 TSEQ_VERSION="3.12.6"
 DOWNLOADER_APP_VERSION="1.0.2"
-UPGBUILDER_VERSION="0.1.5"
+UPGBUILDER_VERSION="0.1.6"
 
 MODE="install"
 UPDATE_ONLY_MODE="0"
@@ -447,7 +447,7 @@ module_health_for_module() {
       [[ -d "$ITGO_HOME/UTILITY/DOWNLOADER_APP" && -f "$version_file" && -x "$ITGO_HOME/UTILITY/DOWNLOADER_APP/upg_installer.sh" && -x "$ITGO_HOME/UTILITY/DOWNLOADER_APP/bin/dwupg" ]] && echo "OK" || echo "BROKEN"
       ;;
     UPGBUILDER)
-      [[ -x "$ITGO_HOME/UTILITY/UPGbuilder/upgbuilder.sh" && -L /usr/local/bin/upgbuilder ]] && echo "OK" || echo "BROKEN"
+      [[ -d "$ITGO_HOME/UTILITY/UPGbuilder" && -f "$version_file" && -x "$ITGO_HOME/UTILITY/UPGbuilder/upgbuilder.sh" && -x "$ITGO_HOME/UTILITY/UPGbuilder/bin/upgbuilder" ]] && echo "OK" || echo "BROKEN"
       ;;
     *)
       echo "UNKNOWN"
@@ -1038,14 +1038,17 @@ EOF_DOWNLOADER_APP_LAUNCHER
 install_upgbuilder_script() {
   local src="${1:?}"
   local app_dir="$UTILITY_DIR/UPGbuilder"
+  local bin_dir="$app_dir/bin"
   local dst="$app_dir/upgbuilder.sh"
-  local link="/usr/local/bin/upgbuilder"
+  local launcher="$bin_dir/upgbuilder"
+  local legacy_link="/usr/local/bin/upgbuilder"
   local version_file="$app_dir/.upgbuilder_version"
   local map_dst="$app_dir/upgbuilder.map"
   local template_dst="$app_dir/template"
 
   echo "[$(ts)] ACTION: install upgbuilder into $app_dir"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$app_dir"
+  install -d -m 0700 -o "$TARGET_USER" -g "$TARGET_USER" "$bin_dir"
 
   install -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$src" "$dst"
 
@@ -1068,21 +1071,23 @@ install_upgbuilder_script() {
   chown "$TARGET_USER:$TARGET_USER" "$version_file" 2>/dev/null || true
   chmod 0644 "$version_file" 2>/dev/null || true
 
-  if [[ -L "$link" || -e "$link" ]]; then
-    echo "[$(ts)] ACTION: remove existing $link"
-    rm -f "$link"
-  fi
+  cat > "$launcher" <<EOF_UPGBUILDER_LAUNCHER
+#!/usr/bin/env bash
+exec "$dst" "\$@"
+EOF_UPGBUILDER_LAUNCHER
+  chown "$TARGET_USER:$TARGET_USER" "$launcher" 2>/dev/null || true
+  chmod 0700 "$launcher" 2>/dev/null || true
 
-  ln -s "$dst" "$link"
-  chmod 0755 "$dst" 2>/dev/null || true
+  echo "[$(ts)] ACTION: cleanup legacy $legacy_link and backups"
+  rm -f "$legacy_link" "${legacy_link}.bak" "${legacy_link}.bak."* 2>/dev/null || true
 
   echo "[$(ts)] OK: upgbuilder installed:"
   echo "[$(ts)]   script   : $dst"
+  echo "[$(ts)]   launcher : $launcher"
   echo "[$(ts)]   map      : $map_dst"
   echo "[$(ts)]   template : $template_dst"
-  echo "[$(ts)]   symlink  : $link"
   echo "[$(ts)]   verfile  : $version_file"
-  echo "[$(ts)]   usage    : upgbuilder"
+  echo "[$(ts)]   usage    : $launcher"
 }
 
 cleanup_downloaded_installers() {
@@ -1404,10 +1409,11 @@ install_downloader_app_step() {
 
 install_upgbuilder_step() {
   local upgbuilder_sh="${1:?}"
+  local upgbuilder_launcher
 
   if should_install_or_update_module "UPGBUILDER"; then
     if [[ "$MODULE_DECISION" == "install" ]]; then
-      if prompt_yn "MODUŁ: UPGbuilder (zainstalować ~/UTILITY/UPGbuilder/upgbuilder.sh i symlink /usr/local/bin/upgbuilder)?" "Y"; then
+      if prompt_yn "MODUŁ: UPGbuilder (lokalnie: ~/UTILITY/UPGbuilder/upgbuilder.sh + ~/UTILITY/UPGbuilder/bin/upgbuilder)?" "Y"; then
         ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
 
         if ! have_user; then
@@ -1426,10 +1432,11 @@ install_upgbuilder_step() {
 
         download_to_tmp "$UPGBUILDER_URL" "$upgbuilder_sh" "$UPGBUILDER_LOCAL_PATH"
         install_upgbuilder_script "$upgbuilder_sh"
+        upgbuilder_launcher="$UTILITY_DIR/UPGbuilder/bin/upgbuilder"
 
-        if prompt_yn "Uruchomić teraz: upgbuilder --detect jako $TARGET_USER?" "Y"; then
-          echo "[$(ts)] RUN(itgo): sudo -H -u $TARGET_USER /usr/local/bin/upgbuilder --detect"
-          sudo -H -u "$TARGET_USER" /usr/local/bin/upgbuilder --detect
+        if prompt_yn "Uruchomić teraz: $upgbuilder_launcher --detect jako $TARGET_USER?" "Y"; then
+          echo "[$(ts)] RUN(itgo): sudo -H -u $TARGET_USER $upgbuilder_launcher --detect"
+          sudo -H -u "$TARGET_USER" "$upgbuilder_launcher" --detect
         else
           echo "[$(ts)] SKIP: upgbuilder --detect."
         fi
@@ -1457,10 +1464,11 @@ install_upgbuilder_step() {
 
       download_to_tmp "$UPGBUILDER_URL" "$upgbuilder_sh" "$UPGBUILDER_LOCAL_PATH"
       install_upgbuilder_script "$upgbuilder_sh"
+      upgbuilder_launcher="$UTILITY_DIR/UPGbuilder/bin/upgbuilder"
 
-      if prompt_yn "Uruchomić teraz: upgbuilder --detect jako $TARGET_USER?" "Y"; then
-        echo "[$(ts)] RUN(itgo): sudo -H -u $TARGET_USER /usr/local/bin/upgbuilder --detect"
-        sudo -H -u "$TARGET_USER" /usr/local/bin/upgbuilder --detect
+      if prompt_yn "Uruchomić teraz: $upgbuilder_launcher --detect jako $TARGET_USER?" "Y"; then
+        echo "[$(ts)] RUN(itgo): sudo -H -u $TARGET_USER $upgbuilder_launcher --detect"
+        sudo -H -u "$TARGET_USER" "$upgbuilder_launcher" --detect
       else
         echo "[$(ts)] SKIP: upgbuilder --detect."
       fi
@@ -1613,7 +1621,7 @@ uninstall_downloader_app_step() {
 }
 
 uninstall_upgbuilder_step() {
-  local app_dir link
+  local app_dir legacy_link
 
   if ! have_user; then
     echo "[$(ts)] WARN: user '$TARGET_USER' missing. Pomijam UPGbuilder uninstall."
@@ -1624,9 +1632,9 @@ uninstall_upgbuilder_step() {
   [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] WARN: cannot resolve home for '$TARGET_USER'. Pomijam UPGbuilder uninstall."; return 0; }
 
   app_dir="$ITGO_HOME/UTILITY/UPGbuilder"
-  link="/usr/local/bin/upgbuilder"
+  legacy_link="/usr/local/bin/upgbuilder"
 
-  rm -f "$link" 2>/dev/null || true
+  rm -f "$legacy_link" "${legacy_link}.bak" "${legacy_link}.bak."* 2>/dev/null || true
   rm -rf "$app_dir" 2>/dev/null || true
 
   echo "[$(ts)] OK: UPGbuilder uninstall done."
