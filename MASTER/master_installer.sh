@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.24"
+MASTER_VERSION="1.2.25"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.12"
@@ -87,10 +87,39 @@ UPGBUILDER_LOCAL_PATH="${SOURCE_DIR}/UPGBUILDER/upgbuilder.sh"
 UPGBUILDER_LOCAL_MAP="${SOURCE_DIR}/UPGBUILDER/upgbuilder.map"
 UPGBUILDER_LOCAL_TEMPLATE_DIR="${SOURCE_DIR}/UPGBUILDER/template"
 
-TMP_LOG="/tmp/itgo-master-install.$(date +%Y%m%d_%H%M%S).log"
+TMP_LOG=""
 
 ts() { date "+%F %T"; }
-prelog() { echo "[$(ts)] $*" | tee -a "$TMP_LOG" >/dev/null; }
+
+init_tmp_log_if_needed() {
+  [[ -n "${TMP_LOG:-}" ]] && return 0
+
+  local target_home log_dir
+  target_home="$(getent passwd "$TARGET_USER" | awk -F: '{print $6}' || true)"
+  if [[ -n "${target_home:-}" ]]; then
+    log_dir="$target_home/UTILITY/LOG/OTHER"
+  else
+    log_dir="/root/UTILITY/LOG/OTHER"
+  fi
+
+  mkdir -p "$log_dir" 2>/dev/null || true
+  if [[ -n "${target_home:-}" && -d "$log_dir" ]]; then
+    chown "$TARGET_USER:$TARGET_USER" "$target_home/UTILITY" "$target_home/UTILITY/LOG" "$log_dir" 2>/dev/null || true
+  fi
+  chmod 0755 "$log_dir" 2>/dev/null || true
+
+  TMP_LOG="$log_dir/master-install.prelog_$(date +%Y%m%d_%H%M%S).log"
+  touch "$TMP_LOG" 2>/dev/null || true
+  if [[ -n "${target_home:-}" && -f "$TMP_LOG" ]]; then
+    chown "$TARGET_USER:$TARGET_USER" "$TMP_LOG" 2>/dev/null || true
+  fi
+  chmod 0644 "$TMP_LOG" 2>/dev/null || true
+}
+
+prelog() {
+  init_tmp_log_if_needed
+  echo "[$(ts)] $*" | tee -a "$TMP_LOG" >/dev/null
+}
 
 need_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
