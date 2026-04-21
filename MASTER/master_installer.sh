@@ -37,10 +37,10 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.23"
+MASTER_VERSION="1.2.24"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
-STATUS_VERSION="3.12.11"
+STATUS_VERSION="3.12.12"
 CLEANUP_VERSION="1.0.3"
 TSEQ_VERSION="3.12.6"
 DOWNLOADER_APP_VERSION="1.0.2"
@@ -435,7 +435,13 @@ module_health_for_module() {
 
   case "$module" in
     STATUS)
-      [[ -d "$ITGO_HOME/UTILITY/STATUS" && -x /usr/local/bin/status ]] && echo "OK" || echo "BROKEN"
+      [[ -d "$ITGO_HOME/UTILITY/STATUS" \
+        && -f "$version_file" \
+        && -x "$ITGO_HOME/UTILITY/STATUS/bin/status" \
+        && -x "$ITGO_HOME/UTILITY/STATUS/bin/system_inventory_collect" \
+        && -x "$ITGO_HOME/UTILITY/STATUS/bin/apps_inventory_collect" \
+        && -d "$ITGO_HOME/UTILITY/STATUS/cache" \
+        && -f "$ITGO_HOME/UTILITY/STATUS/eol-db/eol-db.tsv" ]] && echo "OK" || echo "BROKEN"
       ;;
     TSEQ)
       [[ -d "$ITGO_HOME/UTILITY/TSEQ" && -f "$version_file" && -x "$ITGO_HOME/UTILITY/TSEQ/bin/tseq" && -f /etc/systemd/system/tseq.service ]] && echo "OK" || echo "BROKEN"
@@ -1215,6 +1221,7 @@ restore_master_shell_settings() {
 
 install_ssh_history_prompt_block() {
   local bp="$ITGO_HOME/.bash_profile"
+  local status_launcher="$ITGO_HOME/UTILITY/STATUS/bin/status"
 
   local START="# >>> ITGO SSH HISTORY PROMPT (auto) >>>"
   local END="# <<< ITGO SSH HISTORY PROMPT (auto) <<<"
@@ -1249,10 +1256,13 @@ if [[ -z "${ITGO_ASKED_HISTORY:-}" ]]; then
 fi
 
 sleep 0.05
-command -v status >/dev/null 2>&1 && status 2>/dev/null || true
+if [[ -x "__STATUS_LAUNCHER__" ]]; then
+  "__STATUS_LAUNCHER__" 2>/dev/null || true
+fi
 # <<< ITGO SSH HISTORY PROMPT (auto) <<<
 BEOF
 )
+  BLOCK="${BLOCK//__STATUS_LAUNCHER__/$status_launcher}"
 
   echo "[$(ts)] ACTION: patch $bp (replace old status block + ensure single prompt+status)"
   touch "$bp"
@@ -1294,7 +1304,7 @@ install_status_step() {
 
   if should_install_or_update_module "STATUS"; then
     if [[ "$MODULE_DECISION" == "install" ]]; then
-      if prompt_yn "MODUŁ: Server-Status (systemd + /usr/local + /var/cache)?" "Y"; then
+      if prompt_yn "MODUŁ: Server-Status (lokalny launcher + lokalne collectory/cache; systemd jako wyjątek techniczny)?" "Y"; then
         ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
         download_to_tmp "$STATUS_URL" "$status_sh" "$STATUS_LOCAL_PATH"
         run_module_root "$status_sh" "$TARGET_USER"
@@ -1832,7 +1842,7 @@ main() {
     echo "[$(ts)] SKIP: SSH history prompt pominięty, bo włączono czyszczenie historii przy wylogowaniu."
     add_summary "Shell: SSH history prompt skipped because history clear on logout is enabled"
   else
-    if prompt_yn "MODUŁ: SSH login prompt: pytać czy zapisywać historię + potem status (bez dubli)?" "Y"; then
+    if prompt_yn "MODUŁ: SSH login prompt: pytać czy zapisywać historię + potem lokalny STATUS/bin/status (bez dubli)?" "Y"; then
       if ! have_user; then
         echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
         exit 1
