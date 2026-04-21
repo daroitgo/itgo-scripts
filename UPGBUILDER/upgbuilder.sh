@@ -13,10 +13,14 @@ set -euo pipefail
 # -------------------- CONFIG --------------------
 
 MODULE_DIR="${HOME}/UTILITY/UPGbuilder"
+BIN_DIR="${MODULE_DIR}/bin"
 TMP_DIR="${MODULE_DIR}/tmp"
 BACKUP_DIR="${MODULE_DIR}/backup"
 OUTPUT_DIR="${HOME}/UPG"
 VERSION_FILE="${MODULE_DIR}/.upgbuilder_version"
+APP_SCRIPT="${MODULE_DIR}/upgbuilder.sh"
+LOCAL_LAUNCHER="${BIN_DIR}/upgbuilder"
+LEGACY_LAUNCHER="/usr/local/bin/upgbuilder"
 
 MODE="${1:-normal}"
 
@@ -33,7 +37,7 @@ RULE_ORDER=(
 
 # -------------------- GLOBALS --------------------
 
-UPGBUILDER_VERSION="0.1.5"
+UPGBUILDER_VERSION="0.1.6"
 RAW_REPO_BASE="https://raw.githubusercontent.com/daroitgo/itgo-scripts"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,7 +89,59 @@ cleanup() {
 trap cleanup EXIT
 
 ensure_dirs() {
-  mkdir -p "$MODULE_DIR" "$TMP_DIR" "$BACKUP_DIR" "$OUTPUT_DIR"
+  mkdir -p "$MODULE_DIR" "$BIN_DIR" "$TMP_DIR" "$BACKUP_DIR" "$OUTPUT_DIR"
+  chmod 0755 "$MODULE_DIR" 2>/dev/null || true
+  chmod 0700 "$BIN_DIR" "$TMP_DIR" "$BACKUP_DIR" 2>/dev/null || true
+}
+
+script_source_path() {
+  local src="${BASH_SOURCE[0]}"
+  local dir base
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  base="$(basename "$src")"
+  printf "%s/%s\n" "$dir" "$base"
+}
+
+cleanup_legacy_launcher() {
+  rm -f "$LEGACY_LAUNCHER" \
+        "${LEGACY_LAUNCHER}.bak" \
+        "${LEGACY_LAUNCHER}.bak."* 2>/dev/null || true
+}
+
+write_version_file() {
+  printf "%s\n" "$UPGBUILDER_VERSION" > "$VERSION_FILE"
+  chmod 0644 "$VERSION_FILE" 2>/dev/null || true
+}
+
+write_local_launcher() {
+  cat > "$LOCAL_LAUNCHER" <<EOF_UPGBUILDER_LAUNCHER
+#!/usr/bin/env bash
+exec "$APP_SCRIPT" "\$@"
+EOF_UPGBUILDER_LAUNCHER
+  chmod 0700 "$LOCAL_LAUNCHER" 2>/dev/null || true
+}
+
+install_local_artifacts() {
+  local src
+  src="$(script_source_path)"
+
+  ensure_dirs
+
+  if [[ "$src" != "$APP_SCRIPT" ]]; then
+    cp -f "$src" "$APP_SCRIPT"
+  fi
+
+  chmod 0700 "$APP_SCRIPT" 2>/dev/null || true
+  write_local_launcher
+  write_version_file
+  cleanup_legacy_launcher
+}
+
+uninstall_upgbuilder() {
+  cleanup_legacy_launcher
+  rm -rf "$MODULE_DIR" 2>/dev/null || true
+  log "[OK] Usunięto UPGbuilder z ${MODULE_DIR}"
+  log "[OK] Usunięto legacy ${LEGACY_LAUNCHER} oraz backupy (jeśli istniały)"
 }
 
 set_source_paths() {
@@ -827,7 +883,7 @@ print_generate_summary() {
 main() {
   local map_local template_local output_file local_version cmp_result local_template_path
 
-  ensure_dirs
+  install_local_artifacts
   load_version
   cleanup
 
@@ -918,7 +974,15 @@ case "$MODE" in
   --detect)
     main
     ;;
+  --install)
+    install_local_artifacts
+    log "[OK] UPGbuilder installed locally"
+    log "[OK] Launcher: ${LOCAL_LAUNCHER}"
+    ;;
+  --uninstall)
+    uninstall_upgbuilder
+    ;;
   *)
-    die "Nieznany parametr: $MODE. Dozwolone: --detect"
+    die "Nieznany parametr: $MODE. Dozwolone: --detect, --install, --uninstall"
     ;;
 esac
