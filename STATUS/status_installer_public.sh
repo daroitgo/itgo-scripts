@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.12"
+VERSION="3.12.13"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -106,6 +106,55 @@ cleanup_legacy_global_artifacts() {
         "$LEGACY_SYSTEMD_APPS_COLLECT" \
         "${LEGACY_SYSTEMD_APPS_COLLECT}.bak" \
         "${LEGACY_SYSTEMD_APPS_COLLECT}.bak."* 2>/dev/null || true
+}
+
+selinux_collectors() {
+  printf "%s\n" "$COLLECTOR_SRC" "$APPS_COLLECTOR_SRC"
+}
+
+configure_collectors_selinux() {
+  command -v getenforce >/dev/null 2>&1 || return 0
+
+  local paths=()
+  local path
+  while IFS= read -r path; do
+    [[ -n "$path" && -e "$path" ]] && paths+=("$path")
+  done < <(selinux_collectors)
+
+  [[ "${#paths[@]}" -gt 0 ]] || return 0
+
+  echo "INFO: SELinux executable context fix covers:"
+  printf "INFO:   %s\n" "${paths[@]}"
+
+  if command -v semanage >/dev/null 2>&1; then
+    for path in "${paths[@]}"; do
+      semanage fcontext -a -t bin_t "$path" 2>/dev/null || \
+        semanage fcontext -m -t bin_t "$path" 2>/dev/null || true
+    done
+
+    if command -v restorecon >/dev/null 2>&1; then
+      restorecon -v "${paths[@]}" 2>/dev/null || restorecon "${paths[@]}" 2>/dev/null || true
+      echo "INFO: SELinux persistent fcontext applied with semanage + restorecon (type bin_t)."
+    else
+      chcon -t bin_t "${paths[@]}" 2>/dev/null || true
+      echo "WARN: semanage is available, but restorecon is missing; applied temporary chcon -t bin_t fallback."
+    fi
+  else
+    chcon -t bin_t "${paths[@]}" 2>/dev/null || true
+    echo "WARN: semanage not found; applied chcon -t bin_t fallback. This is less persistent than semanage + restorecon."
+  fi
+}
+
+remove_collectors_selinux_fcontext() {
+  command -v semanage >/dev/null 2>&1 || return 0
+
+  local path
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    semanage fcontext -d "$path" 2>/dev/null || true
+  done < <(selinux_collectors)
+
+  echo "INFO: Removed STATUS SELinux fcontext entries for local collectors when present."
 }
 
 write_installer_version_file() {
@@ -922,6 +971,7 @@ chmod 0755 "$VIEWER"
 install_collectors_local() {
   chown "$TARGET_USER:$TARGET_USER" "$COLLECTOR_SRC" "$APPS_COLLECTOR_SRC" 2>/dev/null || true
   chmod 0755 "$COLLECTOR_SRC" "$APPS_COLLECTOR_SRC" 2>/dev/null || true
+  configure_collectors_selinux
   cleanup_legacy_global_artifacts
 }
 
@@ -1127,6 +1177,7 @@ uninstall_status() {
   fi
 
   rm -f "$UNIT_SERVICE" "$UNIT_TIMER" "$UNIT_APPS_SERVICE" "$UNIT_APPS_TIMER" 2>/dev/null || true
+  remove_collectors_selinux_fcontext
   rm -f "$SYSTEMD_COLLECT" "$SYSTEMD_APPS_COLLECT" "$STATUS_LAUNCHER" 2>/dev/null || true
   cleanup_legacy_global_artifacts
   rm -rf "$STATUS_DIR" 2>/dev/null || true
