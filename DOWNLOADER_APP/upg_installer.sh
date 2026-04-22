@@ -14,10 +14,13 @@ set -euo pipefail 2>/dev/null || set -eu
 #
 # Opis:
 # - Pobiera manifest versions.json z Nextcloud
-# - Pyta czy pobrać AMMS czy PI
+# - Pyta czy pobrać AMMS, PI, BK czy AMCS
 # - Pokazuje listę dostępnych wersji
-# - Pobiera wybrany plik do ~/UPG
-# - Przed pobraniem usuwa wszystkie pliki *.jar z ~/UPG
+# - Pobiera wybrany plik lub pliki do ~/UPG
+# - Przed pobraniem usuwa stare pliki zgodnie z wybranym typem:
+#   * AMMS/PI: *.jar
+#   * BK: *.war
+#   * AMCS: tylko istniejący plik docelowy AMCS
 # - Utrzymuje lokalny launcher:
 #     ~/UTILITY/DOWNLOADER_APP/bin/dwupg
 # - Zapisuje wersję instalera do:
@@ -34,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - wget
 # ==========================================================
 
-VERSION="1.0.2"
+VERSION="1.0.3"
 MANIFEST_URL="https://helpdesk.itgo.com.pl/nextcloud/index.php/s/s2778Z6z4rEibLp/download"
 
 TARGET_DIR="${HOME}/UPG"
@@ -114,9 +117,29 @@ uninstall_downloader_app() {
   echo "OK: usunięto legacy ${LEGACY_DWUPG} oraz backupy (jeśli istniały)"
 }
 
-cleanup_old_jars() {
+cleanup_old_artifacts() {
+  local app_type="$1"
+  shift
+
   mkdir -p "$TARGET_DIR"
-  find "$TARGET_DIR" -maxdepth 1 -type f -name "*.jar" -print -delete 2>/dev/null || true
+
+  case "$app_type" in
+    amms|pi)
+      find "$TARGET_DIR" -maxdepth 1 -type f -name "*.jar" -print -delete 2>/dev/null || true
+      ;;
+    bk)
+      find "$TARGET_DIR" -maxdepth 1 -type f -name "*.war" -print -delete 2>/dev/null || true
+      ;;
+    amcs)
+      local target_file
+      for target_file in "$@"; do
+        if [ -f "$target_file" ]; then
+          printf '%s\n' "$target_file"
+          rm -f "$target_file"
+        fi
+      done
+      ;;
+  esac
 }
 
 fetch_manifest() {
@@ -124,22 +147,65 @@ fetch_manifest() {
 }
 
 print_versions() {
-  fetch_manifest | jq -r '.versions[].version' | nl -w1 -s') '
+  local manifest="$1"
+  local channel="$2"
+  printf '%s\n' "$manifest" | jq -r --arg channel "$channel" '.channels[$channel][].version' | nl -w1 -s') '
 }
 
 get_versions_count() {
-  fetch_manifest | jq -r '.versions | length'
+  local manifest="$1"
+  local channel="$2"
+  printf '%s\n' "$manifest" | jq -r --arg channel "$channel" '.channels[$channel] | length'
 }
 
-resolve_url() {
+resolve_download_urls() {
+  local manifest="$1"
+  local app_type="$2"
+  local choice="$3"
+  local channel key
+
+  case "$app_type" in
+    amms) channel="core"; key="amms" ;;
+    pi) channel="core"; key="pi" ;;
+    amcs) channel="amcs"; key="amcs_updater" ;;
+    bk)
+      printf '%s\n' "$manifest" | jq -r --argjson n "$choice" '
+        .channels.bk[$n-1]
+        | [.bk_raporty_war, .bk_infomedica_server_war]
+        | .[]
+        | select(. != null and . != "")
+      '
+      return
+      ;;
+    *)
+      echo "ERROR: Nieznany typ aplikacji: ${app_type}" >&2
+      exit 1
+      ;;
+  esac
+
+  printf '%s\n' "$manifest" | jq -r --arg channel "$channel" --arg key "$key" --argjson n "$choice" '
+    .channels[$channel][$n-1][$key] // empty
+  '
+}
+
+resolve_channel() {
   local app_type="$1"
-  local choice="$2"
-  fetch_manifest | jq -r --arg app "$app_type" --argjson n "$choice" '.versions[$n-1][$app]'
+  case "$app_type" in
+    amms|pi) printf '%s\n' "core" ;;
+    bk) printf '%s\n' "bk" ;;
+    amcs) printf '%s\n' "amcs" ;;
+    *)
+      echo "ERROR: Nieznany typ aplikacji: ${app_type}" >&2
+      exit 1
+      ;;
+  esac
 }
 
 resolve_version() {
-  local choice="$1"
-  fetch_manifest | jq -r --argjson n "$choice" '.versions[$n-1].version'
+  local manifest="$1"
+  local channel="$2"
+  local choice="$3"
+  printf '%s\n' "$manifest" | jq -r --arg channel "$channel" --argjson n "$choice" '.channels[$channel][$n-1].version'
 }
 
 resolve_filename_from_header() {
@@ -176,8 +242,12 @@ format_size_gb() {
 }
 
 main() {
-  local app_choice app_type choice versions_count url selected_version filename target_file
-  local start_ts end_ts elapsed_human size_human
+  local app_choice app_type channel choice versions_count selected_version manifest
+  local start_ts end_ts elapsed_human url filename target_file size_human
+  local urls=()
+  local filenames=()
+  local target_files=()
+  local sizes_human=()
 
   if [ "${1:-}" = "--uninstall" ]; then
     uninstall_downloader_app
@@ -204,22 +274,34 @@ main() {
   echo "Co chcesz pobrać?"
   echo "1) AMMS"
   echo "2) PI"
-  read -r -p "Wybierz [1-2]: " app_choice
+  echo "3) BK"
+  echo "4) AMCS"
+  read -r -p "Wybierz [1-4]: " app_choice
 
   case "$app_choice" in
     1) app_type="amms" ;;
     2) app_type="pi" ;;
+    3) app_type="bk" ;;
+    4) app_type="amcs" ;;
     *)
       echo "ERROR: Błędny wybór."
       exit 1
       ;;
   esac
 
+  manifest="$(fetch_manifest)"
+  channel="$(resolve_channel "$app_type")"
+
   echo
   echo "Dostępne wersje:"
-  print_versions
+  print_versions "$manifest" "$channel"
 
-  versions_count="$(get_versions_count)"
+  versions_count="$(get_versions_count "$manifest" "$channel")"
+  if [ "$versions_count" -lt 1 ]; then
+    echo "ERROR: Brak wersji w kanale manifestu: ${channel}"
+    exit 1
+  fi
+
   echo
   read -r -p "Wybierz numer wersji [1-${versions_count}]: " choice
 
@@ -235,52 +317,72 @@ main() {
     exit 1
   fi
 
-  url="$(resolve_url "$app_type" "$choice")"
-  selected_version="$(resolve_version "$choice")"
+  while IFS= read -r url; do
+    [ -n "$url" ] && urls+=("$url")
+  done < <(resolve_download_urls "$manifest" "$app_type" "$choice")
 
-  if [ -z "$url" ] || [ "$url" = "null" ]; then
+  selected_version="$(resolve_version "$manifest" "$channel" "$choice")"
+
+  if [ "${#urls[@]}" -lt 1 ]; then
     echo "ERROR: Nie udało się wyznaczyć URL dla wybranego wariantu."
+    if [ "$app_type" = "bk" ]; then
+      echo "ERROR: Wybrana wersja BK nie zawiera żadnego pliku do pobrania."
+    fi
     exit 1
   fi
 
-  filename="$(resolve_filename_from_header "$url")"
-  target_file="${TARGET_DIR}/${filename}"
+  for url in "${urls[@]}"; do
+    filename="$(resolve_filename_from_header "$url")"
+    target_file="${TARGET_DIR}/${filename}"
+    filenames+=("$filename")
+    target_files+=("$target_file")
+  done
 
   echo
   echo "Przygotowanie katalogu docelowego: ${TARGET_DIR}"
-  echo "Usuwanie starych plików JAR z ${TARGET_DIR}:"
-  cleanup_old_jars
+  echo "Usuwanie starych plików dla typu ${app_type^^} z ${TARGET_DIR}:"
+  cleanup_old_artifacts "$app_type" "${target_files[@]}"
 
   echo
   echo "Pobieranie:"
   echo "  Typ     : ${app_type^^}"
   echo "  Wersja  : ${selected_version}"
-  echo "  Plik    : ${filename}"
-  echo "  Cel     : ${target_file}"
+  for i in "${!filenames[@]}"; do
+    echo "  Plik    : ${filenames[$i]}"
+    echo "  Cel     : ${target_files[$i]}"
+  done
   echo
 
   start_ts="$(date +%s)"
-  wget -O "$target_file" "$url"
+  for i in "${!urls[@]}"; do
+    wget -O "${target_files[$i]}" "${urls[$i]}"
+  done
   end_ts="$(date +%s)"
 
-  if [ ! -f "$target_file" ]; then
-    echo "ERROR: Plik nie został pobrany."
-    exit 1
-  fi
-
   elapsed_human="$(format_duration "$(( end_ts - start_ts ))")"
-  size_human="$(format_size_gb "$target_file")"
+  for target_file in "${target_files[@]}"; do
+    if [ ! -f "$target_file" ]; then
+      echo "ERROR: Plik nie został pobrany: ${target_file}"
+      exit 1
+    fi
+
+    size_human="$(format_size_gb "$target_file")"
+    sizes_human+=("$size_human")
+  done
 
   echo
   echo "========================================"
   echo "PODSUMOWANIE"
   echo "========================================"
-  echo "Pobrano     : ${filename}"
+  echo "Pobrano:"
+  for i in "${!filenames[@]}"; do
+    echo "  - ${filenames[$i]}"
+    echo "    Zapisano do : ${target_files[$i]}"
+    echo "    Rozmiar     : ${sizes_human[$i]}"
+  done
   echo "Typ         : ${app_type^^}"
   echo "Wersja      : ${selected_version}"
-  echo "Zapisano do : ${target_file}"
   echo "Czas        : ${elapsed_human}"
-  echo "Rozmiar     : ${size_human}"
   echo "Installer   : ${VERSION}"
   echo "Ver file    : ${VERSION_FILE}"
   echo "Launcher    : ${LOCAL_LAUNCHER}"
