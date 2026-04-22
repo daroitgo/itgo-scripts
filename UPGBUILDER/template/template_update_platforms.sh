@@ -6,7 +6,7 @@
 # ==========================================================
 # UPGBUILDER_VERSION={{UPGBUILDER_VERSION}}
 # TEMPLATE_NAME=template_update_platforms.sh
-# TEMPLATE_VERSION=1.1.0
+# TEMPLATE_VERSION=1.2.0
 # RULE_NAME=platforms
 # GENERATED_AT={{GENERATED_AT}}
 # GENERATED_HOST={{HOSTNAME}}
@@ -142,6 +142,105 @@ step_cleanup_old_backups() {
   fi
 }
 
+list_dir_entries_sorted() {
+  local dir="$1"
+  find "$dir" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort
+}
+
+copy_dir_if_matches_expected_files() {
+  local src="$1"
+  local dst="$2"
+  local label="$3"
+  shift 3
+  local expected=( "$@" )
+
+  if [[ ! -d "$src" ]]; then
+    echo "    [INFO] Brak ${label}: $src"
+    return 0
+  fi
+
+  local actual_sorted expected_sorted
+  actual_sorted="$(list_dir_entries_sorted "$src")"
+  expected_sorted="$(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)"
+
+  if [[ "$actual_sorted" != "$expected_sorted" ]]; then
+    echo "    [INFO] Pomijam ${label}: zawartość inna niż oczekiwana"
+    echo "           SRC: $src"
+    echo "           Oczekiwane:"
+    printf '             - %s\n' "${expected[@]}"
+    echo "           Rzeczywiste:"
+    if [[ -n "$actual_sorted" ]]; then
+      while IFS= read -r line; do
+        echo "             - $line"
+      done <<< "$actual_sorted"
+    else
+      echo "             - <brak plików>"
+    fi
+    return 0
+  fi
+
+  echo "    ${label}: $src -> $dst"
+  rm -rf "$dst"
+  mkdir -p "$(dirname "$dst")"
+  cp -a "$src" "$dst"
+}
+
+step_copy_special_app_data_to_new() {
+  echo "[2c] Kopiowanie danych aplikacyjnych z bieżących platform do *_NEW..."
+
+  local i current_platform target_new
+  local src_nmvs_users dst_nmvs_users
+  local src_zsmopl_users dst_zsmopl_users
+  local src_zsmopl_certs dst_zsmopl_certs
+
+  for i in "${!PLATFORMS[@]}"; do
+    current_platform="${PLATFORMS[$i]}"
+    target_new="${PLATFORMS_NEW[$i]}"
+
+    if [[ ! -d "$current_platform" ]]; then
+      echo "    [WARN] Brak źródłowej platformy: $current_platform"
+      continue
+    fi
+
+    if [[ ! -d "$target_new" ]]; then
+      echo "    [WARN] Brak katalogu *_NEW: $target_new"
+      continue
+    fi
+
+    src_nmvs_users="${current_platform}/apache-tomcat/webapps/nmvs/WEB-INF/users"
+    dst_nmvs_users="${target_new}/apache-tomcat/webapps/nmvs/WEB-INF/users"
+
+    src_zsmopl_users="${current_platform}/apache-tomcat/webapps/zsmopl/WEB-INF/properties/users"
+    dst_zsmopl_users="${target_new}/apache-tomcat/webapps/zsmopl/WEB-INF/properties/users"
+
+    src_zsmopl_certs="${current_platform}/apache-tomcat/webapps/zsmopl/WEB-INF/properties/certs"
+    dst_zsmopl_certs="${target_new}/apache-tomcat/webapps/zsmopl/WEB-INF/properties/certs"
+
+    echo "    Platforma: $current_platform"
+
+    copy_dir_if_matches_expected_files \
+      "$src_nmvs_users" \
+      "$dst_nmvs_users" \
+      "nmvs/WEB-INF/users" \
+      "USER1.properties" \
+      "USER2.properties"
+
+    copy_dir_if_matches_expected_files \
+      "$src_zsmopl_users" \
+      "$dst_zsmopl_users" \
+      "zsmopl/WEB-INF/properties/users" \
+      "user1.properties" \
+      "user2.properties"
+
+    copy_dir_if_matches_expected_files \
+      "$src_zsmopl_certs" \
+      "$dst_zsmopl_certs" \
+      "zsmopl/WEB-INF/properties/certs" \
+      "user1Sign.properties" \
+      "user2Sign.properties"
+  done
+}
+
 step_move_platforms_to_backup() {
   echo "[3] Przenoszenie katalogów do backupu..."
   if [[ -z "${NEW_BACKUP:-}" ]]; then
@@ -221,6 +320,7 @@ run_step "Wykrywanie platform IntegrationPlatform"              step_discover_pl
 run_step "Czyszczenie logów Tomcata"                            step_clear_logs
 run_step "Przygotowanie katalogu backupu (dzisiejszy)"          step_prepare_backup
 run_step "Czyszczenie starych backupów (zostają 2)"             step_cleanup_old_backups
+run_step "Kopiowanie users/certs z NMVS i ZSMOPL do *_NEW"      step_copy_special_app_data_to_new
 {{SPECIAL_PLATFORM_RUNS}}
 run_step "Przenoszenie IntegrationPlatform_* do backupu"        step_move_platforms_to_backup
 run_step "Kopiowanie manager/tomcat-users.xml do *_NEW"         step_copy_resources_to_new
