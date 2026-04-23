@@ -22,7 +22,7 @@ platforms_zm.log_path=/var/log/asseco
 # ==========================================================
 platforms.output=update_platforms.sh
 platforms.template=template/template_update_platforms.sh
-platforms.version=1.1.0
+platforms.version=1.2.0
 platforms.detect_mode=prefix
 platforms.detect_value=IntegrationPlatform
 platforms.log_path={{APP_DIR}}/apache-tomcat/logs
