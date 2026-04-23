@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.29"
+MASTER_VERSION="1.2.31"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.13"
@@ -184,6 +184,227 @@ install_packages() {
   fi
 }
 
+ensure_package_installed() {
+  local pkg="${1:?}"
+
+  if pkg_installed "$pkg"; then
+    echo "[$(ts)] OK: package already installed: $pkg"
+    return 0
+  fi
+
+  echo "[$(ts)] INFO: missing package: $pkg"
+  install_packages "$pkg"
+}
+
+remove_packages() {
+  local pkgs=("$@")
+  [[ "${#pkgs[@]}" -gt 0 ]] || return 0
+
+  if command -v dnf >/dev/null 2>&1; then
+    echo "[$(ts)] ACTION: dnf -y remove ${pkgs[*]}"
+    dnf -y remove "${pkgs[@]}"
+  elif command -v yum >/dev/null 2>&1; then
+    echo "[$(ts)] ACTION: yum -y remove ${pkgs[*]}"
+    yum -y remove "${pkgs[@]}"
+  else
+    echo "[$(ts)] ERROR: brak dnf/yum."
+    return 1
+  fi
+}
+
+get_command_invocation_path() {
+  local cmd="${1:?}"
+  command -v "$cmd" 2>/dev/null || true
+}
+
+get_active_command_path() {
+  local cmd="${1:?}"
+  local cmd_path=""
+
+  cmd_path="$(get_command_invocation_path "$cmd")"
+  [[ -n "$cmd_path" ]] || return 1
+
+  readlink -f "$cmd_path" 2>/dev/null || printf "%s\n" "$cmd_path"
+}
+
+get_rpm_owner_name_for_path() {
+  local path="${1:?}"
+
+  [[ -e "$path" ]] || return 1
+  rpm -qf --qf '%{NAME}\n' "$path" 2>/dev/null
+}
+
+command_reports_java8() {
+  local cmd="${1:?}"
+  local out=""
+
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  out="$("$cmd" -version 2>&1 || true)"
+  [[ "$out" == *' 1.8.'* || "$out" == *'"1.8.'* || "$out" == *'version "8.'* || "$out" == *'openjdk version "1.8.'* ]]
+}
+
+is_amcs_java_runtime_owner_compatible() {
+  local owner="${1:-}"
+  case "$owner" in
+    java-1.8.0-openjdk|java-1.8.0-openjdk-headless|java-1.8.0-openjdk-devel) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_amcs_javac_owner_compatible() {
+  local owner="${1:-}"
+  case "$owner" in
+    java-1.8.0-openjdk-devel) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+remove_unmanaged_local_java_wrappers() {
+  local cmd raw_path resolved_path owner
+
+  for cmd in java javac; do
+    raw_path="$(get_command_invocation_path "$cmd")"
+    [[ -n "$raw_path" ]] || continue
+
+    if [[ "$raw_path" != "/usr/local/bin/$cmd" ]]; then
+      continue
+    fi
+
+    resolved_path="$(readlink -f "$raw_path" 2>/dev/null || printf "%s\n" "$raw_path")"
+    owner="$(get_rpm_owner_name_for_path "$raw_path" 2>/dev/null || true)"
+    if [[ -z "$owner" && "$resolved_path" != /usr/bin/* ]]; then
+      echo "[$(ts)] ACTION: removing unmanaged local $cmd wrapper: $raw_path"
+      rm -f "$raw_path"
+    fi
+  done
+}
+
+collect_amcs_java_state() {
+  local java_raw_path="" javac_raw_path="" java_path="" javac_path="" java_owner="" javac_owner=""
+  local java_ok="0" javac_ok="0"
+
+  java_raw_path="$(get_command_invocation_path java)"
+  javac_raw_path="$(get_command_invocation_path javac)"
+  java_path="$(get_active_command_path java 2>/dev/null || true)"
+  javac_path="$(get_active_command_path javac 2>/dev/null || true)"
+
+  if [[ -n "$java_path" ]]; then
+    java_owner="$(get_rpm_owner_name_for_path "$java_path" 2>/dev/null || true)"
+  fi
+  if [[ -n "$javac_path" ]]; then
+    javac_owner="$(get_rpm_owner_name_for_path "$javac_path" 2>/dev/null || true)"
+  fi
+
+  if command_reports_java8 java && is_amcs_java_runtime_owner_compatible "$java_owner"; then
+    java_ok="1"
+  fi
+  if command_reports_java8 javac && is_amcs_javac_owner_compatible "$javac_owner"; then
+    javac_ok="1"
+  fi
+
+  printf "java_raw_path=%s\n" "${java_raw_path:-}"
+  printf "java_path=%s\n" "${java_path:-}"
+  printf "java_owner=%s\n" "${java_owner:-}"
+  printf "java_ok=%s\n" "$java_ok"
+  printf "javac_raw_path=%s\n" "${javac_raw_path:-}"
+  printf "javac_path=%s\n" "${javac_path:-}"
+  printf "javac_owner=%s\n" "${javac_owner:-}"
+  printf "javac_ok=%s\n" "$javac_ok"
+}
+
+ensure_amcs_java_runtime() {
+  local target_pkg="java-1.8.0-openjdk-devel"
+  local state="" line=""
+  local java_raw_path="" javac_raw_path="" java_path="" javac_path="" java_owner="" javac_owner=""
+  local java_ok="0" javac_ok="0"
+  local remove_list=()
+
+  remove_unmanaged_local_java_wrappers
+
+  state="$(collect_amcs_java_state)"
+  while IFS= read -r line; do
+    case "$line" in
+      java_raw_path=*) java_raw_path="${line#java_raw_path=}" ;;
+      java_path=*)  java_path="${line#java_path=}" ;;
+      java_owner=*) java_owner="${line#java_owner=}" ;;
+      java_ok=*)    java_ok="${line#java_ok=}" ;;
+      javac_raw_path=*) javac_raw_path="${line#javac_raw_path=}" ;;
+      javac_path=*) javac_path="${line#javac_path=}" ;;
+      javac_owner=*) javac_owner="${line#javac_owner=}" ;;
+      javac_ok=*)   javac_ok="${line#javac_ok=}" ;;
+    esac
+  done <<< "$state"
+
+  echo "[$(ts)] INFO: active java command path: ${java_raw_path:-MISSING}"
+  echo "[$(ts)] INFO: active java path: ${java_path:-MISSING}"
+  echo "[$(ts)] INFO: active java rpm owner: ${java_owner:-UNKNOWN}"
+  echo "[$(ts)] INFO: active javac command path: ${javac_raw_path:-MISSING}"
+  echo "[$(ts)] INFO: active javac path: ${javac_path:-MISSING}"
+  echo "[$(ts)] INFO: active javac rpm owner: ${javac_owner:-UNKNOWN}"
+
+  if pkg_installed "$target_pkg" && [[ "$java_ok" == "1" && "$javac_ok" == "1" ]]; then
+    echo "[$(ts)] OK: active java and javac already match Java 8 from $target_pkg"
+    add_summary "AMCS Java runtime: OK ($target_pkg already active)"
+    return 0
+  fi
+
+  if [[ -n "$java_owner" ]] && ! is_amcs_java_runtime_owner_compatible "$java_owner"; then
+    remove_list+=("$java_owner")
+  fi
+  if [[ -n "$javac_owner" ]] && ! is_amcs_javac_owner_compatible "$javac_owner" && [[ "$javac_owner" != "$java_owner" ]]; then
+    remove_list+=("$javac_owner")
+  fi
+
+  if [[ "${#remove_list[@]}" -gt 0 ]]; then
+    echo "[$(ts)] INFO: removing incompatible active Java RPM package(s): ${remove_list[*]}"
+    remove_packages "${remove_list[@]}"
+  fi
+
+  ensure_package_installed "$target_pkg"
+  remove_unmanaged_local_java_wrappers
+
+  state="$(collect_amcs_java_state)"
+  java_raw_path=""
+  java_path=""
+  javac_raw_path=""
+  javac_path=""
+  java_owner=""
+  javac_owner=""
+  java_ok="0"
+  javac_ok="0"
+  while IFS= read -r line; do
+    case "$line" in
+      java_raw_path=*) java_raw_path="${line#java_raw_path=}" ;;
+      java_path=*)  java_path="${line#java_path=}" ;;
+      java_owner=*) java_owner="${line#java_owner=}" ;;
+      java_ok=*)    java_ok="${line#java_ok=}" ;;
+      javac_raw_path=*) javac_raw_path="${line#javac_raw_path=}" ;;
+      javac_path=*) javac_path="${line#javac_path=}" ;;
+      javac_owner=*) javac_owner="${line#javac_owner=}" ;;
+      javac_ok=*)   javac_ok="${line#javac_ok=}" ;;
+    esac
+  done <<< "$state"
+
+  echo "[$(ts)] INFO: post-install active java command path: ${java_raw_path:-MISSING}"
+  echo "[$(ts)] INFO: post-install active java path: ${java_path:-MISSING}"
+  echo "[$(ts)] INFO: post-install active java rpm owner: ${java_owner:-UNKNOWN}"
+  echo "[$(ts)] INFO: post-install active javac command path: ${javac_raw_path:-MISSING}"
+  echo "[$(ts)] INFO: post-install active javac path: ${javac_path:-MISSING}"
+  echo "[$(ts)] INFO: post-install active javac rpm owner: ${javac_owner:-UNKNOWN}"
+
+  if ! pkg_installed "$target_pkg" || [[ "$java_ok" != "1" || "$javac_ok" != "1" ]]; then
+    echo "[$(ts)] ERROR: AMCS requires installed $target_pkg plus active Java 8 java/javac from compatible OpenJDK 8 RPM packages."
+    echo "[$(ts)] ERROR: active java command=${java_raw_path:-MISSING} resolved=${java_path:-MISSING} owner=${java_owner:-UNKNOWN}"
+    echo "[$(ts)] ERROR: active javac command=${javac_raw_path:-MISSING} resolved=${javac_path:-MISSING} owner=${javac_owner:-UNKNOWN}"
+    exit 1
+  fi
+
+  add_summary "AMCS Java runtime: OK ($target_pkg active for java and javac)"
+}
+
 install_master_launcher() {
   local launcher_dir install_launcher update_launcher bp
   local legacy_install_launcher="/usr/local/bin/master-install"
@@ -327,13 +548,13 @@ EOF_MASTER_UPDATE_LAUNCHER
   safe_backup "$bp"
   remove_block_from_file "$bp" "$legacy_path_start" "$legacy_path_end"
   remove_block_from_file "$bp" "$path_start" "$path_end"
-  printf "\n%s\nexport PATH=\"\$HOME/UTILITY/MASTER:\$HOME/UTILITY/STATUS/bin:\$HOME/UTILITY/TSEQ/bin:\$HOME/UTILITY/DOWNLOADER_APP/bin:\$HOME/UTILITY/UPGbuilder/bin:\$PATH\"\n%s\n" "$path_start" "$path_end" >> "$bp"
+  printf "\n%s\nexport PATH=\"\$HOME/UTILITY/MASTER:\$HOME/UTILITY/STATUS/bin:\$HOME/UTILITY/TSEQ/bin:\$HOME/UTILITY/DOWNLOADER_APP/bin:\$HOME/UTILITY/UPGbuilder/bin:\$HOME/UTILITY/AMCS:\$PATH\"\n%s\n" "$path_start" "$path_end" >> "$bp"
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
   chmod 0644 "$bp" 2>/dev/null || true
 
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-install"
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-update"
-  add_summary "User-local PATH updated for MASTER, STATUS, TSEQ, DOWNLOADER_APP, UPGbuilder"
+  add_summary "User-local PATH updated for MASTER, STATUS, TSEQ, DOWNLOADER_APP, UPGbuilder, AMCS"
 }
 
 ITGO_HOME=""
@@ -662,6 +883,8 @@ ensure_home_dirs() {
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$ITGO_HOME/UPG"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$ITGO_HOME/BACKUP"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR/AMCS"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR/AMCS/resources"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$LOG_DIR"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$LOG_OTHER"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$LOG_UPDATE"
@@ -1036,6 +1259,166 @@ run_module_as_itgo() {
   shift || true
   echo "[$(ts)] RUN(itgo): sudo -H -u $TARGET_USER bash $script $*"
   sudo -H -u "$TARGET_USER" bash "$script" "$@"
+}
+
+install_amcs_local_launchers() {
+  local app_dir="$UTILITY_DIR/AMCS"
+  local resources_dir="$app_dir/resources"
+  local launcher="$app_dir/AMCS"
+  local copy_prod_launcher="$app_dir/amcs-copy-prod"
+
+  echo "[$(ts)] ACTION: install AMCS launchers into $app_dir"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$app_dir"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$resources_dir"
+
+  cat > "$launcher" <<'EOF_AMCS_LAUNCHER'
+#!/usr/bin/env bash
+set -euo pipefail 2>/dev/null || set -eu
+
+APP_DIR="${HOME}/UTILITY/AMCS"
+
+cd "$APP_DIR"
+exec java \
+  -Dspring.profiles.active=main \
+  -Dapplication.installer.resources.dir="$HOME/UTILITY/AMCS/resources" \
+  -Dapplication.installer.master.cluster-port=5701 \
+  -Dserver.port=8090 \
+  -jar amcs-installer.jar \
+  "$@"
+EOF_AMCS_LAUNCHER
+
+  cat > "$copy_prod_launcher" <<'EOF_AMCS_COPY_PROD'
+#!/usr/bin/env bash
+set -euo pipefail 2>/dev/null || set -eu
+
+TARGET_DIR="$HOME/UPG/EDM"
+
+ts() { date "+%F %T"; }
+
+shopt -s nullglob
+sources=(/srv/edm*)
+
+if [[ "${#sources[@]}" -eq 0 ]]; then
+  echo "[$(ts)] ERROR: no /srv/edm* sources found." >&2
+  exit 1
+fi
+
+echo "[$(ts)] INFO: starting AMCS prod copy to $TARGET_DIR"
+mkdir -p "$TARGET_DIR"
+
+echo "[$(ts)] INFO: cleaning contents of $TARGET_DIR"
+find "$TARGET_DIR" -mindepth 1 -exec rm -rf -- {} +
+
+for src in "${sources[@]}"; do
+  echo "[$(ts)] INFO: copying $src -> $TARGET_DIR/"
+  cp -a "$src" "$TARGET_DIR"/
+done
+
+echo "[$(ts)] OK: AMCS prod copy completed successfully."
+EOF_AMCS_COPY_PROD
+
+  chown "$TARGET_USER:$TARGET_USER" "$launcher" "$copy_prod_launcher" 2>/dev/null || true
+  chmod 0700 "$launcher" "$copy_prod_launcher" 2>/dev/null || true
+
+  add_summary "AMCS launcher installed: ~/UTILITY/AMCS/AMCS"
+  add_summary "AMCS launcher installed: ~/UTILITY/AMCS/amcs-copy-prod"
+}
+
+configure_amcs_firewall_public() {
+  local firewall_cmd=""
+  local port changed=0
+  local ports=("8090/tcp" "5701/tcp")
+  local query_rc=0
+  local add_rc=0
+  local reload_rc=0
+
+  if ! command -v firewall-cmd >/dev/null 2>&1; then
+    echo "[$(ts)] SKIP: firewall-cmd not found."
+    add_summary "AMCS firewall public: SKIP (firewall-cmd missing)"
+    return 0
+  fi
+
+  firewall_cmd="$(command -v firewall-cmd)"
+
+  if ! systemctl is-active --quiet firewalld 2>/dev/null; then
+    echo "[$(ts)] SKIP: firewalld inactive or unavailable."
+    add_summary "AMCS firewall public: SKIP (firewalld inactive/unavailable)"
+    return 0
+  fi
+
+  for port in "${ports[@]}"; do
+    if "$firewall_cmd" --permanent --zone=public --query-port="$port" >/dev/null 2>&1; then
+      query_rc=0
+    else
+      query_rc=$?
+    fi
+
+    if [[ "$query_rc" -eq 0 ]]; then
+      echo "[$(ts)] OK: firewalld public already allows $port"
+    elif [[ "$query_rc" -eq 1 ]]; then
+      echo "[$(ts)] ACTION: firewall-cmd --permanent --zone=public --add-port=$port"
+      if "$firewall_cmd" --permanent --zone=public --add-port="$port" >/dev/null 2>&1; then
+        add_rc=0
+      else
+        add_rc=$?
+      fi
+      if [[ "$add_rc" -ne 0 ]]; then
+        echo "[$(ts)] SKIP: firewalld add-port failed for $port."
+        add_summary "AMCS firewall public: SKIP (firewalld inactive/unavailable)"
+        return 0
+      fi
+      changed=1
+    else
+      echo "[$(ts)] SKIP: firewalld query failed for $port."
+      add_summary "AMCS firewall public: SKIP (firewalld inactive/unavailable)"
+      return 0
+    fi
+  done
+
+  if [[ "$changed" -eq 1 ]]; then
+    echo "[$(ts)] ACTION: firewall-cmd --reload"
+    if "$firewall_cmd" --reload >/dev/null 2>&1; then
+      reload_rc=0
+    else
+      reload_rc=$?
+    fi
+    if [[ "$reload_rc" -ne 0 ]]; then
+      echo "[$(ts)] SKIP: firewalld reload failed."
+      add_summary "AMCS firewall public: SKIP (firewalld inactive/unavailable)"
+      return 0
+    fi
+    add_summary "AMCS firewall public: ports added successfully (8090/tcp + 5701/tcp)"
+  else
+    add_summary "AMCS firewall public: ports already set (8090/tcp + 5701/tcp)"
+  fi
+}
+
+install_amcs_step() {
+  if [[ "$UPDATE_ONLY_MODE" == "1" ]]; then
+    add_summary "AMCS: skip (update-only mode)"
+    return 0
+  fi
+
+  if ! have_user; then
+    echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+    exit 1
+  fi
+
+  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+  [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+  UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+  TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+
+  if prompt_yn "MODUŁ: AMCS (~/UTILITY/AMCS + resources + launcher + amcs-copy-prod + firewall public 8090/5701)?" "Y"; then
+    ensure_amcs_java_runtime
+    install_amcs_local_launchers
+    configure_amcs_firewall_public
+    echo "[$(ts)] OK: AMCS done."
+  else
+    echo "[$(ts)] SKIP: AMCS."
+    add_summary "AMCS: skipped by user"
+  fi
 }
 
 install_downloader_app_script() {
@@ -1763,6 +2146,7 @@ main() {
     install_cleanup_step "$cleanup_sh"
     install_downloader_app_step "$downloader_app_sh"
     install_upgbuilder_step "$upgbuilder_sh"
+    install_amcs_step
 
     cleanup_tmp_installers_no_prompt
     echo "[$(ts)] DONE."
@@ -1873,7 +2257,7 @@ main() {
   install_status_step "$status_sh"
   install_tseq_step "$tseq_sh"
 
-  section "SEKCJA 5/6 - HOOKI I NARZĘDZIA UŻYTKOWE"
+  section "SEKCJA 5/7 - HOOKI I NARZĘDZIA UŻYTKOWE"
   if [[ "$HISTORY_CLEAR_ON_LOGOUT_ENABLED" == "1" ]]; then
     echo "[$(ts)] SKIP: SSH history prompt pominięty, bo włączono czyszczenie historii przy wylogowaniu."
     add_summary "Shell: SSH history prompt skipped because history clear on logout is enabled"
@@ -1897,7 +2281,10 @@ main() {
   install_downloader_app_step "$downloader_app_sh"
   install_upgbuilder_step "$upgbuilder_sh"
 
-  section "SEKCJA 6/6 - PORZĄDKI KOŃCOWE"
+  section "SEKCJA 6/7 - AMCS"
+  install_amcs_step
+
+  section "SEKCJA 7/7 - PORZĄDKI KOŃCOWE"
   cleanup_downloaded_installers
 
   echo "[$(ts)] DONE."
@@ -1906,3 +2293,4 @@ main() {
 }
 
 main "$@"
+
