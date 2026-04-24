@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.32"
+MASTER_VERSION="1.2.33"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.13"
@@ -1312,8 +1312,8 @@ echo "[$(ts)] INFO: cleaning contents of $TARGET_DIR"
 find "$TARGET_DIR" -mindepth 1 -exec rm -rf -- {} +
 
 for src in "${sources[@]}"; do
-  echo "[$(ts)] INFO: copying $src -> $TARGET_DIR/"
-  cp -a "$src" "$TARGET_DIR"/
+  echo "[$(ts)] INFO: copying contents of $src -> $TARGET_DIR/"
+  cp -a "$src"/. "$TARGET_DIR"/
 done
 
 echo "[$(ts)] OK: AMCS prod copy completed successfully."
