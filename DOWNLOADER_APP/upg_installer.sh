@@ -37,10 +37,11 @@ set -euo pipefail 2>/dev/null || set -eu
 # - wget
 # ==========================================================
 
-VERSION="1.0.3"
+VERSION="1.0.4"
 MANIFEST_URL="https://helpdesk.itgo.com.pl/nextcloud/index.php/s/s2778Z6z4rEibLp/download"
 
 TARGET_DIR="${HOME}/UPG"
+AMCS_TARGET_DIR="${HOME}/UTILITY/AMCS"
 
 UTILITY_DIR="${HOME}/UTILITY"
 DOWNLOADER_DIR="${UTILITY_DIR}/DOWNLOADER_APP"
@@ -121,7 +122,10 @@ cleanup_old_artifacts() {
   local app_type="$1"
   shift
 
-  mkdir -p "$TARGET_DIR"
+  local target_file
+  for target_file in "$@"; do
+    [ -n "$target_file" ] && mkdir -p "$(dirname "$target_file")"
+  done
 
   case "$app_type" in
     amms|pi)
@@ -131,7 +135,6 @@ cleanup_old_artifacts() {
       find "$TARGET_DIR" -maxdepth 1 -type f -name "*.war" -print -delete 2>/dev/null || true
       ;;
     amcs)
-      local target_file
       for target_file in "$@"; do
         if [ -f "$target_file" ]; then
           printf '%s\n' "$target_file"
@@ -201,6 +204,14 @@ resolve_channel() {
   esac
 }
 
+resolve_target_dir() {
+  local app_type="$1"
+  case "$app_type" in
+    amcs) printf '%s\n' "$AMCS_TARGET_DIR" ;;
+    *) printf '%s\n' "$TARGET_DIR" ;;
+  esac
+}
+
 resolve_version() {
   local manifest="$1"
   local channel="$2"
@@ -243,6 +254,7 @@ format_size_gb() {
 
 main() {
   local app_choice app_type channel choice versions_count selected_version manifest
+  local download_dir
   local start_ts end_ts elapsed_human url filename target_file size_human
   local urls=()
   local filenames=()
@@ -289,6 +301,7 @@ main() {
       ;;
   esac
 
+  download_dir="$(resolve_target_dir "$app_type")"
   manifest="$(fetch_manifest)"
   channel="$(resolve_channel "$app_type")"
 
@@ -333,14 +346,15 @@ main() {
 
   for url in "${urls[@]}"; do
     filename="$(resolve_filename_from_header "$url")"
-    target_file="${TARGET_DIR}/${filename}"
+    target_file="${download_dir}/${filename}"
     filenames+=("$filename")
     target_files+=("$target_file")
   done
 
   echo
-  echo "Przygotowanie katalogu docelowego: ${TARGET_DIR}"
-  echo "Usuwanie starych plików dla typu ${app_type^^} z ${TARGET_DIR}:"
+  echo "Przygotowanie katalogu docelowego: ${download_dir}"
+  mkdir -p "$download_dir"
+  echo "Usuwanie starych plików dla typu ${app_type^^} z ${download_dir}:"
   cleanup_old_artifacts "$app_type" "${target_files[@]}"
 
   echo
