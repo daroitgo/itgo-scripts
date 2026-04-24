@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ========= TSEQ (Tomcat Sequencer) Installer baseline 3.12.3 / planned docs 3.12.4 =========
-VERSION="3.12.6"
+VERSION="3.12.7"
 BASE_USER="itgo"
 MODE="${1:-install}"
 
@@ -977,7 +977,7 @@ for item in "\${INSTANCES[@]}"; do
   log "Starting: \$svc (base: \$base)"
   rotate_logs_dir "\$base"
 
-  systemctl start "\$svc" || { log "FAIL: systemctl start failed for \$svc"; exit 1; }
+  sudo -n systemctl start "\$svc" || { log "FAIL: sudo -n systemctl start failed for \$svc"; exit 1; }
 
   wait_for_file "\$logfile" "\$TIMEOUT" || { log "FAIL: \$svc did not create catalina.out"; exit 1; }
 
