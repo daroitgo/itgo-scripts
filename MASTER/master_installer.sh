@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.33"
+MASTER_VERSION="1.2.34"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.13"
@@ -1305,7 +1305,7 @@ if [[ "${#sources[@]}" -eq 0 ]]; then
   exit 1
 fi
 
-echo "[$(ts)] INFO: starting AMCS prod copy to $TARGET_DIR"
+echo "[$(ts)] INFO: starting UPG production copy to $TARGET_DIR"
 mkdir -p "$TARGET_DIR"
 
 echo "[$(ts)] INFO: cleaning contents of $TARGET_DIR"
@@ -1316,7 +1316,7 @@ for src in "${sources[@]}"; do
   cp -a "$src"/. "$TARGET_DIR"/
 done
 
-echo "[$(ts)] OK: AMCS prod copy completed successfully."
+echo "[$(ts)] OK: UPG production copy completed successfully."
 EOF_AMCS_COPY_PROD
 
   chown "$TARGET_USER:$TARGET_USER" "$launcher" "$copy_prod_launcher" 2>/dev/null || true
