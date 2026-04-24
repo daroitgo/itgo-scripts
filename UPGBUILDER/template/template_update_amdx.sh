@@ -6,7 +6,7 @@
 # ==========================================================
 # UPGBUILDER_VERSION={{UPGBUILDER_VERSION}}
 # TEMPLATE_NAME=template_update_amdx.sh
-# TEMPLATE_VERSION=1.1.0
+# TEMPLATE_VERSION=1.2.0
 # RULE_NAME=amdx
 # GENERATED_AT={{GENERATED_AT}}
 # GENERATED_HOST={{HOSTNAME}}
@@ -17,7 +17,7 @@ set -euo pipefail
 
 UPGBUILDER_VERSION="{{UPGBUILDER_VERSION}}"
 TEMPLATE_NAME="template_update_amdx.sh"
-TEMPLATE_VERSION="1.1.0"
+TEMPLATE_VERSION="1.2.0"
 UPDATER_VERSION="${TEMPLATE_VERSION}"
 RULE_NAME="amdx"
 TARGET_USER="{{TARGET_USER}}"
@@ -200,7 +200,7 @@ calc_total_delta_bytes() {
 }
 
 step_clear_logs() {
-  echo "[1/6] Czyszczę logi aplikacyjne: ${APP_LOG_DIR}"
+  echo "[1/7] Czyszczę logi aplikacyjne: ${APP_LOG_DIR}"
   if [[ -d "$APP_LOG_DIR" ]]; then
     sudo find "$APP_LOG_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
   else
@@ -209,7 +209,7 @@ step_clear_logs() {
 }
 
 step_backup_src() {
-  echo "[2/6] Backup: ${SRC_DIR} -> ${BACKUP_DEST}/"
+  echo "[2/7] Backup: ${SRC_DIR} -> ${BACKUP_DEST}/"
   mkdir -p "$BACKUP_DEST"
   if [[ -d "$SRC_DIR" ]]; then
     rsync -a --delete "$SRC_DIR"/ "${BACKUP_DEST}/edm-docker-amdx-cloud/"
@@ -219,9 +219,13 @@ step_backup_src() {
 }
 
 step_cleanup_old_backups() {
-  echo "[3/6] Czyszczę stare backupy, zostawiam 2 najnowsze w ${BACKUP_ROOT}"
+  echo "[3/7] Czyszczę stare backupy, zostawiam 2 najnowsze w ${BACKUP_ROOT}"
   mkdir -p "$BACKUP_ROOT"
-  mapfile -t TO_DEL < <(ls -1dt "${BACKUP_ROOT}"/*/ 2>/dev/null | tail -n +3 || true)
+  mapfile -t TO_DEL < <(
+    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d ! -name AMCS -printf '%T@ %p/\n' 2>/dev/null \
+      | sort -rn \
+      | awk 'NR > 2 {sub(/^[^ ]+ /, ""); print}'
+  )
   if ((${#TO_DEL[@]})); then
     printf '%s\0' "${TO_DEL[@]}" | xargs -0r rm -rf
     echo "[INFO] Usunięto stare backupy: ${TO_DEL[*]}"
@@ -230,8 +234,59 @@ step_cleanup_old_backups() {
   fi
 }
 
+step_cleanup_old_amcs_backups() {
+  local amcs_root="${BACKUP_ROOT}/AMCS"
+
+  echo "[INFO] Czyszczę stare backupy AMCS, zostawiam 2 najnowsze w ${amcs_root}"
+  if [[ ! -d "$amcs_root" ]]; then
+    echo "[INFO] Katalog backupów AMCS ${amcs_root} nie istnieje – pomijam retencję."
+    return 0
+  fi
+
+  mapfile -t TO_DEL < <(ls -1dt "${amcs_root}"/*/ 2>/dev/null | tail -n +3 || true)
+  if ((${#TO_DEL[@]})); then
+    printf '%s\0' "${TO_DEL[@]}" | xargs -0r rm -rf
+    echo "[INFO] Usunięto stare backupy AMCS: ${TO_DEL[*]}"
+  else
+    echo "[INFO] Brak starych backupów AMCS do usunięcia."
+  fi
+}
+
+step_move_upg_backup_files() {
+  echo "[4/7] Przenoszę pliki *.backup z UPG do backupu AMCS"
+
+  local amcs_backup_dest="${BACKUP_ROOT}/AMCS/${DATE_STAMP}"
+  local moved_count=0
+  local backup_file rel_path dest_file dest_dir
+
+  if [[ ! -d "$UPG_DIR" ]]; then
+    echo "[INFO] Katalog UPG ${UPG_DIR} nie istnieje – pomijam przenoszenie plików *.backup."
+    step_cleanup_old_amcs_backups
+    return 0
+  fi
+
+  while IFS= read -r -d '' backup_file; do
+    rel_path="${backup_file#${UPG_DIR}/}"
+    dest_file="${amcs_backup_dest}/${rel_path}"
+    dest_dir="$(dirname "$dest_file")"
+
+    mkdir -p "$dest_dir"
+    mv "$backup_file" "$dest_file"
+    echo "[INFO] Przeniesiono: ${rel_path} -> ${dest_file}"
+    moved_count=$((moved_count + 1))
+  done < <(find "$UPG_DIR" -type f -name '*.backup' -print0)
+
+  if ((moved_count == 0)); then
+    echo "[INFO] Brak plików *.backup w ${UPG_DIR}."
+  else
+    echo "[INFO] Przeniesiono plików *.backup: ${moved_count}"
+  fi
+
+  step_cleanup_old_amcs_backups
+}
+
 step_deploy_upg() {
-  echo "[4/6] Deploy UPG -> katalog aplikacji"
+  echo "[5/7] Deploy UPG -> katalog aplikacji"
 
   if [[ ! -d "$UPG_DIR" ]]; then
     echo "[ERROR] Brak katalogu UPG: ${UPG_DIR}" >&2
@@ -244,7 +299,7 @@ step_deploy_upg() {
 }
 
 step_docker_cleanup_and_restart() {
-  echo "[5/6] Docker: akcje interaktywne (kontenery / obrazy / wolumeny / restart)"
+  echo "[6/7] Docker: akcje interaktywne (kontenery / obrazy / wolumeny / restart)"
 
   command -v docker >/dev/null 2>&1 || { echo "[ERROR] 'docker' nie znaleziony w PATH." >&2; return 1; }
   detect_compose
@@ -300,7 +355,7 @@ step_docker_cleanup_and_restart() {
 }
 
 step_compose_pull_quiet_summary() {
-  echo "[6/6] Pull obrazów (bez spamu) + podsumowanie"
+  echo "[7/7] Pull obrazów (bez spamu) + podsumowanie"
 
   command -v docker >/dev/null 2>&1 || { echo "[ERROR] 'docker' nie znaleziony w PATH." >&2; return 1; }
   detect_compose
@@ -393,6 +448,7 @@ step_compose_pull_quiet_summary() {
 run_step "Czyszczenie logów aplikacyjnych"            step_clear_logs
 run_step "Backup źródła AMDX"                         step_backup_src
 run_step "Czyszczenie starych backupów"               step_cleanup_old_backups
+run_step "Przenoszenie plików *.backup z UPG"         step_move_upg_backup_files
 run_step "Deploy UPG -> katalog aplikacji"            step_deploy_upg
 run_step "Docker cleanup + restart (interaktywnie)"   step_docker_cleanup_and_restart
 run_step "Compose pull (bez spamu) + podsumowanie"    step_compose_pull_quiet_summary

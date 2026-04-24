@@ -37,7 +37,7 @@ RULE_ORDER=(
 
 # -------------------- GLOBALS --------------------
 
-UPGBUILDER_VERSION="0.1.8"
+UPGBUILDER_VERSION="0.1.9"
 RAW_REPO_BASE="https://raw.githubusercontent.com/daroitgo/itgo-scripts"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

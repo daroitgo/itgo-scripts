@@ -52,7 +52,7 @@ bk.log_path=/var/log/asseco
 # ==========================================================
 amdx.output=update_amdx.sh
 amdx.template=template/template_update_amdx.sh
-amdx.version=1.1.0
+amdx.version=1.2.0
 amdx.detect_mode=contains
 amdx.detect_value=amdx
 amdx.log_path=/var/log/asseco
