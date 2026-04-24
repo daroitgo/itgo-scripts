@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.31"
+MASTER_VERSION="1.2.32"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.13"
@@ -548,13 +548,13 @@ EOF_MASTER_UPDATE_LAUNCHER
   safe_backup "$bp"
   remove_block_from_file "$bp" "$legacy_path_start" "$legacy_path_end"
   remove_block_from_file "$bp" "$path_start" "$path_end"
-  printf "\n%s\nexport PATH=\"\$HOME/UTILITY/MASTER:\$HOME/UTILITY/STATUS/bin:\$HOME/UTILITY/TSEQ/bin:\$HOME/UTILITY/DOWNLOADER_APP/bin:\$HOME/UTILITY/UPGbuilder/bin:\$HOME/UTILITY/AMCS:\$PATH\"\n%s\n" "$path_start" "$path_end" >> "$bp"
+  printf "\n%s\nexport PATH=\"\$HOME/UTILITY/MASTER:\$HOME/UTILITY/STATUS/bin:\$HOME/UTILITY/TSEQ/bin:\$HOME/UTILITY/DOWNLOADER_APP/bin:\$HOME/UTILITY/UPGbuilder/bin:\$HOME/UTILITY/AMCS:\$HOME/UTILITY/TOOLS:\$PATH\"\n%s\n" "$path_start" "$path_end" >> "$bp"
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
   chmod 0644 "$bp" 2>/dev/null || true
 
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-install"
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-update"
-  add_summary "User-local PATH updated for MASTER, STATUS, TSEQ, DOWNLOADER_APP, UPGbuilder, AMCS"
+  add_summary "User-local PATH updated for MASTER, STATUS, TSEQ, DOWNLOADER_APP, UPGbuilder, AMCS, TOOLS"
 }
 
 ITGO_HOME=""
@@ -1265,11 +1265,13 @@ install_amcs_local_launchers() {
   local app_dir="$UTILITY_DIR/AMCS"
   local resources_dir="$app_dir/resources"
   local launcher="$app_dir/AMCS"
-  local copy_prod_launcher="$app_dir/amcs-copy-prod"
+  local tools_dir="$UTILITY_DIR/TOOLS"
+  local copy_prod_launcher="$tools_dir/cp-upg"
 
   echo "[$(ts)] ACTION: install AMCS launchers into $app_dir"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$app_dir"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$resources_dir"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$tools_dir"
 
   cat > "$launcher" <<'EOF_AMCS_LAUNCHER'
 #!/usr/bin/env bash
@@ -1321,7 +1323,7 @@ EOF_AMCS_COPY_PROD
   chmod 0700 "$launcher" "$copy_prod_launcher" 2>/dev/null || true
 
   add_summary "AMCS launcher installed: ~/UTILITY/AMCS/AMCS"
-  add_summary "AMCS launcher installed: ~/UTILITY/AMCS/amcs-copy-prod"
+  add_summary "TOOLS launcher installed: ~/UTILITY/TOOLS/cp-upg"
 }
 
 configure_amcs_firewall_public() {
@@ -1410,7 +1412,7 @@ install_amcs_step() {
   UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
   TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
 
-  if prompt_yn "MODUŁ: AMCS (~/UTILITY/AMCS + resources + launcher + amcs-copy-prod + firewall public 8090/5701)?" "Y"; then
+  if prompt_yn "MODUŁ: AMCS (~/UTILITY/AMCS + resources + launcher AMCS + helper cp-upg + firewall public 8090/5701)?" "Y"; then
     ensure_amcs_java_runtime
     install_amcs_local_launchers
     configure_amcs_firewall_public
@@ -2293,4 +2295,3 @@ main() {
 }
 
 main "$@"
-
