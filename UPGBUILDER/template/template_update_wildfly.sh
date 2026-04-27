@@ -6,7 +6,7 @@
 # ==========================================================
 # UPGBUILDER_VERSION={{UPGBUILDER_VERSION}}
 # TEMPLATE_NAME=template_update_wildfly.sh
-# TEMPLATE_VERSION=1.0.0
+# TEMPLATE_VERSION=1.1.0
 # RULE_NAME=wildfly
 # GENERATED_AT={{GENERATED_AT}}
 # GENERATED_HOST={{HOSTNAME}}
