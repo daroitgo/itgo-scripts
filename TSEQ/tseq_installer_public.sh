@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ========= TSEQ (Tomcat Sequencer) Installer baseline 3.12.3 / planned docs 3.12.4 =========
-VERSION="3.12.8"
+VERSION="3.12.9"
 BASE_USER="itgo"
 MODE="${1:-install}"
 
@@ -1006,27 +1006,33 @@ write_launcher_and_unit() {
 set -euo pipefail
 
 case "\${1:-}" in
-  --order)
-    shift
-    exec "$ORDER_TOOL_SH" "\$@"
-    ;;
-  --foreground)
-    shift
-    exec "$SEQUENCER_SH" "\$@"
-    ;;
-  --status)
-    systemctl status tseq --no-pager
-    ;;
-  *)
+  "")
+    report_file="$REPORT_FILE"
+    log_dir="\$(dirname "\$report_file")"
+
+    mkdir -p "\$log_dir"
+    touch "\$report_file"
+    printf "%s %s\n" "\$(date "+%F %T")" "LAUNCHER: start requested by tseq" >> "\$report_file"
+
     if [[ "\$(id -u)" -eq 0 ]]; then
       systemctl start tseq --no-block
     else
       sudo -n systemctl start tseq --no-block
     fi
-    echo "TSEQ: start requested in background via systemd."
-    echo "TSEQ: log: $REPORT_FILE"
-    echo "TSEQ: status: systemctl status tseq --no-pager"
-    echo "TSEQ: live log: tail -f $REPORT_FILE"
+
+    echo "TSEQ: start requested."
+    echo "TSEQ: log: \$report_file"
+    ;;
+  --order)
+    shift
+    exec "$ORDER_TOOL_SH" "\$@"
+    ;;
+  *)
+    echo "ERROR: unsupported argument: \$1" >&2
+    echo "Usage:" >&2
+    echo "  tseq" >&2
+    echo "  tseq --order" >&2
+    exit 2
     ;;
 esac
 EOF_WR
@@ -1153,11 +1159,8 @@ main() {
   echo "Version:   $(cat "$VERSION_FILE" 2>/dev/null || echo "?")"
   echo
   echo "Uruchomienie:"
-  echo "  tseq                  # start w tle przez systemd"
-  echo "  tseq --foreground     # diagnostyka: sekwencer na pierwszym planie"
-  echo "  tseq --status         # status usługi tseq"
+  echo "  tseq                  # start sekwencji w tle przez systemd"
   echo "  tseq --order          # konfiguracja kolejności"
-  echo "  sudo systemctl start tseq --no-block"
   echo
 }
 
