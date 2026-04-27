@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ========= TSEQ (Tomcat Sequencer) Installer baseline 3.12.3 / planned docs 3.12.4 =========
-VERSION="3.12.7"
+VERSION="3.12.8"
 BASE_USER="itgo"
 MODE="${1:-install}"
 
@@ -1010,8 +1010,23 @@ case "\${1:-}" in
     shift
     exec "$ORDER_TOOL_SH" "\$@"
     ;;
-  *)
+  --foreground)
+    shift
     exec "$SEQUENCER_SH" "\$@"
+    ;;
+  --status)
+    systemctl status tseq --no-pager
+    ;;
+  *)
+    if [[ "\$(id -u)" -eq 0 ]]; then
+      systemctl start tseq --no-block
+    else
+      sudo -n systemctl start tseq --no-block
+    fi
+    echo "TSEQ: start requested in background via systemd."
+    echo "TSEQ: log: $REPORT_FILE"
+    echo "TSEQ: status: systemctl status tseq --no-pager"
+    echo "TSEQ: live log: tail -f $REPORT_FILE"
     ;;
 esac
 EOF_WR
@@ -1025,7 +1040,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$LAUNCHER_BIN
+ExecStart=$SEQUENCER_SH
 
 [Install]
 WantedBy=multi-user.target
@@ -1138,8 +1153,10 @@ main() {
   echo "Version:   $(cat "$VERSION_FILE" 2>/dev/null || echo "?")"
   echo
   echo "Uruchomienie:"
-  echo "  sudo $LAUNCHER_BIN"
-  echo "  sudo $LAUNCHER_BIN --order"
+  echo "  tseq                  # start w tle przez systemd"
+  echo "  tseq --foreground     # diagnostyka: sekwencer na pierwszym planie"
+  echo "  tseq --status         # status usługi tseq"
+  echo "  tseq --order          # konfiguracja kolejności"
   echo "  sudo systemctl start tseq --no-block"
   echo
 }
