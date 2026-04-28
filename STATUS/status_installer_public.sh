@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.13"
+VERSION="3.12.14"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -196,6 +196,25 @@ mkdir -p "$OUTDIR"
 
 collected="$(date '+%Y-%m-%d %H:%M')"
 host="$(hostname -f 2>/dev/null || hostname)"
+host_ip="$(
+  {
+    (hostname -I 2>/dev/null || true) | awk '{
+      for (i=1; i<=NF; i++) {
+        if (first == "" && $i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i !~ /^127\./) {
+          first=$i
+        }
+      }
+    } END{if (first != "") print first}'
+    (ip -o -4 addr show scope global 2>/dev/null || true) | awk '{
+      addr=$4
+      sub(/\/.*/, "", addr)
+      if (first == "" && addr !~ /^127\./) {
+        first=addr
+      }
+    } END{if (first != "") print first}'
+  } | awk 'NF && first == ""{first=$0} END{if (first != "") print first}'
+)"
+[[ -n "${host_ip:-}" ]] || host_ip="UNKNOWN"
 kernel="$(uname -r)"
 
 os_id="unknown"; os_ver="unknown"; os_pretty="UNKNOWN"
@@ -386,6 +405,7 @@ fi
 {
 echo "Collected     : $collected"
 echo "Host          : $host"
+echo "Host IP       : $host_ip"
 echo "OS            : $os_pretty"
 echo "Kernel        : $kernel"
 echo "Java          : $java_ver"
@@ -738,6 +758,7 @@ getv(){ local key="$1"; awk -v k="$key" '$0 ~ "^"k"[[:space:]]*:"{sub("^"k"[[:sp
 
 collected="$(getv "Collected")"
 host="$(getv "Host")"
+hostip="$(getv "Host IP")"
 os="$(getv "OS")"
 kernel="$(getv "Kernel")"
 java="$(getv "Java")"
@@ -769,6 +790,56 @@ module_state() {
   [[ -f "$vf" ]] && echo "YES" || echo "NO"
 }
 
+fetch_github_tags() {
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -fsSL --connect-timeout 3 --max-time 5 \
+    "https://api.github.com/repos/daroitgo/itgo-scripts/git/matching-refs/tags/" 2>/dev/null
+}
+
+github_tags="$(fetch_github_tags || true)"
+github_tags_ok="NO"
+[[ -n "${github_tags:-}" ]] && github_tags_ok="YES"
+
+github_latest_for() {
+  local prefix="$1" latest
+  if [[ "$github_tags_ok" != "YES" ]]; then
+    echo "UNKNOWN"
+    return
+  fi
+
+  latest="$(
+    printf "%s\n" "$github_tags" \
+    | sed -n 's/.*"ref"[[:space:]]*:[[:space:]]*"refs\/tags\/\([^"]*\)".*/\1/p' \
+    | awk -v p="$prefix" 'index($0,p)==1 {print substr($0, length(p)+1)}' \
+    | awk 'NF' \
+    | sort -V \
+    | tail -n1
+  )"
+  [[ -n "${latest:-}" ]] && echo "$latest" || echo "UNKNOWN"
+}
+
+module_state_text() {
+  local inst="$1" local_ver="$2" github_ver="$3" highest
+  if [[ "$inst" == "NO" ]]; then
+    echo "NOT INSTALLED"
+  elif [[ "$github_ver" == "UNKNOWN" ]]; then
+    echo "CHECK FAILED"
+  elif [[ "$local_ver" == "$github_ver" ]]; then
+    echo "OK"
+  elif [[ "$local_ver" == "UNKNOWN" ]]; then
+    echo "CHECK MANUALLY"
+  else
+    highest="$(printf "%s\n%s\n" "$local_ver" "$github_ver" | sort -V | tail -n1)"
+    if [[ "$highest" == "$github_ver" ]]; then
+      echo "UPDATE REQUIRED"
+    elif [[ "$highest" == "$local_ver" ]]; then
+      echo "LOCAL NEWER"
+    else
+      echo "CHECK MANUALLY"
+    fi
+  fi
+}
+
 status_vf="$HOME/UTILITY/STATUS/.status_installer_version"
 tseq_vf="$HOME/UTILITY/TSEQ/.tseq_version"
 downloader_vf="$HOME/UTILITY/DOWNLOADER_APP/.downloader_version"
@@ -793,22 +864,24 @@ upg_cleanup_ver="$(read_version_file "$upg_cleanup_vf")"
 [[ -n "${upgbuilder_ver:-}" ]] || upgbuilder_ver="UNKNOWN"
 [[ -n "${upg_cleanup_ver:-}" ]] || upg_cleanup_ver="UNKNOWN"
 
+status_github_ver="$(github_latest_for "status-")"
+upg_cleanup_github_ver="$(github_latest_for "cleanup-")"
+tseq_github_ver="$(github_latest_for "tseq-")"
+downloader_github_ver="$(github_latest_for "downloader_app-")"
+upgbuilder_github_ver="$(github_latest_for "upgbuilder-")"
+
+status_mod_state="$(module_state_text "$status_installed" "$inst_ver" "$status_github_ver")"
+upg_cleanup_mod_state="$(module_state_text "$upg_cleanup_installed" "$upg_cleanup_ver" "$upg_cleanup_github_ver")"
+tseq_mod_state="$(module_state_text "$tseq_installed" "$tseq_ver" "$tseq_github_ver")"
+downloader_mod_state="$(module_state_text "$downloader_installed" "$downloader_ver" "$downloader_github_ver")"
+upgbuilder_mod_state="$(module_state_text "$upgbuilder_installed" "$upgbuilder_ver" "$upgbuilder_github_ver")"
+
 upg_cleanup_hook="NO"
 if [[ -f "$HOME/.bashrc" ]] && grep -qF "# >>> UPG XML cleanup (auto) >>>" "$HOME/.bashrc" 2>/dev/null; then
   upg_cleanup_hook="YES"
 fi
 
-RED=$'\033[31m'; GREEN=$'\033[32m'; RESET=$'\033[0m'
-
-badge="$status"
-echo "$status" | grep -qi "UPDATE REQUIRED" && badge="${RED}${status}${RESET}" || badge="${GREEN}${status}${RESET}"
-
-secbadge="${secupd:-UNKNOWN}"
-if echo "${secupd:-}" | grep -qi "SECURITY UPDATES AVAILABLE"; then
-  secbadge="${RED}${secupd}${RESET}"
-elif echo "${secupd:-}" | grep -qi "^OK"; then
-  secbadge="${GREEN}${secupd}${RESET}"
-fi
+RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; DIM=$'\033[2m'; RESET=$'\033[0m'
 
 hr_bytes() {
   local b="${1:-}"
@@ -822,65 +895,362 @@ hr_bytes() {
 }
 
 svc_state() { systemctl is-active "$1" 2>/dev/null || echo "unknown"; }
-trim2(){ local s="$1" w="$2"; ((${#s}>w)) && echo "${s:0:$((w-3))}..." || echo "$s"; }
 
-echo
-echo "== SERVER STATUS (${collected:-UNKNOWN}) =="
-printf "%-10s %s\n" "Host"       "${host:-UNKNOWN}"
-printf "%-10s %s\n" "OS"         "${os:-UNKNOWN}"
-printf "%-10s %s\n" "Kernel"     "${kernel:-UNKNOWN}"
-printf "%-10s %s\n" "Java"       "${java:-UNKNOWN}"
-printf "%-10s %s   [%b]\n" "Updated" "${updated:-UNKNOWN}" "$badge"
-printf "%-10s %b\n" "SecUpd"     "${secbadge}"
-printf "%-10s %s\n" "SecSrc"     "${secsrc:-UNKNOWN}"
-printf "%-10s %s\n" "Support"    "${support:-UNKNOWN}"
-printf "%-10s %s\n" "SupportSrc" "${supportsrc:-local-db}"
+terminal_width() {
+  local cols
+  cols="$(tput cols 2>/dev/null || echo 100)"
+  [[ "$cols" =~ ^[0-9]+$ ]] || cols=100
+  ((cols > 0)) || cols=100
+  echo "$cols"
+}
 
-echo
-echo "== MODULES =="
-printf "%-12s %-5s %s\n" "MODULE" "INST" "VERSION / INFO"
-printf "%-12s %-5s %s\n" "------------" "-----" "------------------------------"
-printf "%-12s %-5s %s\n" "StatusInst" "${status_installed:-NO}" "${inst_ver:-UNKNOWN}"
-printf "%-12s %-5s %s\n" "UPGclean"   "${upg_cleanup_installed:-NO}" "${upg_cleanup_ver:-UNKNOWN} (bashrc:${upg_cleanup_hook})"
-printf "%-12s %-5s %s\n" "TSEQ"       "${tseq_installed:-NO}" "${tseq_ver:-UNKNOWN}"
-printf "%-12s %-5s %s\n" "Downloader" "${downloader_installed:-NO}" "${downloader_ver:-UNKNOWN}"
-printf "%-12s %-5s %s\n" "UPGbuilder" "${upgbuilder_installed:-NO}" "${upgbuilder_ver:-UNKNOWN}"
+use_utf8_box() {
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *UTF-8*|*utf-8*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
-echo
-echo "== FIREWALL (permanent) =="
-printf "%-10s %s\n" "State"    "${fw:-UNKNOWN}"
-printf "%-10s %s\n" "Default"  "${fw_default:-UNKNOWN}"
-printf "%-10s %s\n" "Active"   "${fw_active:-UNKNOWN}"
-printf "%-10s %s\n" "PM Ports" "${fw_pm_ports:-UNKNOWN}"
-printf "%-10s %s\n" "PM Svcs"  "${fw_pm_services:-UNKNOWN}"
-printf "%-10s %s\n" "Direct"   "${fw_direct:-UNKNOWN}"
+setup_box_chars() {
+  if use_utf8_box; then
+    BOX_TL="┌"; BOX_H="─"; BOX_TR="┐"; BOX_V="│"; BOX_BL="└"; BOX_BR="┘"
+  else
+    BOX_TL="+"; BOX_H="-"; BOX_TR="+"; BOX_V="|"; BOX_BL="+"; BOX_BR="+"
+  fi
+}
 
-echo
-echo "== APPS (live state, cached logs size) =="
+strip_ansi() {
+  printf "%s" "$1" | sed $'s/\033\\[[0-9;]*[A-Za-z]//g'
+}
 
-printf "%-10s %-10s %-10s %-24s %s\n" "APP" "STATE" "LOGS" "UNIT" "HINT"
-printf "%-10s %-10s %-10s %-24s %s\n" "---------" "---------" "----------" "------------------------" "----------------------------------------"
+visible_len() {
+  local clean
+  clean="$(strip_ansi "$1")"
+  printf "%s" "${#clean}"
+}
 
-if [[ -f "$APPS" ]]; then
-  awk -F'\t' '$1=="SVC"{print $2 "\t" $3 "\t" $4 "\t" $7}' "$APPS" 2>/dev/null \
-  | while IFS=$'\t' read -r app unit hint logsbytes; do
-      st="$(svc_state "$unit")"
-      logs="$(hr_bytes "${logsbytes:-}")"
-      printf "%-10s %-10s %-10s %-24s %s\n" \
-        "$(trim2 "${app:-APP}" 10)" \
-        "$(trim2 "${st:-unknown}" 10)" \
-        "$(trim2 "${logs:-n/a}" 10)" \
-        "$(trim2 "${unit:-unknown}" 24)" \
-        "${hint:-UNKNOWN}"
+repeat_char() {
+  local ch="$1" n="$2" out="" i
+  ((n < 0)) && n=0
+  for ((i=0; i<n; i++)); do out="${out}${ch}"; done
+  printf "%s" "$out"
+}
+
+trim_visible() {
+  local s="$1" w="$2" clean
+  if (($(visible_len "$s") <= w)); then
+    printf "%s" "$s"
+    return
+  fi
+  clean="$(strip_ansi "$s")"
+  if ((w <= 3)); then
+    printf "%s" "${clean:0:w}"
+  else
+    printf "%s..." "${clean:0:$((w-3))}"
+  fi
+}
+
+trim2(){ trim_visible "$1" "$2"; }
+
+pad_visible() {
+  local s="$1" w="$2" out len
+  out="$(trim_visible "$s" "$w")"
+  len="$(visible_len "$out")"
+  printf "%s%s" "$out" "$(repeat_char " " "$((w-len))")"
+}
+
+color_state() {
+  local state="$1"
+  case "$state" in
+    OK) printf "%s" "${GREEN}${state}${RESET}" ;;
+    "UPDATE REQUIRED"|*"SECURITY"*UPDATE*) printf "%s" "${RED}${state}${RESET}" ;;
+    "NOT INSTALLED"|"CHECK FAILED") printf "%s" "${YELLOW}${state}${RESET}" ;;
+    *) printf "%s" "$state" ;;
+  esac
+}
+
+color_update_value() {
+  local value="$1"
+  if [[ "$value" == "OK" ]]; then
+    printf "%s" "${GREEN}${value}${RESET}"
+  elif echo "$value" | grep -qi "UPDATE"; then
+    printf "%s" "${RED}${value}${RESET}"
+  else
+    printf "%s" "$value"
+  fi
+}
+
+module_state_color() {
+  color_state "$1"
+}
+
+wrap_words() {
+  local text="$1" width="$2" indent="${3:-0}" line="" prefix word
+  prefix="$(repeat_char " " "$indent")"
+  [[ -n "${text:-}" ]] || text="UNKNOWN"
+  for word in $text; do
+    if [[ -z "$line" ]]; then
+      line="$word"
+    elif ((${#line} + 1 + ${#word} > width)); then
+      printf "%s\n" "$line"
+      line="${prefix}${word}"
+    else
+      line="${line} ${word}"
+    fi
+  done
+  [[ -n "$line" ]] && printf "%s\n" "$line"
+}
+
+kv_line() {
+  local key="$1" value="$2" width="$3" key_w=10 avail
+  avail="$((width - key_w - 1))"
+  ((avail < 8)) && avail=8
+  printf "%-${key_w}s %s" "$key" "$(trim_visible "${value:-UNKNOWN}" "$avail")"
+}
+
+render_box() {
+  local title="$1" width="$2" body="$3" inner top_title top_fill line
+  ((width < 24)) && width=24
+  inner="$((width - 4))"
+  top_title=" ${title} "
+  top_fill="$((width - 2 - $(visible_len "$top_title")))"
+  printf "%s%s%s%s\n" "$BOX_TL" "$top_title" "$(repeat_char "$BOX_H" "$top_fill")" "$BOX_TR"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    printf "%s %s %s\n" "$BOX_V" "$(pad_visible "$line" "$inner")" "$BOX_V"
+  done <<< "$body"
+  printf "%s%s%s\n" "$BOX_BL" "$(repeat_char "$BOX_H" "$((width - 2))")" "$BOX_BR"
+}
+
+box_to_array() {
+  local arr_name="$1" title="$2" width="$3" body="$4" line
+  if [[ "$arr_name" == "left_box" ]]; then
+    left_box=()
+  else
+    right_box=()
+  fi
+  while IFS= read -r line; do
+    if [[ "$arr_name" == "left_box" ]]; then
+      left_box+=("$line")
+    else
+      right_box+=("$line")
+    fi
+  done < <(render_box "$title" "$width" "$body")
+}
+
+render_two_boxes() {
+  local title1="$1" body1="$2" title2="$3" body2="$4" cols="$5"
+  local gap=2 width left_count right_count max_lines i
+  if ((cols >= 110)); then
+    width="$(( (cols - gap) / 2 ))"
+    ((width > 64)) && width=64
+    box_to_array left_box "$title1" "$width" "$body1"
+    box_to_array right_box "$title2" "$width" "$body2"
+    left_count="${#left_box[@]}"
+    right_count="${#right_box[@]}"
+    max_lines="$left_count"
+    ((right_count > max_lines)) && max_lines="$right_count"
+    for ((i=0; i<max_lines; i++)); do
+      printf "%s%s%s\n" "$(pad_visible "${left_box[$i]-}" "$width")" "$(repeat_char " " "$gap")" "${right_box[$i]-}"
     done
-else
-  echo "(no apps cache; run: status -r)"
+  else
+    width="$cols"
+    ((width > 90)) && width=90
+    render_box "$title1" "$width" "$body1"
+    echo
+    render_box "$title2" "$width" "$body2"
+  fi
+}
+
+update_short() {
+  local st="${1:-UNKNOWN}" ts="${2:-UNKNOWN}" now upd age
+  if echo "$st" | grep -qi "^OK"; then
+    echo "OK"
+  elif echo "$st" | grep -qi "UPDATE REQUIRED"; then
+    now="$(date +%s 2>/dev/null || echo 0)"
+    upd="$(date -d "$ts" +%s 2>/dev/null || echo 0)"
+    if [[ "$now" -gt 0 && "$upd" -gt 0 ]]; then
+      age="$(( (now - upd) / 86400 ))"
+      echo "${age}d UPDATE"
+    else
+      echo "UPDATE"
+    fi
+  else
+    echo "${st:-UNKNOWN}"
+  fi
+}
+
+security_short() {
+  local st="${1:-UNKNOWN}" n
+  if echo "$st" | grep -qi "^OK"; then
+    echo "OK"
+  elif echo "$st" | grep -qi "SECURITY UPDATES AVAILABLE"; then
+    n="$(echo "$st" | sed -n 's/.*(\([0-9][0-9]*\)).*/\1/p')"
+    [[ -n "${n:-}" ]] && echo "${n} UPDATE" || echo "UPDATE"
+  else
+    echo "${st:-UNKNOWN}"
+  fi
+}
+
+firewall_ports_display() {
+  local active="$1" ports="$2" zone
+  [[ -n "${ports:-}" ]] || { echo "UNKNOWN"; return; }
+  zone="${active%%(*}"
+  if [[ "$ports" == "${zone}:"* && "$ports" != *" | "* ]]; then
+    ports="${ports#${zone}:}"
+  fi
+  echo "$ports"
+}
+
+firewall_services_display() {
+  local active="$1" services="$2" zone
+  [[ -n "${services:-}" ]] || { echo "UNKNOWN"; return; }
+  zone="${active%%(*}"
+  if [[ "$services" == "${zone}:"* && "$services" != *" | "* ]]; then
+    services="${services#${zone}:}"
+  fi
+  echo "$services"
+}
+
+module_local_display() {
+  local inst="$1" local_ver="$2"
+  if [[ "$inst" == "NO" && "$local_ver" == "UNKNOWN" ]]; then
+    echo "-"
+  else
+    echo "$local_ver"
+  fi
+}
+
+module_row() {
+  local name="$1" inst="$2" local_ver="$3" github_ver="$4" state="$5"
+  printf "%-11s %-4s %-8s %-8s %s" \
+    "$name" "$inst" "$(module_local_display "$inst" "$local_ver")" "$github_ver" "$(module_state_color "$state")"
+}
+
+runtime_state_color() {
+  local state="$1"
+  case "$state" in
+    active|running) printf "%s" "${GREEN}${state}${RESET}" ;;
+    failed|dead) printf "%s" "${RED}${state}${RESET}" ;;
+    inactive|stopped|unknown) printf "%s" "${YELLOW}${state}${RESET}" ;;
+    *) printf "%s" "$state" ;;
+  esac
+}
+
+apps_row() {
+  local app="$1" state="$2" logs="$3" unit="$4" hint="$5"
+  local app_w="$6" state_w="$7" logs_w="$8" unit_w="$9" hint_w="${10}"
+  printf "%s %s %s %s %s" \
+    "$(pad_visible "${app:-APP}" "$app_w")" \
+    "$(pad_visible "$(runtime_state_color "${state:-unknown}")" "$state_w")" \
+    "$(pad_visible "${logs:-n/a}" "$logs_w")" \
+    "$(pad_visible "${unit:-unknown}" "$unit_w")" \
+    "$(trim_visible "${hint:-UNKNOWN}" "$hint_w")"
+}
+
+docker_info_row() {
+  local label="$1" value="$2" width="$3"
+  printf "%-8s %s" "$label" "$(trim_visible "${value:-UNKNOWN}" "$((width - 9))")"
+}
+
+setup_box_chars
+cols="$(terminal_width)"
+dashboard_w="$cols"
+((dashboard_w > 132)) && dashboard_w=132
+
+host_value="${host:-UNKNOWN}"
+if [[ -n "${hostip:-}" && "${hostip:-UNKNOWN}" != "UNKNOWN" ]]; then
+  host_value="${host_value}  IP ${hostip}"
 fi
+os_update="$(update_short "$status" "$updated")"
+sec_update="$(security_short "$secupd")"
+updates_value="OS $(color_update_value "$os_update") | Security $(color_update_value "$sec_update")"
+support_value="${support:-UNKNOWN} [${supportsrc:-local-db}]"
+
+server_body=""
+server_body+="$(kv_line "Host" "$host_value" 54)"$'\n'
+server_body+="$(kv_line "OS" "${os:-UNKNOWN}" 54)"$'\n'
+server_body+="$(kv_line "Kernel" "${kernel:-UNKNOWN}" 54)"$'\n'
+server_body+="$(kv_line "Java" "${java:-UNKNOWN}" 54)"$'\n'
+server_body+="$(kv_line "Updates" "$updates_value" 54)"$'\n'
+server_body+="$(kv_line "Support" "$support_value" 54)"
+
+fw_ports="$(firewall_ports_display "${fw_active:-UNKNOWN}" "${fw_pm_ports:-UNKNOWN}")"
+fw_services="$(firewall_services_display "${fw_active:-UNKNOWN}" "${fw_pm_services:-UNKNOWN}")"
+firewall_body=""
+firewall_body+="$(kv_line "Zone" "${fw_active:-UNKNOWN}" 54)"$'\n'
+firewall_body+="Ports"$'\n'
+while IFS= read -r line; do
+  firewall_body+="  ${line}"$'\n'
+done < <(wrap_words "$fw_ports" 48 2)
+if [[ -n "$fw_services" && "$fw_services" != "UNKNOWN" && "$fw_services" != "(none)" ]]; then
+  firewall_body+="Services"$'\n'
+  while IFS= read -r line; do
+    firewall_body+="  ${line}"$'\n'
+  done < <(wrap_words "$fw_services" 48 2)
+fi
+firewall_body="${firewall_body%$'\n'}"
+
+echo
+render_two_boxes "SERVER ${collected:-UNKNOWN}" "$server_body" "FIREWALL" "$firewall_body" "$cols"
+
+modules_w="$dashboard_w"
+((modules_w > 76)) && modules_w=76
+modules_body=""
+modules_body+="$(printf "%-11s %-4s %-8s %-8s %s" "MODULE" "INST" "LOCAL" "GITHUB" "STATE")"$'\n'
+modules_body+="$(printf "%-11s %-4s %-8s %-8s %s" "-----------" "----" "--------" "--------" "----------------")"$'\n'
+modules_body+="$(module_row "StatusInst" "${status_installed:-NO}" "${inst_ver:-UNKNOWN}" "${status_github_ver:-UNKNOWN}" "$status_mod_state")"$'\n'
+modules_body+="$(module_row "UPGclean" "${upg_cleanup_installed:-NO}" "${upg_cleanup_ver:-UNKNOWN}" "${upg_cleanup_github_ver:-UNKNOWN}" "$upg_cleanup_mod_state")"$'\n'
+modules_body+="$(module_row "TSEQ" "${tseq_installed:-NO}" "${tseq_ver:-UNKNOWN}" "${tseq_github_ver:-UNKNOWN}" "$tseq_mod_state")"$'\n'
+modules_body+="$(module_row "Downloader" "${downloader_installed:-NO}" "${downloader_ver:-UNKNOWN}" "${downloader_github_ver:-UNKNOWN}" "$downloader_mod_state")"$'\n'
+modules_body+="$(module_row "UPGbuilder" "${upgbuilder_installed:-NO}" "${upgbuilder_ver:-UNKNOWN}" "${upgbuilder_github_ver:-UNKNOWN}" "$upgbuilder_mod_state")"$'\n'
+modules_body+="${DIM}UPGclean hook: bashrc:${upg_cleanup_hook}${RESET}"
+
+echo
+render_box "MODULES" "$modules_w" "$modules_body"
+
+echo
+apps_w="$dashboard_w"
+((apps_w > 100)) && apps_w=100
+apps_inner="$((apps_w - 4))"
+app_w=10
+app_state_w=8
+app_logs_w=8
+app_unit_w=20
+app_hint_w="$((apps_inner - app_w - app_state_w - app_logs_w - app_unit_w - 4))"
+if ((app_hint_w < 10)); then
+  app_unit_w=16
+  app_hint_w="$((apps_inner - app_w - app_state_w - app_logs_w - app_unit_w - 4))"
+fi
+if ((app_hint_w < 8)); then
+  app_w=8
+  app_state_w=7
+  app_logs_w=7
+  app_unit_w=12
+  app_hint_w="$((apps_inner - app_w - app_state_w - app_logs_w - app_unit_w - 4))"
+fi
+((app_hint_w < 6)) && app_hint_w=6
+
+apps_body=""
+apps_body+="$(apps_row "APP" "STATE" "LOGS" "UNIT" "HINT" "$app_w" "$app_state_w" "$app_logs_w" "$app_unit_w" "$app_hint_w")"$'\n'
+apps_body+="$(apps_row "--------" "--------" "------" "----------------" "----------------" "$app_w" "$app_state_w" "$app_logs_w" "$app_unit_w" "$app_hint_w")"
+if [[ -f "$APPS" ]]; then
+  apps_count=0
+  while IFS=$'\t' read -r app unit hint logsbytes; do
+    apps_count="$((apps_count + 1))"
+    st="$(svc_state "$unit")"
+    logs="$(hr_bytes "${logsbytes:-}")"
+    apps_body+=$'\n'
+    apps_body+="$(apps_row "${app:-APP}" "${st:-unknown}" "${logs:-n/a}" "${unit:-unknown}" "${hint:-UNKNOWN}" "$app_w" "$app_state_w" "$app_logs_w" "$app_unit_w" "$app_hint_w")"
+  done < <(awk -F'\t' '$1=="SVC"{print $2 "\t" $3 "\t" $4 "\t" $7}' "$APPS" 2>/dev/null)
+  if [[ "${apps_count:-0}" -eq 0 ]]; then
+    apps_body="no app services in cache; run: status -r"
+  fi
+else
+  apps_body="no apps cache; run: status -r"
+fi
+render_box "APPS" "$apps_w" "$apps_body"
 
 command -v docker >/dev/null 2>&1 || { echo; exit 0; }
-
-echo
-echo "== DOCKER / COMPOSE =="
 
 dockerv="$(docker --version 2>/dev/null | tr -d '\r' || echo UNKNOWN)"
 composev="NOT_INSTALLED"
@@ -889,11 +1259,15 @@ if docker compose version >/dev/null 2>&1; then
 elif command -v docker-compose >/dev/null 2>&1; then
   composev="$(docker-compose --version 2>/dev/null | tr -d '\r' || echo UNKNOWN)"
 fi
-printf "%-10s %s\n" "Docker" "$dockerv"
-printf "%-10s %s\n" "Compose" "$composev"
+
+docker_w="$dashboard_w"
+((docker_w > 90)) && docker_w=90
+docker_body=""
+docker_body+="$(docker_info_row "Docker" "$dockerv" "$((docker_w - 4))")"$'\n'
+docker_body+="$(docker_info_row "Compose" "$composev" "$((docker_w - 4))")"
 
 echo
-echo "== DOCKER COMPOSE PROJECTS (grouped) =="
+render_box "DOCKER / COMPOSE" "$docker_w" "$docker_body"
 
 compose_proj_counts() {
   local proj="$1"
@@ -926,39 +1300,65 @@ if [[ -f "$APPS" ]]; then
   done < <(awk -F'\t' '$1=="CMP"{print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8}' "$APPS" 2>/dev/null)
 fi
 
-printf "%-10s %-10s %-10s %-24s %s\n" "SYSTEM" "STATE" "LOGS" "UNIT" "HINT"
-printf "%-10s %-10s %-10s %-24s %s\n" "---------" "---------" "----------" "------------------------" "----------------------------------------"
+compose_w="$dashboard_w"
+((compose_w > 100)) && compose_w=100
+compose_inner="$((compose_w - 4))"
+compose_sys_w=10
+compose_state_w=8
+compose_logs_w=8
+compose_unit_w=20
+compose_hint_w="$((compose_inner - compose_sys_w - compose_state_w - compose_logs_w - compose_unit_w - 4))"
+if ((compose_hint_w < 10)); then
+  compose_unit_w=16
+  compose_hint_w="$((compose_inner - compose_sys_w - compose_state_w - compose_logs_w - compose_unit_w - 4))"
+fi
+if ((compose_hint_w < 8)); then
+  compose_sys_w=8
+  compose_state_w=7
+  compose_logs_w=7
+  compose_unit_w=12
+  compose_hint_w="$((compose_inner - compose_sys_w - compose_state_w - compose_logs_w - compose_unit_w - 4))"
+fi
+((compose_hint_w < 6)) && compose_hint_w=6
 
-for key in "${!G_PROJS[@]}"; do
-  sys="${key%%|||*}"
-  unit="${key##*|||}"
-  hint="${G_HINT[$key]-UNKNOWN}"
-  projs="${G_PROJS[$key]-}"
-  logs="$(hr_bytes "${G_LOGS[$key]-}")"
+compose_body=""
+compose_body+="$(apps_row "SYSTEM" "STATE" "LOGS" "UNIT" "HINT" "$compose_sys_w" "$compose_state_w" "$compose_logs_w" "$compose_unit_w" "$compose_hint_w")"$'\n'
+compose_body+="$(apps_row "--------" "--------" "------" "----------------" "----------------" "$compose_sys_w" "$compose_state_w" "$compose_logs_w" "$compose_unit_w" "$compose_hint_w")"
 
-  state="unknown"
-  any_all=0
-  any_running=0
-  for p in $projs; do
-    read -r rcount acount < <(compose_proj_counts "$p")
-    [[ "${acount:-0}" -gt 0 ]] && any_all=1
-    [[ "${rcount:-0}" -gt 0 ]] && any_running=1
-  done
-  if [[ "$any_running" -eq 1 ]]; then
-    state="running"
-  elif [[ "$any_all" -eq 1 ]]; then
-    state="stopped"
-  else
+if ((${#G_PROJS[@]} > 0)); then
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    sys="${key%%|||*}"
+    unit="${key##*|||}"
+    hint="${G_HINT[$key]-UNKNOWN}"
+    projs="${G_PROJS[$key]-}"
+    logs="$(hr_bytes "${G_LOGS[$key]-}")"
+
     state="unknown"
-  fi
+    any_all=0
+    any_running=0
+    for p in $projs; do
+      read -r rcount acount < <(compose_proj_counts "$p")
+      [[ "${acount:-0}" -gt 0 ]] && any_all=1
+      [[ "${rcount:-0}" -gt 0 ]] && any_running=1
+    done
+    if [[ "$any_running" -eq 1 ]]; then
+      state="running"
+    elif [[ "$any_all" -eq 1 ]]; then
+      state="stopped"
+    else
+      state="unknown"
+    fi
 
-  printf "%-10s %-10s %-10s %-24s %s\n" \
-    "$(trim2 "${sys:-UNKNOWN}" 10)" \
-    "$(trim2 "${state:-unknown}" 10)" \
-    "$(trim2 "${logs:-n/a}" 10)" \
-    "$(trim2 "${unit:-unknown}" 24)" \
-    "${hint:-UNKNOWN}"
-done | sort
+    compose_body+=$'\n'
+    compose_body+="$(apps_row "${sys:-UNKNOWN}" "${state:-unknown}" "${logs:-n/a}" "${unit:-unknown}" "${hint:-UNKNOWN}" "$compose_sys_w" "$compose_state_w" "$compose_logs_w" "$compose_unit_w" "$compose_hint_w")"
+  done < <(printf "%s\n" "${!G_PROJS[@]}" | sort)
+else
+  compose_body="no compose projects in cache; run: status -r"
+fi
+
+echo
+render_box "DOCKER COMPOSE PROJECTS" "$compose_w" "$compose_body"
 
 echo
 VIEW
