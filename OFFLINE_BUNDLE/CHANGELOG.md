@@ -2,6 +2,20 @@
 
 W tym pliku prowadzona jest historia zmian modułu `OFFLINE_BUNDLE`.
 
+## 0.1.39 - 2026-04-27
+
+### Changed
+- przebudowano pakiet offline po publikacji `UPGBUILDER 0.1.10`,
+- zaktualizowano payload `MASTER` do wersji `1.2.40`,
+- zaktualizowano payload `UPGBUILDER` do wersji `0.1.10`,
+- odświeżono artefakt `itgo-offline-bundle.tar.gz` zgodnie z aktualnym stanem payloadów.
+
+### Compatibility
+- pakiet offline pozostaje zgodny z aktualnym modelem instalacji przez `MASTER`.
+
+### Breaking changes
+- brak
+
 ## 0.1.5 - 2026-03-30
 - przebudowano pakiet offline po zmianach w `UPGBUILDER` do wersji `0.1.3`,
 - zaktualizowano payload `MASTER` do wersji `1.2.5`,
