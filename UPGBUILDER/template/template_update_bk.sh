@@ -6,7 +6,7 @@
 # ==========================================================
 # UPGBUILDER_VERSION={{UPGBUILDER_VERSION}}
 # TEMPLATE_NAME=template_update_bk.sh
-# TEMPLATE_VERSION=1.0.0
+# TEMPLATE_VERSION=1.1.0
 # RULE_NAME=bk
 # GENERATED_AT={{GENERATED_AT}}
 # GENERATED_HOST={{HOSTNAME}}
@@ -77,6 +77,73 @@ step_verify_paths() {
   done
 }
 
+step_guard_webapps_stopped() {
+  local tomcat_dir
+  tomcat_dir="$(dirname "$WEBAPPS_DIR")"
+
+  echo "[INFO] Sprawdzam, czy Tomcat/Java dla WEBAPPS_DIR jest zatrzymany..."
+
+  if [[ ! -d /proc || ! -r /proc ]]; then
+    echo "[ERROR] Nie można potwierdzić zatrzymania aplikacji."
+    echo "[ERROR] Katalog /proc jest niedostępny lub nieczytelny."
+    exit 1
+  fi
+
+  local proc_cmdline pid cmdline cmdline_lower short_cmd
+  local checked_cmdlines=0
+  local -a running_processes=()
+
+  for proc_cmdline in /proc/[0-9]*/cmdline; do
+    [[ -e "$proc_cmdline" ]] || continue
+    [[ -r "$proc_cmdline" ]] || continue
+
+    pid="${proc_cmdline#/proc/}"
+    pid="${pid%%/*}"
+
+    if ! cmdline="$(tr '\0' ' ' < "$proc_cmdline" 2>/dev/null)"; then
+      continue
+    fi
+    [[ -n "$cmdline" ]] || continue
+    checked_cmdlines=$((checked_cmdlines + 1))
+
+    cmdline_lower="${cmdline,,}"
+    if [[ "$cmdline" != *"$WEBAPPS_DIR"* && "$cmdline" != *"$tomcat_dir"* ]]; then
+      continue
+    fi
+    if [[ "$cmdline_lower" != *java* && "$cmdline_lower" != *catalina* && "$cmdline_lower" != *tomcat* && "$cmdline_lower" != *apache-tomcat* ]]; then
+      continue
+    fi
+
+    short_cmd="$cmdline"
+    if ((${#short_cmd} > 240)); then
+      short_cmd="${short_cmd:0:237}..."
+    fi
+    running_processes+=("${pid}|${short_cmd}")
+  done
+
+  if ((checked_cmdlines == 0)); then
+    echo "[ERROR] Nie można potwierdzić zatrzymania aplikacji."
+    echo "[ERROR] Nie udało się odczytać żadnego /proc/<pid>/cmdline."
+    exit 1
+  fi
+
+  if ((${#running_processes[@]})); then
+    echo "[ERROR] Wykryto uruchomiony proces Tomcat/Java powiązany z aktualizowanym WEBAPPS_DIR."
+    echo "[ERROR] WEBAPPS_DIR: ${WEBAPPS_DIR}"
+    echo "[ERROR] tomcat_dir: ${tomcat_dir}"
+    local item found_pid found_cmd
+    for item in "${running_processes[@]}"; do
+      IFS='|' read -r found_pid found_cmd <<<"$item"
+      echo "[ERROR] PID: ${found_pid}"
+      echo "[ERROR] Komenda: ${found_cmd}"
+    done
+    echo "[INFO] Zatrzymaj Tomcat/aplikację przed aktualizacją i uruchom updater ponownie."
+    exit 1
+  fi
+
+  echo "[OK] Nie znaleziono uruchomionych procesów Tomcat/Java dla WEBAPPS_DIR: ${WEBAPPS_DIR}"
+}
+
 step_remove_apps() {
   echo "[INFO] Usuwanie katalogów aplikacji (rozpakowane webappy)"
   local app target
@@ -135,6 +202,7 @@ step_copy_new_wars() {
 }
 
 run_step "Weryfikacja katalogów źródłowych i docelowych" step_verify_paths
+run_step "Guard: Tomcat/Java dla WEBAPPS_DIR zatrzymany" step_guard_webapps_stopped
 run_step "Usuwanie katalogów aplikacji"                  step_remove_apps
 run_step "Usuwanie starych plików WAR"                   step_remove_old_wars
 run_step "Sprawdzanie dostępności nowych plików WAR"     step_check_new_wars

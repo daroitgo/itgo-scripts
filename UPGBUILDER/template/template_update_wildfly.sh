@@ -6,7 +6,7 @@
 # ==========================================================
 # UPGBUILDER_VERSION={{UPGBUILDER_VERSION}}
 # TEMPLATE_NAME=template_update_wildfly.sh
-# TEMPLATE_VERSION=1.1.0
+# TEMPLATE_VERSION=1.2.0
 # RULE_NAME=wildfly
 # GENERATED_AT={{GENERATED_AT}}
 # GENERATED_HOST={{HOSTNAME}}
@@ -58,6 +58,71 @@ step_verify_paths() {
   [[ "$missing" -eq 0 ]]
 }
 
+step_guard_wildfly_stopped() {
+  echo "[1b] Sprawdzam, czy WildFly/JBoss dla APP_DIR jest zatrzymany..."
+
+  if [[ ! -d /proc || ! -r /proc ]]; then
+    echo "    [ERROR] Nie można potwierdzić zatrzymania aplikacji."
+    echo "    [ERROR] Katalog /proc jest niedostępny lub nieczytelny."
+    exit 1
+  fi
+
+  local proc_cmdline pid cmdline cmdline_lower short_cmd
+  local wildfly_final="${APP_DIR}/wildfly-26.0.1.Final"
+  local wildfly_dir="${APP_DIR}/wildfly"
+  local checked_cmdlines=0
+  local -a running_processes=()
+
+  for proc_cmdline in /proc/[0-9]*/cmdline; do
+    [[ -e "$proc_cmdline" ]] || continue
+    [[ -r "$proc_cmdline" ]] || continue
+
+    pid="${proc_cmdline#/proc/}"
+    pid="${pid%%/*}"
+
+    if ! cmdline="$(tr '\0' ' ' < "$proc_cmdline" 2>/dev/null)"; then
+      continue
+    fi
+    [[ -n "$cmdline" ]] || continue
+    checked_cmdlines=$((checked_cmdlines + 1))
+
+    cmdline_lower="${cmdline,,}"
+    if [[ "$cmdline" != *"$APP_DIR"* && "$cmdline" != *"$wildfly_final"* && "$cmdline" != *"$wildfly_dir"* ]]; then
+      continue
+    fi
+    if [[ "$cmdline_lower" != *java* && "$cmdline_lower" != *wildfly* && "$cmdline_lower" != *jboss* && "$cmdline_lower" != *standalone* ]]; then
+      continue
+    fi
+
+    short_cmd="$cmdline"
+    if ((${#short_cmd} > 240)); then
+      short_cmd="${short_cmd:0:237}..."
+    fi
+    running_processes+=("${pid}|${short_cmd}")
+  done
+
+  if ((checked_cmdlines == 0)); then
+    echo "    [ERROR] Nie można potwierdzić zatrzymania aplikacji."
+    echo "    [ERROR] Nie udało się odczytać żadnego /proc/<pid>/cmdline."
+    exit 1
+  fi
+
+  if ((${#running_processes[@]})); then
+    echo "    [ERROR] Wykryto uruchomiony proces Java/WildFly/JBoss powiązany z aktualizowanym APP_DIR."
+    echo "    [ERROR] APP_DIR: ${APP_DIR}"
+    local item found_pid found_cmd
+    for item in "${running_processes[@]}"; do
+      IFS='|' read -r found_pid found_cmd <<<"$item"
+      echo "    [ERROR] PID: ${found_pid}"
+      echo "    [ERROR] Komenda: ${found_cmd}"
+    done
+    echo "    [INFO] Zatrzymaj WildFly/aplikację przed aktualizacją i uruchom updater ponownie."
+    exit 1
+  fi
+
+  echo "    [OK] Nie znaleziono uruchomionych procesów Java/WildFly/JBoss dla APP_DIR: ${APP_DIR}"
+}
+
 step_clear_logs() {
   echo "[2] Czyszczenie katalogu logów..."
   if [[ -d "${APP_LOG_DIR}" ]]; then
@@ -104,6 +169,7 @@ step_summary() {
 }
 
 step_verify_paths
+step_guard_wildfly_stopped
 step_clear_logs
 step_cleanup_tmp
 step_swap_dirs

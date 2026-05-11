@@ -6,7 +6,7 @@
 # ==========================================================
 # UPGBUILDER_VERSION={{UPGBUILDER_VERSION}}
 # TEMPLATE_NAME=template_update_platforms.sh
-# TEMPLATE_VERSION=1.2.0
+# TEMPLATE_VERSION=1.3.0
 # RULE_NAME=platforms
 # GENERATED_AT={{GENERATED_AT}}
 # GENERATED_HOST={{HOSTNAME}}
@@ -14,6 +14,8 @@
 # ==========================================================
 
 set -uo pipefail
+
+TEMPLATE_VERSION="1.3.0"
 
 BACKUP_DIR="/home/itgo/BACKUP"
 SRV_DIR="/srv"
@@ -101,6 +103,75 @@ step_discover_platforms() {
     echo "    ${PLATFORMS[$i]}"
     echo "    -> NEW: ${PLATFORMS_NEW[$i]}"
   done
+}
+
+step_guard_platforms_stopped() {
+  local platform proc_cmdline pid cmdline cmdline_lower short_cmd
+  local tomcat_dir checked_cmdlines=0
+  local -a running_platforms=()
+
+  echo "[0b] Sprawdzam, czy wykryte platformy Tomcat są zatrzymane..."
+
+  if [[ ! -d /proc || ! -r /proc ]]; then
+    echo "[ERROR] Nie można potwierdzić zatrzymania aplikacji."
+    echo "[ERROR] Katalog /proc jest niedostępny lub nieczytelny."
+    exit 1
+  fi
+
+  if ((${#PLATFORMS[@]} == 0)); then
+    echo "[ERROR] Nie można potwierdzić zatrzymania aplikacji."
+    echo "[ERROR] Brak wykrytych platform do sprawdzenia."
+    exit 1
+  fi
+
+  for platform in "${PLATFORMS[@]}"; do
+    tomcat_dir="${platform}/apache-tomcat"
+
+    for proc_cmdline in /proc/[0-9]*/cmdline; do
+      [[ -r "$proc_cmdline" ]] || continue
+      pid="${proc_cmdline#/proc/}"
+      pid="${pid%%/*}"
+
+      cmdline="$(tr '\0' ' ' < "$proc_cmdline" 2>/dev/null || true)"
+      [[ -n "$cmdline" ]] || continue
+      checked_cmdlines=$((checked_cmdlines + 1))
+
+      cmdline_lower="${cmdline,,}"
+      if [[ "$cmdline" != *"$platform"* && "$cmdline" != *"$tomcat_dir"* ]]; then
+        continue
+      fi
+      if [[ "$cmdline_lower" != *java* && "$cmdline_lower" != *catalina* && "$cmdline_lower" != *tomcat* && "$cmdline_lower" != *apache-tomcat* ]]; then
+        continue
+      fi
+
+      short_cmd="$cmdline"
+      if ((${#short_cmd} > 240)); then
+        short_cmd="${short_cmd:0:237}..."
+      fi
+      running_platforms+=("${platform}|${pid}|${short_cmd}")
+    done
+  done
+
+  if ((checked_cmdlines == 0)); then
+    echo "[ERROR] Nie można potwierdzić zatrzymania aplikacji."
+    echo "[ERROR] Nie udało się odczytać żadnego /proc/<pid>/cmdline."
+    exit 1
+  fi
+
+  if ((${#running_platforms[@]})); then
+    echo "[ERROR] Wykryto uruchomiony proces Tomcat/Java dla aktualizowanej platformy. Przerwano aktualizację."
+    local item found_platform found_pid found_cmd
+    for item in "${running_platforms[@]}"; do
+      IFS='|' read -r found_platform found_pid found_cmd <<<"$item"
+      echo "[ERROR] Platforma: ${found_platform}"
+      echo "[ERROR] PID: ${found_pid}"
+      echo "[ERROR] Komenda: ${found_cmd}"
+    done
+    echo "[INFO] Zatrzymaj aplikację/platformę przed aktualizacją i uruchom updater ponownie."
+    exit 1
+  fi
+
+  echo "[OK] Nie znaleziono uruchomionych procesów Tomcat/Java dla wykrytych platform."
 }
 
 step_clear_logs() {
@@ -317,6 +388,7 @@ step_chmod_platforms() {
 {{SPECIAL_PLATFORM_FUNCTIONS}}
 
 run_step "Wykrywanie platform IntegrationPlatform"              step_discover_platforms
+run_step "Guard: platformy Tomcat zatrzymane"                   step_guard_platforms_stopped
 run_step "Czyszczenie logów Tomcata"                            step_clear_logs
 run_step "Przygotowanie katalogu backupu (dzisiejszy)"          step_prepare_backup
 run_step "Czyszczenie starych backupów (zostają 2)"             step_cleanup_old_backups

@@ -6,7 +6,7 @@
 # ==========================================================
 # UPGBUILDER_VERSION={{UPGBUILDER_VERSION}}
 # TEMPLATE_NAME=template_update_p1adapter.sh
-# TEMPLATE_VERSION=1.1.0
+# TEMPLATE_VERSION=1.2.0
 # RULE_NAME=p1adapter
 # GENERATED_AT={{GENERATED_AT}}
 # GENERATED_HOST={{HOSTNAME}}
@@ -17,7 +17,7 @@ set -euo pipefail
 
 UPGBUILDER_VERSION="{{UPGBUILDER_VERSION}}"
 TEMPLATE_NAME="template_update_p1adapter.sh"
-TEMPLATE_VERSION="1.1.0"
+TEMPLATE_VERSION="1.2.0"
 UPDATER_VERSION="${TEMPLATE_VERSION}"
 RULE_NAME="p1adapter"
 TARGET_USER="{{TARGET_USER}}"
@@ -118,6 +118,84 @@ detect_compose() {
 
   echo "[ERROR] Nie znaleziono ani 'docker compose', ani 'docker-compose'." >&2
   return 1
+}
+
+step_guard_compose_stopped() {
+  local target_dir="$SRC_DIR"
+  local old_pwd="$PWD"
+  local ids_output=""
+  local container_id inspect_line running name service
+  local -a container_ids=()
+  local -a running_containers=()
+
+  echo "[0/7] Sprawdzam, czy docelowy projekt Docker Compose jest zatrzymany: ${target_dir}"
+
+  if [[ ! -d "$target_dir" ]]; then
+    echo "[ERROR] Nie można potwierdzić zatrzymania docelowej aplikacji."
+    echo "[ERROR] Katalog projektu nie istnieje: ${target_dir}"
+    exit 1
+  fi
+
+  cd "$target_dir" || {
+    echo "[ERROR] Nie można potwierdzić zatrzymania docelowej aplikacji."
+    echo "[ERROR] Nie mogę wejść do katalogu projektu: ${target_dir}"
+    exit 1
+  }
+
+  if ! detect_compose; then
+    echo "[ERROR] Nie można potwierdzić zatrzymania docelowej aplikacji."
+    echo "[ERROR] Nie udało się wykryć narzędzia Docker Compose dla katalogu: ${target_dir}"
+    exit 1
+  fi
+
+  if ! ids_output="$(sudo "${COMPOSE_CMD[@]}" ps -q 2>/dev/null)"; then
+    echo "[ERROR] Nie można potwierdzić zatrzymania docelowej aplikacji."
+    echo "[ERROR] Nie udało się odczytać kontenerów Compose w katalogu: ${target_dir}"
+    exit 1
+  fi
+
+  mapfile -t container_ids < <(printf '%s\n' "$ids_output" | awk 'NF')
+  if ((${#container_ids[@]} == 0)); then
+    echo "[OK] Brak kontenerów w docelowym projekcie Compose (${target_dir})."
+    cd "$old_pwd"
+    return 0
+  fi
+
+  for container_id in "${container_ids[@]}"; do
+    if ! inspect_line="$(sudo docker inspect --format '{{.State.Running}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.service"}}' "$container_id" 2>/dev/null)"; then
+      echo "[ERROR] Nie można potwierdzić zatrzymania docelowej aplikacji."
+      echo "[ERROR] Nie udało się sprawdzić kontenera: ${container_id}"
+      exit 1
+    fi
+
+    IFS='|' read -r running name service <<<"$inspect_line"
+    if [[ "$running" == "true" ]]; then
+      running_containers+=("${container_id}|${name}|${service}")
+    fi
+  done
+
+  if ((${#running_containers[@]})); then
+    echo "[ERROR] Docelowy projekt Docker Compose jest uruchomiony. Przerwano aktualizację."
+    echo "[ERROR] Katalog projektu: ${target_dir}"
+    echo "[ERROR] Działające kontenery/usługi:"
+    for inspect_line in "${running_containers[@]}"; do
+      IFS='|' read -r container_id name service <<<"$inspect_line"
+      name="${name#/}"
+      [[ -z "$service" || "$service" == "<no value>" ]] && service="nieustalona"
+      echo " - kontener=${name:-$container_id}, usługa=${service}, id=${container_id}"
+    done
+    echo "[INFO] Zatrzymaj projekt przed aktualizacją:"
+    echo "  cd ${target_dir}"
+    if [[ "$COMPOSE_KIND" == "v1" ]]; then
+      echo "  sudo docker-compose down"
+    else
+      echo "  sudo docker compose down"
+    fi
+    exit 1
+  fi
+
+  echo "[OK] Docelowy projekt Compose nie ma uruchomionych kontenerów (${target_dir})."
+  cd "$old_pwd"
 }
 
 compose_has_flag() {
@@ -402,6 +480,7 @@ step_compose_pull_quiet_summary() {
   rm -f "$tmp_before" "$tmp_after" "$tmp_pairs" "$pull_log" "$services_log"
 }
 
+run_step "Guard: docelowy Compose zatrzymany"              step_guard_compose_stopped
 run_step "Czyszczenie logów aplikacyjnych"                 step_clear_logs
 run_step "Backup źródła P1ADAPTER"                         step_backup_src
 run_step "Czyszczenie starych backupów"                    step_cleanup_old_backups
