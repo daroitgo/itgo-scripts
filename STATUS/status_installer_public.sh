@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.14"
+VERSION="3.12.15"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -1522,6 +1522,7 @@ remove_block_from_file() {
 patch_bash_profile() {
   local start_marker="# --- system-audit on SSH login (background) ---"
   local end_marker="# --- /system-audit ---"
+  local master_start_marker="# >>> ITGO SSH HISTORY PROMPT (auto) >>>"
 
   touch "$BASH_PROFILE"
   chown "$TARGET_USER:$TARGET_USER" "$BASH_PROFILE"
@@ -1530,8 +1531,16 @@ patch_bash_profile() {
   cleanup_old_legacy_backups
   safe_backup "$BASH_PROFILE"
 
+  # Always remove the old legacy block first. If MASTER already owns the
+  # current SSH login prompt/status block, do not re-add the legacy block,
+  # otherwise SSH login would print status twice.
   remove_block_from_file "$BASH_PROFILE" "$start_marker" "$end_marker"
 
+  if grep -qF "$master_start_marker" "$BASH_PROFILE" 2>/dev/null; then
+    return 0
+  fi
+
+  # Standalone STATUS installations still get one SSH-login status display.
   cat >> "$BASH_PROFILE" <<'EOF_BP'
 
 # --- system-audit on SSH login (background) ---
