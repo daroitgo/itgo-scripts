@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.45"
+MASTER_VERSION="1.2.46"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.15"
@@ -1498,29 +1498,28 @@ is_supported_type() {
 
 collect_sources() {
   local type="${1:?}"
-  local candidate
+  local find_pattern candidate
   sources=()
 
-  shopt -s nullglob
   case "$type" in
-    edm) candidates=(/srv/edm*) ;;
-    zm) candidates=(/srv/*zm_docker*) ;;
-    mpi) candidates=(/srv/*mpi*) ;;
-    p1adapter) candidates=(/srv/*p1adapter*) ;;
+    edm) find_pattern="edm*" ;;
+    zm) find_pattern="*zm_docker*" ;;
+    mpi) find_pattern="*mpi*" ;;
+    p1adapter) find_pattern="*p1adapter*" ;;
     *) return 1 ;;
   esac
-  shopt -u nullglob
 
-  for candidate in "${candidates[@]}"; do
-    [[ -d "$candidate" ]] && sources+=("$candidate")
-  done
+  [[ -d /srv ]] || return 0
+
+  while IFS= read -r candidate; do
+    sources+=("$candidate")
+  done < <(find /srv -mindepth 1 -maxdepth 1 -type d -iname "$find_pattern" -print 2>/dev/null | sort)
 }
 
 copy_type() {
   local type="${1:?}"
   local missing_is_error="${2:-1}"
   local pattern target src
-  local candidates=()
   local sources=()
 
   pattern="$(type_pattern "$type")"
