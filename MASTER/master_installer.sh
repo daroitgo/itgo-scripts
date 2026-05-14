@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.43"
+MASTER_VERSION="1.2.44"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.15"
@@ -1261,10 +1261,61 @@ run_module_as_itgo() {
   sudo -H -u "$TARGET_USER" bash "$script" "$@"
 }
 
+is_valid_amcs_ipv4() {
+  local ip="${1:-}"
+  local a b c d part
+
+  [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
+
+  IFS='.' read -r a b c d <<< "$ip"
+  for part in "$a" "$b" "$c" "$d"; do
+    [[ "$part" =~ ^[0-9]+$ ]] || return 1
+    ((part >= 0 && part <= 255)) || return 1
+  done
+
+  return 0
+}
+
+prompt_amcs_node_master_host() {
+  local config_file="$UTILITY_DIR/AMCS/amcs-node-master.host"
+  local current="" ans=""
+
+  if [[ -f "$config_file" ]]; then
+    current="$(head -n 1 "$config_file" 2>/dev/null | tr -d '[:space:]' || true)"
+  fi
+
+  while true; do
+    if [[ -n "$current" ]]; then
+      printf "AMCS node/slave: IP instalacji MASTER [%s] (Enter = zostaw): " "$current" >&2
+    else
+      printf "AMCS node/slave: podaj IP instalacji MASTER (Enter = pomiń, później użyj: AMCS -S <IP>): " >&2
+    fi
+
+    read -r ans || true
+    ans="${ans//$'\r'/}"
+    ans="${ans#"${ans%%[![:space:]]*}"}"
+    ans="${ans%"${ans##*[![:space:]]}"}"
+
+    if [[ -z "$ans" ]]; then
+      printf "%s\n" "$current"
+      return 0
+    fi
+
+    if is_valid_amcs_ipv4 "$ans"; then
+      printf "%s\n" "$ans"
+      return 0
+    fi
+
+    echo "[$(ts)] WARN: podaj poprawny adres IPv4, np. 10.10.10.150, albo Enter żeby pominąć." >&2
+  done
+}
+
 install_amcs_local_launchers() {
+  local node_master_host="${1:-}"
   local app_dir="$UTILITY_DIR/AMCS"
   local resources_dir="$app_dir/resources"
   local launcher="$app_dir/AMCS"
+  local node_master_host_file="$app_dir/amcs-node-master.host"
   local tools_dir="$UTILITY_DIR/TOOLS"
   local copy_prod_launcher="$tools_dir/cp-upg"
 
@@ -1273,20 +1324,107 @@ install_amcs_local_launchers() {
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$resources_dir"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$tools_dir"
 
+  if [[ -n "$node_master_host" ]]; then
+    printf "%s\n" "$node_master_host" > "$node_master_host_file"
+    chown "$TARGET_USER:$TARGET_USER" "$node_master_host_file" 2>/dev/null || true
+    chmod 0600 "$node_master_host_file" 2>/dev/null || true
+    add_summary "AMCS node/slave master host: $node_master_host"
+  else
+    add_summary "AMCS node/slave master host: not configured"
+  fi
+
   cat > "$launcher" <<'EOF_AMCS_LAUNCHER'
 #!/usr/bin/env bash
 set -euo pipefail 2>/dev/null || set -eu
 
 APP_DIR="${HOME}/UTILITY/AMCS"
+RESOURCES_DIR="${APP_DIR}/resources"
+NODE_MASTER_HOST_FILE="${APP_DIR}/amcs-node-master.host"
+
+usage() {
+  cat <<'EOF_USAGE'
+Usage:
+  AMCS
+      Run AMCS installer in main mode.
+
+  AMCS -S [MASTER_IP]
+  AMCS --slave [MASTER_IP]
+  AMCS --node [MASTER_IP]
+      Run AMCS installer in node/slave mode.
+      MASTER_IP can be provided as an argument or stored in:
+      ~/UTILITY/AMCS/amcs-node-master.host
+EOF_USAGE
+}
+
+is_valid_ipv4() {
+  local ip="${1:-}"
+  local a b c d part
+
+  [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
+
+  IFS='.' read -r a b c d <<< "$ip"
+  for part in "$a" "$b" "$c" "$d"; do
+    [[ "$part" =~ ^[0-9]+$ ]] || return 1
+    ((part >= 0 && part <= 255)) || return 1
+  done
+
+  return 0
+}
 
 cd "$APP_DIR"
-exec java \
-  -Dspring.profiles.active=main \
-  -Dapplication.installer.resources.dir="$HOME/UTILITY/AMCS/resources" \
-  -Dapplication.installer.master.cluster-port=5701 \
-  -Dserver.port=8090 \
-  -jar amcs-installer.jar \
-  "$@"
+
+mode="${1:-}"
+case "$mode" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+
+  -S|--slave|--node)
+    shift || true
+    master_host=""
+
+    if [[ -n "${1:-}" && "${1:-}" != -* ]]; then
+      master_host="$1"
+      shift || true
+    elif [[ -f "$NODE_MASTER_HOST_FILE" ]]; then
+      master_host="$(head -n 1 "$NODE_MASTER_HOST_FILE" 2>/dev/null | tr -d '[:space:]' || true)"
+    fi
+
+    if [[ -z "$master_host" ]]; then
+      echo "[ERROR] Brak IP instalacji MASTER dla trybu node/slave." >&2
+      echo "[INFO] Podaj IP jako argument, np.: AMCS -S 10.10.10.150" >&2
+      echo "[INFO] Albo zapisz IP w: $NODE_MASTER_HOST_FILE" >&2
+      exit 1
+    fi
+
+    if ! is_valid_ipv4 "$master_host"; then
+      echo "[ERROR] Niepoprawny adres IPv4 instalacji MASTER dla trybu node/slave: $master_host" >&2
+      echo "[INFO] Podaj IP jako argument, np.: AMCS -S 10.10.10.150" >&2
+      echo "[INFO] Albo popraw IP w: $NODE_MASTER_HOST_FILE" >&2
+      exit 1
+    fi
+
+    exec java \
+      -Dspring.profiles.active=node \
+      -Dapplication.installer.resources.dir="$RESOURCES_DIR" \
+      -Dapplication.installer.master.host="$master_host" \
+      -Dapplication.installer.master.cluster-port=5701 \
+      -Dapplication.installer.master.resources-port=8090 \
+      -jar amcs-installer.jar \
+      "$@"
+    ;;
+
+  *)
+    exec java \
+      -Dspring.profiles.active=main \
+      -Dapplication.installer.resources.dir="$RESOURCES_DIR" \
+      -Dapplication.installer.master.cluster-port=5701 \
+      -Dserver.port=8090 \
+      -jar amcs-installer.jar \
+      "$@"
+    ;;
+esac
 EOF_AMCS_LAUNCHER
 
   cat > "$copy_prod_launcher" <<'EOF_AMCS_COPY_PROD'
@@ -1412,9 +1550,11 @@ install_amcs_step() {
   UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
   TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
 
-  if prompt_yn "MODUŁ: AMCS (~/UTILITY/AMCS + resources + launcher AMCS + helper cp-upg + firewall public 8090/5701)?" "Y"; then
+  if prompt_yn "MODUŁ: AMCS (~/UTILITY/AMCS + resources + launcher AMCS/main+slave + helper cp-upg + firewall public 8090/5701)?" "Y"; then
+    local amcs_node_master_host=""
     ensure_amcs_java_runtime
-    install_amcs_local_launchers
+    amcs_node_master_host="$(prompt_amcs_node_master_host)"
+    install_amcs_local_launchers "$amcs_node_master_host"
     configure_amcs_firewall_public
     echo "[$(ts)] OK: AMCS done."
   else
