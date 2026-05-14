@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.46"
+MASTER_VERSION="1.2.47"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.15"
@@ -1316,13 +1316,10 @@ install_amcs_local_launchers() {
   local resources_dir="$app_dir/resources"
   local launcher="$app_dir/AMCS"
   local node_master_host_file="$app_dir/amcs-node-master.host"
-  local tools_dir="$UTILITY_DIR/TOOLS"
-  local copy_prod_launcher="$tools_dir/cp-upg"
 
   echo "[$(ts)] ACTION: install AMCS launchers into $app_dir"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$app_dir"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$resources_dir"
-  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$tools_dir"
 
   if [[ -n "$node_master_host" ]]; then
     printf "%s\n" "$node_master_host" > "$node_master_host_file"
@@ -1426,6 +1423,19 @@ case "$mode" in
     ;;
 esac
 EOF_AMCS_LAUNCHER
+
+  chown "$TARGET_USER:$TARGET_USER" "$launcher" 2>/dev/null || true
+  chmod 0700 "$launcher" 2>/dev/null || true
+
+  add_summary "AMCS launcher installed: ~/UTILITY/AMCS/AMCS"
+}
+
+install_cp_upg_helper() {
+  local tools_dir="$UTILITY_DIR/TOOLS"
+  local copy_prod_launcher="$tools_dir/cp-upg"
+
+  echo "[$(ts)] ACTION: install TOOLS launcher into $tools_dir"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$tools_dir"
 
   cat > "$copy_prod_launcher" <<'EOF_AMCS_COPY_PROD'
 #!/usr/bin/env bash
@@ -1598,11 +1608,23 @@ main() {
 main "$@"
 EOF_AMCS_COPY_PROD
 
-  chown "$TARGET_USER:$TARGET_USER" "$launcher" "$copy_prod_launcher" 2>/dev/null || true
-  chmod 0700 "$launcher" "$copy_prod_launcher" 2>/dev/null || true
+  chown "$TARGET_USER:$TARGET_USER" "$copy_prod_launcher" 2>/dev/null || true
+  chmod 0700 "$copy_prod_launcher" 2>/dev/null || true
 
-  add_summary "AMCS launcher installed: ~/UTILITY/AMCS/AMCS"
   add_summary "TOOLS launcher installed: ~/UTILITY/TOOLS/cp-upg"
+}
+
+install_cp_upg_step() {
+  if ! have_user; then
+    echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+    exit 1
+  fi
+
+  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+  [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+  UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+  install_cp_upg_helper
 }
 
 configure_amcs_firewall_public() {
@@ -1691,7 +1713,7 @@ install_amcs_step() {
   UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
   TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
 
-  if prompt_yn "MODUŁ: AMCS (~/UTILITY/AMCS + resources + launcher AMCS/main+slave + helper cp-upg + firewall public 8090/5701)?" "Y"; then
+  if prompt_yn "MODUŁ: AMCS (~/UTILITY/AMCS + resources + launcher AMCS/main+slave + firewall public 8090/5701)?" "Y"; then
     local amcs_node_master_host=""
     ensure_amcs_java_runtime
     amcs_node_master_host="$(prompt_amcs_node_master_host)"
@@ -2410,6 +2432,8 @@ main() {
     detected_modules="$(detect_installed_modules)"
     print_detected_modules_summary "$detected_modules"
 
+    install_cp_upg_helper
+
     if ! ensure_tmp_dir_for_module_actions; then
       echo "[$(ts)] WARN: nie udało się przygotować TMP_DIR dla update-only. Pomijam update-only."
       add_summary "Update-only: SKIP (cannot prepare TMP_DIR)"
@@ -2485,7 +2509,7 @@ main() {
     fi
   fi
 
-  section "SEKCJA 1/6 - BOOTSTRAP"
+  section "SEKCJA 1/8 - BOOTSTRAP"
   if prompt_yn "BOOTSTRAP: user '$TARGET_USER' + katalogi HOME + (opcjonalnie) sudoers + ACL + docker group?" "Y"; then
     bootstrap_block
   else
@@ -2495,14 +2519,14 @@ main() {
 
   install_master_launcher
 
-  section "SEKCJA 2/6 - NARZĘDZIA SYSTEMOWE"
+  section "SEKCJA 2/8 - NARZĘDZIA SYSTEMOWE"
   if prompt_yn "KROK: sprawdzić nano, mc, rsync, dos2unix, jq, wget i doinstalować brakujące?" "Y"; then
     ensure_basic_tools_step
   else
     echo "[$(ts)] SKIP: pakiety bazowe."
   fi
 
-  section "SEKCJA 3/6 - ZACHOWANIE SHELLA"
+  section "SEKCJA 3/8 - ZACHOWANIE SHELLA"
   if prompt_yn "KROK: ustawić w ~/.bash_logout: history -c && history -w ?" "Y"; then
     if ! have_user; then
       echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
@@ -2536,11 +2560,11 @@ main() {
   downloader_app_sh="$TMP_DIR/upg_installer.sh"
   upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
 
-  section "SEKCJA 4/6 - MODUŁY CORE"
+  section "SEKCJA 4/8 - MODUŁY CORE"
   install_status_step "$status_sh"
   install_tseq_step "$tseq_sh"
 
-  section "SEKCJA 5/7 - HOOKI I NARZĘDZIA UŻYTKOWE"
+  section "SEKCJA 5/8 - HOOKI I NARZĘDZIA UŻYTKOWE"
   if [[ "$HISTORY_CLEAR_ON_LOGOUT_ENABLED" == "1" ]]; then
     echo "[$(ts)] SKIP: SSH history prompt pominięty, bo włączono czyszczenie historii przy wylogowaniu."
     add_summary "Shell: SSH history prompt skipped because history clear on logout is enabled"
@@ -2564,10 +2588,18 @@ main() {
   install_downloader_app_step "$downloader_app_sh"
   install_upgbuilder_step "$upgbuilder_sh"
 
-  section "SEKCJA 6/7 - AMCS"
+  section "SEKCJA 6/8 - TOOLS"
+  if prompt_yn "MODUŁ: TOOLS/cp-upg (lokalny helper kopiowania produkcji do ~/UPG/EDM, ZM, MPI, P1ADAPTER)?" "Y"; then
+    install_cp_upg_step
+  else
+    echo "[$(ts)] SKIP: TOOLS/cp-upg."
+    add_summary "TOOLS/cp-upg: skipped by user"
+  fi
+
+  section "SEKCJA 7/8 - AMCS"
   install_amcs_step
 
-  section "SEKCJA 7/7 - PORZĄDKI KOŃCOWE"
+  section "SEKCJA 8/8 - PORZĄDKI KOŃCOWE"
   cleanup_downloaded_installers
 
   echo "[$(ts)] DONE."
