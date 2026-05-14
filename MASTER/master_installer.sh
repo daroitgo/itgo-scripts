@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.44"
+MASTER_VERSION="1.2.45"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.15"
@@ -1431,30 +1431,172 @@ EOF_AMCS_LAUNCHER
 #!/usr/bin/env bash
 set -euo pipefail 2>/dev/null || set -eu
 
-TARGET_DIR="$HOME/UPG/EDM"
+SUPPORTED_TYPES=(edm zm mpi p1adapter)
 
 ts() { date "+%F %T"; }
 
-shopt -s nullglob
-sources=(/srv/edm*)
+usage() {
+  cat <<'EOF_USAGE'
+Usage:
+  cp-upg
+      Detect and copy all supported UPG production types found in /srv.
 
-if [[ "${#sources[@]}" -eq 0 ]]; then
-  echo "[$(ts)] ERROR: no /srv/edm* sources found." >&2
-  exit 1
-fi
+  cp-upg <type>
+      Copy only the selected type.
 
-echo "[$(ts)] INFO: starting UPG production copy to $TARGET_DIR"
-mkdir -p "$TARGET_DIR"
+  cp-upg --list
+      Show supported types, source patterns, and target directories.
 
-echo "[$(ts)] INFO: cleaning contents of $TARGET_DIR"
-find "$TARGET_DIR" -mindepth 1 -exec rm -rf -- {} +
+Supported types:
+  edm
+  zm
+  mpi
+  p1adapter
+EOF_USAGE
+}
 
-for src in "${sources[@]}"; do
-  echo "[$(ts)] INFO: copying contents of $src -> $TARGET_DIR/"
-  cp -a "$src"/. "$TARGET_DIR"/
-done
+type_pattern() {
+  case "$1" in
+    edm) printf "/srv/edm*\n" ;;
+    zm) printf "/srv/*zm_docker*\n" ;;
+    mpi) printf "/srv/*mpi*\n" ;;
+    p1adapter) printf "/srv/*p1adapter*\n" ;;
+    *) return 1 ;;
+  esac
+}
 
-echo "[$(ts)] OK: UPG production copy completed successfully."
+type_target() {
+  case "$1" in
+    edm) printf "%s/UPG/EDM\n" "$HOME" ;;
+    zm) printf "%s/UPG/ZM\n" "$HOME" ;;
+    mpi) printf "%s/UPG/MPI\n" "$HOME" ;;
+    p1adapter) printf "%s/UPG/P1ADAPTER\n" "$HOME" ;;
+    *) return 1 ;;
+  esac
+}
+
+print_supported_types() {
+  local type pattern target
+
+  printf "%-10s %-22s %s\n" "TYPE" "SOURCE_PATTERN" "TARGET_DIR"
+  for type in "${SUPPORTED_TYPES[@]}"; do
+    pattern="$(type_pattern "$type")"
+    target="$(type_target "$type")"
+    printf "%-10s %-22s %s\n" "$type" "$pattern" "$target"
+  done
+}
+
+is_supported_type() {
+  local requested="${1:-}" type
+
+  for type in "${SUPPORTED_TYPES[@]}"; do
+    [[ "$requested" == "$type" ]] && return 0
+  done
+
+  return 1
+}
+
+collect_sources() {
+  local type="${1:?}"
+  local candidate
+  sources=()
+
+  shopt -s nullglob
+  case "$type" in
+    edm) candidates=(/srv/edm*) ;;
+    zm) candidates=(/srv/*zm_docker*) ;;
+    mpi) candidates=(/srv/*mpi*) ;;
+    p1adapter) candidates=(/srv/*p1adapter*) ;;
+    *) return 1 ;;
+  esac
+  shopt -u nullglob
+
+  for candidate in "${candidates[@]}"; do
+    [[ -d "$candidate" ]] && sources+=("$candidate")
+  done
+}
+
+copy_type() {
+  local type="${1:?}"
+  local missing_is_error="${2:-1}"
+  local pattern target src
+  local candidates=()
+  local sources=()
+
+  pattern="$(type_pattern "$type")"
+  target="$(type_target "$type")"
+  collect_sources "$type"
+
+  if [[ "${#sources[@]}" -eq 0 ]]; then
+    if [[ "$missing_is_error" == "1" ]]; then
+      echo "[$(ts)] ERROR: no sources found for type '$type' using pattern $pattern." >&2
+      echo "[$(ts)] INFO: target was not cleaned: $target" >&2
+    else
+      echo "[$(ts)] INFO: no sources found for type '$type' using pattern $pattern; skipping."
+    fi
+    return 1
+  fi
+
+  echo "[$(ts)] INFO: starting UPG production copy for $type to $target"
+  mkdir -p "$target"
+
+  echo "[$(ts)] INFO: cleaning contents of $target"
+  find "$target" -mindepth 1 -exec rm -rf -- {} +
+
+  for src in "${sources[@]}"; do
+    echo "[$(ts)] INFO: copying contents of $src -> $target/"
+    cp -a "$src"/. "$target"/
+  done
+
+  echo "[$(ts)] OK: UPG production copy for $type completed successfully."
+}
+
+main() {
+  local arg="${1:-}"
+  local type
+  local copied=0
+
+  case "$arg" in
+    -h|--help)
+      usage
+      return 0
+      ;;
+    --list)
+      print_supported_types
+      return 0
+      ;;
+    "")
+      for type in "${SUPPORTED_TYPES[@]}"; do
+        if copy_type "$type" 0; then
+          copied=$((copied + 1))
+        fi
+      done
+
+      if [[ "$copied" -eq 0 ]]; then
+        echo "[$(ts)] ERROR: no supported UPG production sources found in /srv." >&2
+        return 1
+      fi
+      ;;
+    *)
+      type="${arg,,}"
+      if [[ "$#" -gt 1 ]]; then
+        echo "[$(ts)] ERROR: too many arguments." >&2
+        usage >&2
+        return 1
+      fi
+
+      if ! is_supported_type "$type"; then
+        echo "[$(ts)] ERROR: unsupported type '$arg'." >&2
+        echo "[$(ts)] INFO: use 'cp-upg --list' to show supported types." >&2
+        return 1
+      fi
+
+      copy_type "$type"
+      ;;
+  esac
+}
+
+main "$@"
 EOF_AMCS_COPY_PROD
 
   chown "$TARGET_USER:$TARGET_USER" "$launcher" "$copy_prod_launcher" 2>/dev/null || true
