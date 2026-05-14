@@ -37,14 +37,15 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.47"
+MASTER_VERSION="1.2.48"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
-STATUS_VERSION="3.12.15"
+STATUS_VERSION="3.12.16"
 CLEANUP_VERSION="1.0.3"
 TSEQ_VERSION="3.12.9"
 DOWNLOADER_APP_VERSION="1.0.4"
 UPGBUILDER_VERSION="0.1.11"
+SERVICEGUARD_VERSION="0.1.1"
 
 MODE="install"
 UPDATE_ONLY_MODE="0"
@@ -65,6 +66,7 @@ CLEANUP_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/cl
 TSEQ_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/tseq-${TSEQ_VERSION}/TSEQ/tseq_installer_public.sh"
 DOWNLOADER_APP_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/downloader_app-${DOWNLOADER_APP_VERSION}/DOWNLOADER_APP/upg_installer.sh"
 UPGBUILDER_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/upgbuilder-${UPGBUILDER_VERSION}/UPGBUILDER/upgbuilder.sh"
+SERVICEGUARD_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/serviceguard-${SERVICEGUARD_VERSION}/SERVICEGUARD/serviceguard_installer_public.sh"
 # <<< AUTO-MODULE-VERSIONS END <<<
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,6 +86,7 @@ CLEANUP_LOCAL_PATH="${SOURCE_DIR}/CLEANUP/cleanup_installer_public.sh"
 TSEQ_LOCAL_PATH="${SOURCE_DIR}/TSEQ/tseq_installer_public.sh"
 DOWNLOADER_APP_LOCAL_PATH="${SOURCE_DIR}/DOWNLOADER_APP/upg_installer.sh"
 UPGBUILDER_LOCAL_PATH="${SOURCE_DIR}/UPGBUILDER/upgbuilder.sh"
+SERVICEGUARD_LOCAL_PATH="${SOURCE_DIR}/SERVICEGUARD/serviceguard_installer_public.sh"
 UPGBUILDER_LOCAL_MAP="${SOURCE_DIR}/UPGBUILDER/upgbuilder.map"
 UPGBUILDER_LOCAL_TEMPLATE_DIR="${SOURCE_DIR}/UPGBUILDER/template"
 
@@ -588,6 +591,7 @@ start_final_logging_if_possible() {
   echo "[$(ts)]   TSEQ          : $TSEQ_VERSION"
   echo "[$(ts)]   DOWNLOADER_APP: $DOWNLOADER_APP_VERSION"
   echo "[$(ts)]   UPGBUILDER    : $UPGBUILDER_VERSION"
+  echo "[$(ts)]   SERVICEGUARD  : $SERVICEGUARD_VERSION"
 
   if [[ -f "$TMP_LOG" ]]; then
     echo "[$(ts)] --- pre-log (from $TMP_LOG) ---"
@@ -640,6 +644,7 @@ version_file_for_module() {
     TSEQ)           printf "%s\n" "$ITGO_HOME/UTILITY/TSEQ/.tseq_version" ;;
     DOWNLOADER_APP) printf "%s\n" "$ITGO_HOME/UTILITY/DOWNLOADER_APP/.downloader_version" ;;
     UPGBUILDER)     printf "%s\n" "$ITGO_HOME/UTILITY/UPGbuilder/.upgbuilder_version" ;;
+    SERVICEGUARD)   printf "%s\n" "$ITGO_HOME/UTILITY/SERVICEGUARD/.serviceguard_version" ;;
     *) return 1 ;;
   esac
 }
@@ -653,6 +658,7 @@ target_version_for_module() {
     TSEQ)           printf "%s\n" "$TSEQ_VERSION" ;;
     DOWNLOADER_APP) printf "%s\n" "$DOWNLOADER_APP_VERSION" ;;
     UPGBUILDER)     printf "%s\n" "$UPGBUILDER_VERSION" ;;
+    SERVICEGUARD)   printf "%s\n" "$SERVICEGUARD_VERSION" ;;
     *) return 1 ;;
   esac
 }
@@ -709,6 +715,9 @@ module_health_for_module() {
     UPGBUILDER)
       [[ -d "$ITGO_HOME/UTILITY/UPGbuilder" && -f "$version_file" && -x "$ITGO_HOME/UTILITY/UPGbuilder/upgbuilder.sh" && -x "$ITGO_HOME/UTILITY/UPGbuilder/bin/upgbuilder" ]] && echo "OK" || echo "BROKEN"
       ;;
+    SERVICEGUARD)
+      [[ -d "$ITGO_HOME/UTILITY/SERVICEGUARD" && -f "$version_file" && -x "$ITGO_HOME/UTILITY/SERVICEGUARD/serviceguard.sh" && -x "$ITGO_HOME/UTILITY/TOOLS/svcguard" ]] && echo "OK" || echo "BROKEN"
+      ;;
     *)
       echo "UNKNOWN"
       ;;
@@ -734,7 +743,7 @@ compare_versions() {
 }
 
 detect_installed_modules() {
-  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER)
+  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER SERVICEGUARD)
   local module installed_version target_version health
 
   for module in "${modules[@]}"; do
@@ -748,7 +757,7 @@ detect_installed_modules() {
 }
 
 any_itgo_module_installed() {
-  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER)
+  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER SERVICEGUARD)
   local module
 
   for module in "${modules[@]}"; do
@@ -2212,6 +2221,58 @@ install_upgbuilder_step() {
   fi
 }
 
+install_serviceguard_step() {
+  local serviceguard_sh="${1:?}"
+
+  if should_install_or_update_module "SERVICEGUARD"; then
+    if [[ "$MODULE_DECISION" == "install" ]]; then
+      if prompt_yn "MODUŁ: SERVICEGUARD (lokalny svcguard + tworzenie systemd usług tylko po jawnym --apply)?" "Y"; then
+        ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+
+        if ! have_user; then
+          echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+          exit 1
+        fi
+
+        ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+        [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+        UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+        TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+
+        [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+        [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+
+        download_to_tmp "$SERVICEGUARD_URL" "$serviceguard_sh" "$SERVICEGUARD_LOCAL_PATH"
+        run_module_root "$serviceguard_sh" "$TARGET_USER"
+        echo "[$(ts)] OK: SERVICEGUARD done."
+      else
+        echo "[$(ts)] SKIP: SERVICEGUARD."
+      fi
+    else
+      ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+
+      if ! have_user; then
+        echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+        exit 1
+      fi
+
+      ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+      [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+      UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+      TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+
+      [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+      [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+
+      download_to_tmp "$SERVICEGUARD_URL" "$serviceguard_sh" "$SERVICEGUARD_LOCAL_PATH"
+      run_module_root "$serviceguard_sh" "$TARGET_USER"
+      echo "[$(ts)] OK: SERVICEGUARD done."
+    fi
+  fi
+}
+
 bootstrap_block() {
   ensure_user_and_password_if_missing
   ensure_home_dirs
@@ -2286,10 +2347,11 @@ prompt_uninstall_module_choice() {
   echo "3) TSEQ" >&2
   echo "4) DOWNLOADER_APP" >&2
   echo "5) UPGBUILDER" >&2
+  echo "6) SERVICEGUARD" >&2
   echo "q) Anuluj uninstall" >&2
 
   while true; do
-    printf "%s" "Wybierz [1-5/q]: " >&2
+    printf "%s" "Wybierz [1-6/q]: " >&2
     read -r ans || true
     case "$ans" in
       1) echo "STATUS"; return 0 ;;
@@ -2297,8 +2359,9 @@ prompt_uninstall_module_choice() {
       3) echo "TSEQ"; return 0 ;;
       4) echo "DOWNLOADER_APP"; return 0 ;;
       5) echo "UPGBUILDER"; return 0 ;;
+      6) echo "SERVICEGUARD"; return 0 ;;
       q|Q) echo "cancel"; return 0 ;;
-      *) echo "Wpisz liczbę od 1 do 5 albo q." >&2 ;;
+      *) echo "Wpisz liczbę od 1 do 6 albo q." >&2 ;;
     esac
   done
 }
@@ -2375,8 +2438,18 @@ uninstall_upgbuilder_step() {
   add_summary "Uninstall: UPGBUILDER"
 }
 
+uninstall_serviceguard_step() {
+  local serviceguard_sh="${1:?}"
+
+  ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module uninstall."; exit 1; }
+  download_to_tmp "$SERVICEGUARD_URL" "$serviceguard_sh" "$SERVICEGUARD_LOCAL_PATH"
+  run_module_root "$serviceguard_sh" --uninstall "$TARGET_USER"
+  echo "[$(ts)] OK: SERVICEGUARD uninstall done."
+  add_summary "Uninstall: SERVICEGUARD"
+}
+
 run_single_module_uninstall() {
-  local module="${1:?}" status_sh="${2:?}" cleanup_sh="${3:?}" tseq_sh="${4:?}"
+  local module="${1:?}" status_sh="${2:?}" cleanup_sh="${3:?}" tseq_sh="${4:?}" serviceguard_sh="${5:?}"
 
   case "$module" in
     STATUS)         uninstall_status_step "$status_sh" ;;
@@ -2384,18 +2457,20 @@ run_single_module_uninstall() {
     TSEQ)           uninstall_tseq_step "$tseq_sh" ;;
     DOWNLOADER_APP) uninstall_downloader_app_step ;;
     UPGBUILDER)     uninstall_upgbuilder_step ;;
+    SERVICEGUARD)   uninstall_serviceguard_step "$serviceguard_sh" ;;
     *) echo "[$(ts)] ERROR: unknown module for uninstall: $module"; exit 1 ;;
   esac
 }
 
 run_all_module_uninstalls() {
-  local status_sh="${1:?}" cleanup_sh="${2:?}" tseq_sh="${3:?}"
+  local status_sh="${1:?}" cleanup_sh="${2:?}" tseq_sh="${3:?}" serviceguard_sh="${4:?}"
 
   uninstall_status_step "$status_sh"
   uninstall_cleanup_step "$cleanup_sh"
   uninstall_tseq_step "$tseq_sh"
   uninstall_downloader_app_step
   uninstall_upgbuilder_step
+  uninstall_serviceguard_step "$serviceguard_sh"
 }
 
 section() {
@@ -2407,7 +2482,7 @@ section() {
 
 main() {
   local detected_modules="" uninstall_scope="" uninstall_module=""
-  local status_sh cleanup_sh tseq_sh downloader_app_sh upgbuilder_sh
+  local status_sh cleanup_sh tseq_sh downloader_app_sh upgbuilder_sh serviceguard_sh
 
   need_root
   prelog "BEGIN: ITGO Master Installer v$MASTER_VERSION user=$TARGET_USER"
@@ -2446,6 +2521,7 @@ main() {
     tseq_sh="$TMP_DIR/tseq_installer_public.sh"
     downloader_app_sh="$TMP_DIR/upg_installer.sh"
     upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
+    serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
 
     section "UPDATE-ONLY - MODUŁY"
     install_status_step "$status_sh"
@@ -2453,6 +2529,7 @@ main() {
     install_cleanup_step "$cleanup_sh"
     install_downloader_app_step "$downloader_app_sh"
     install_upgbuilder_step "$upgbuilder_sh"
+    install_serviceguard_step "$serviceguard_sh"
     install_amcs_step
 
     cleanup_tmp_installers_no_prompt
@@ -2475,11 +2552,12 @@ main() {
       tseq_sh="$TMP_DIR/tseq_installer_public.sh"
       downloader_app_sh="$TMP_DIR/upg_installer.sh"
       upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
+      serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
 
       uninstall_scope="$(prompt_uninstall_scope)"
       if [[ "$uninstall_scope" == "all" ]]; then
         add_summary "Wybrany uninstall scope: all"
-        run_all_module_uninstalls "$status_sh" "$cleanup_sh" "$tseq_sh"
+        run_all_module_uninstalls "$status_sh" "$cleanup_sh" "$tseq_sh" "$serviceguard_sh"
         restore_master_shell_settings
         cleanup_tmp_installers_after_uninstall
         print_summary
@@ -2491,7 +2569,7 @@ main() {
           echo "[$(ts)] SKIP: uninstall cancelled."
           add_summary "Uninstall: cancelled at module selection"
         else
-          run_single_module_uninstall "$uninstall_module" "$status_sh" "$cleanup_sh" "$tseq_sh"
+          run_single_module_uninstall "$uninstall_module" "$status_sh" "$cleanup_sh" "$tseq_sh" "$serviceguard_sh"
           cleanup_tmp_installers_after_uninstall
           print_summary
           exit 0
@@ -2559,6 +2637,7 @@ main() {
   tseq_sh="$TMP_DIR/tseq_installer_public.sh"
   downloader_app_sh="$TMP_DIR/upg_installer.sh"
   upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
+  serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
 
   section "SEKCJA 4/8 - MODUŁY CORE"
   install_status_step "$status_sh"
@@ -2587,6 +2666,7 @@ main() {
   install_cleanup_step "$cleanup_sh"
   install_downloader_app_step "$downloader_app_sh"
   install_upgbuilder_step "$upgbuilder_sh"
+  install_serviceguard_step "$serviceguard_sh"
 
   section "SEKCJA 6/8 - TOOLS"
   if prompt_yn "MODUŁ: TOOLS/cp-upg (lokalny helper kopiowania produkcji do ~/UPG/EDM, ZM, MPI, P1ADAPTER)?" "Y"; then
