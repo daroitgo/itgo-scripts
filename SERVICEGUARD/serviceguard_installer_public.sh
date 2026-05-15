@@ -7,7 +7,7 @@ fi
 
 set -euo pipefail 2>/dev/null || set -eu
 
-VERSION="0.1.2"
+VERSION="0.1.3"
 
 MODE="install"
 TARGET_USER="${SUDO_USER:-${USER:-itgo}}"
@@ -189,6 +189,27 @@ path_has_technical_shadow_component() {
   return 1
 }
 
+is_wildfly_hazelcast_helper_dir() {
+  local path="${1:?}" base part has_wildfly_context
+  local -a path_parts
+
+  base="$(basename "$path")"
+  [ "$(lower "$base")" = "hazelcast" ] || return 1
+
+  has_wildfly_context="0"
+  IFS='/' read -r -a path_parts <<< "$path"
+  for part in "${path_parts[@]}"; do
+    case "$(lower "$part")" in
+      *wildfly*|*jboss*)
+        has_wildfly_context="1"
+        break
+        ;;
+    esac
+  done
+
+  [ "$has_wildfly_context" = "1" ]
+}
+
 find_scannable_app_dirs() {
   local root="${1:?}"
   find "$root" -maxdepth 4 \( -iname '*_NEW' -o -iname '*_OLD' \) -prune -o -type d -print0 2>/dev/null || true
@@ -288,6 +309,10 @@ append_app() {
   local app_type="${1:?}" app_path="${2:?}" expected="${3:-}" found status existing
 
   if path_has_technical_shadow_component "$app_path"; then
+    return 0
+  fi
+
+  if [ "$app_type" = "docker-compose" ] && is_wildfly_hazelcast_helper_dir "$app_path"; then
     return 0
   fi
 
