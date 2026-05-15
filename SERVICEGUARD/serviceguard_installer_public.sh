@@ -7,7 +7,7 @@ fi
 
 set -euo pipefail 2>/dev/null || set -eu
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 
 MODE="install"
 TARGET_USER="${SUDO_USER:-${USER:-itgo}}"
@@ -162,6 +162,38 @@ compose_file_for_dir() {
   fi
 }
 
+is_technical_shadow_dir_name() {
+  local name="${1:-}" lower_name
+  name="${name##*/}"
+  lower_name="$(lower "$name")"
+
+  case "$lower_name" in
+    *_new|*_old)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+path_has_technical_shadow_component() {
+  local path="${1:?}" part
+  local -a path_parts
+  IFS='/' read -r -a path_parts <<< "$path"
+
+  for part in "${path_parts[@]}"; do
+    [ -n "$part" ] || continue
+    if is_technical_shadow_dir_name "$part"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_scannable_app_dirs() {
+  local root="${1:?}"
+  find "$root" -maxdepth 4 \( -iname '*_NEW' -o -iname '*_OLD' \) -prune -o -type d -print0 2>/dev/null || true
+}
+
 mapped_name_for_basename() {
   local base="${1:?}" lower_base suffix
   lower_base="$(lower "$base")"
@@ -254,6 +286,10 @@ unit_file_contains_path() {
 
 append_app() {
   local app_type="${1:?}" app_path="${2:?}" expected="${3:-}" found status existing
+
+  if path_has_technical_shadow_component "$app_path"; then
+    return 0
+  fi
 
   existing="|${APP_PATHS[*]-}|"
   if [[ "$existing" == *"|$app_path|"* ]]; then
@@ -349,7 +385,7 @@ scan_integration_platforms() {
           append_app "integration-platform" "$dir" "$expected"
           ;;
       esac
-    done < <(find "$root" -maxdepth 4 -type d -print0 2>/dev/null || true)
+    done < <(find_scannable_app_dirs "$root")
   done
 }
 
@@ -362,7 +398,7 @@ scan_wildfly() {
         expected="$(expected_for_app "wildfly" "$dir" || true)"
         append_app "wildfly" "$dir" "$expected"
       fi
-    done < <(find "$root" -maxdepth 4 -type d -print0 2>/dev/null || true)
+    done < <(find_scannable_app_dirs "$root")
   done
 }
 
@@ -375,7 +411,7 @@ scan_docker_compose() {
       [ -n "${compose_file:-}" ] || continue
       expected="$(expected_for_app "docker-compose" "$dir" || true)"
       append_app "docker-compose" "$dir" "$expected"
-    done < <(find "$root" -maxdepth 4 -type d -print0 2>/dev/null || true)
+    done < <(find_scannable_app_dirs "$root")
   done
 }
 
