@@ -7,7 +7,7 @@ fi
 
 set -euo pipefail 2>/dev/null || set -eu
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 
 MODE="install"
 TARGET_USER="${SUDO_USER:-${USER:-itgo}}"
@@ -59,10 +59,76 @@ require_target_user() {
   fi
 }
 
+ensure_at_scheduler_backend() {
+  local install_cmd=""
+
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: CERTSWAP installer must run as root because it installs/enables at/atd for scheduled jobs" >&2
+    return 1
+  fi
+
+  if command -v at >/dev/null 2>&1; then
+    echo "OK: at command is available"
+  else
+    echo "ACTION: at command is missing; installing package 'at'"
+    if command -v dnf >/dev/null 2>&1; then
+      install_cmd="dnf -y install at"
+    elif command -v yum >/dev/null 2>&1; then
+      install_cmd="yum -y install at"
+    elif command -v apt-get >/dev/null 2>&1; then
+      install_cmd="apt-get update && apt-get install -y at"
+    else
+      echo "ERROR: cannot install 'at'; supported package managers are dnf, yum, and apt-get" >&2
+      return 1
+    fi
+
+    echo "ACTION: running: $install_cmd"
+    case "$install_cmd" in
+      "dnf -y install at")
+        dnf -y install at
+        ;;
+      "yum -y install at")
+        yum -y install at
+        ;;
+      "apt-get update && apt-get install -y at")
+        apt-get update && apt-get install -y at
+        ;;
+    esac
+  fi
+
+  if ! command -v at >/dev/null 2>&1; then
+    echo "ERROR: at command is still unavailable after installation" >&2
+    return 1
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "ACTION: enabling and starting atd service"
+    if systemctl enable --now atd >/dev/null 2>&1; then
+      echo "OK: atd service enabled and started"
+    else
+      echo "WARN: systemctl enable --now atd failed; trying enable and start separately" >&2
+      systemctl enable atd
+      systemctl start atd
+    fi
+
+    if systemctl is-active --quiet atd; then
+      echo "OK: atd service is active"
+    else
+      echo "ERROR: atd service is not active after start attempt" >&2
+      return 1
+    fi
+  else
+    echo "WARN: systemctl is not available; cannot enable or verify atd service" >&2
+    return 1
+  fi
+}
+
 install_certswap() {
   local home_dir group_name utility_dir module_dir tools_dir jobs_dir history_dir app_script launcher version_file
 
   require_target_user
+  ensure_at_scheduler_backend
+
   home_dir="$(target_home)" || { echo "ERROR: cannot resolve HOME for '$TARGET_USER'" >&2; exit 1; }
   group_name="$(target_group)"
 
@@ -432,28 +498,26 @@ EOF_JOB
   echo "Exact at command:"
   echo "  $at_cmd"
 
-  if command -v at >/dev/null 2>&1; then
-    if prompt_yn "Register this job with at now?" "Y"; then
-      if at_output="$(at -t "$scheduled_at_value" -f "$job_file" 2>&1)"; then
-        echo "OK: job registered with at."
-        [ -n "${at_output:-}" ] && printf '%s\n' "$at_output"
-      else
-        echo "ERROR: at registration failed." >&2
-        [ -n "${at_output:-}" ] && printf '%s\n' "$at_output" >&2
-        echo "Run manually when ready:"
-        echo "  $at_cmd"
-      fi
-    else
-      echo "Run this command to register later:"
-      echo "  $at_cmd"
-    fi
+  if ! command -v at >/dev/null 2>&1; then
+    echo "ERROR: at is not available; job was NOT scheduled." >&2
+    echo "Emergency manual fallback after fixing scheduler backend:" >&2
+    echo "  $at_cmd" >&2
+    echo "Direct manual execution fallback:" >&2
+    echo "  bash $job_file" >&2
+    return 1
+  fi
+
+  if at_output="$(at -t "$scheduled_at_value" -f "$job_file" 2>&1)"; then
+    echo "OK: job registered with at."
+    [ -n "${at_output:-}" ] && printf '%s\n' "$at_output"
   else
-    echo
-    echo "WARN: at is not available on this system."
-    echo "Install/enable at and run:"
-    echo "  $at_cmd"
-    echo "Manual fallback:"
-    echo "  bash $job_file"
+    echo "ERROR: at registration failed; job was NOT scheduled." >&2
+    [ -n "${at_output:-}" ] && printf '%s\n' "$at_output" >&2
+    echo "Emergency manual fallback after fixing scheduler backend:" >&2
+    echo "  $at_cmd" >&2
+    echo "Direct manual execution fallback:" >&2
+    echo "  bash $job_file" >&2
+    return 1
   fi
 }
 
@@ -550,7 +614,9 @@ file_flow() {
     schedule_input="$(prompt_schedule_time)"
     scheduled_time_display="${schedule_input%%|*}"
     scheduled_at_value="${schedule_input#*|}"
-    write_job_script "$target" "$source" "$schedule_stamp" "$scheduled_time_display" "$scheduled_at_value"
+    if ! write_job_script "$target" "$source" "$schedule_stamp" "$scheduled_time_display" "$scheduled_at_value"; then
+      return 1
+    fi
     return 0
   fi
 
