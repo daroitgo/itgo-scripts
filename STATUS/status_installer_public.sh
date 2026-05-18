@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.16"
+VERSION="3.12.17"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -846,6 +846,7 @@ downloader_vf="$HOME/UTILITY/DOWNLOADER_APP/.downloader_version"
 upgbuilder_vf="$HOME/UTILITY/UPGbuilder/.upgbuilder_version"
 upg_cleanup_vf="$HOME/UTILITY/UPG_CLEANUP/.upg_cleanup_version"
 serviceguard_vf="$HOME/UTILITY/SERVICEGUARD/.serviceguard_version"
+certswap_vf="$HOME/UTILITY/CERTSWAP/.certswap_version"
 
 status_installed="$(module_state "$status_vf")"
 tseq_installed="$(module_state "$tseq_vf")"
@@ -853,6 +854,7 @@ downloader_installed="$(module_state "$downloader_vf")"
 upgbuilder_installed="$(module_state "$upgbuilder_vf")"
 upg_cleanup_installed="$(module_state "$upg_cleanup_vf")"
 serviceguard_installed="$(module_state "$serviceguard_vf")"
+certswap_installed="$(module_state "$certswap_vf")"
 
 inst_ver="$(read_version_file "$status_vf")"
 tseq_ver="$(read_version_file "$tseq_vf")"
@@ -860,6 +862,7 @@ downloader_ver="$(read_version_file "$downloader_vf")"
 upgbuilder_ver="$(read_version_file "$upgbuilder_vf")"
 upg_cleanup_ver="$(read_version_file "$upg_cleanup_vf")"
 serviceguard_ver="$(read_version_file "$serviceguard_vf")"
+certswap_ver="$(read_version_file "$certswap_vf")"
 
 [[ -n "${inst_ver:-}" ]] || inst_ver="UNKNOWN"
 [[ -n "${tseq_ver:-}" ]] || tseq_ver="UNKNOWN"
@@ -867,6 +870,7 @@ serviceguard_ver="$(read_version_file "$serviceguard_vf")"
 [[ -n "${upgbuilder_ver:-}" ]] || upgbuilder_ver="UNKNOWN"
 [[ -n "${upg_cleanup_ver:-}" ]] || upg_cleanup_ver="UNKNOWN"
 [[ -n "${serviceguard_ver:-}" ]] || serviceguard_ver="UNKNOWN"
+[[ -n "${certswap_ver:-}" ]] || certswap_ver="UNKNOWN"
 
 status_github_ver="$(github_latest_for "status-")"
 upg_cleanup_github_ver="$(github_latest_for "cleanup-")"
@@ -874,6 +878,7 @@ tseq_github_ver="$(github_latest_for "tseq-")"
 downloader_github_ver="$(github_latest_for "downloader_app-")"
 upgbuilder_github_ver="$(github_latest_for "upgbuilder-")"
 serviceguard_github_ver="$(github_latest_for "serviceguard-")"
+certswap_github_ver="$(github_latest_for "certswap-")"
 
 status_mod_state="$(module_state_text "$status_installed" "$inst_ver" "$status_github_ver")"
 upg_cleanup_mod_state="$(module_state_text "$upg_cleanup_installed" "$upg_cleanup_ver" "$upg_cleanup_github_ver")"
@@ -881,6 +886,7 @@ tseq_mod_state="$(module_state_text "$tseq_installed" "$tseq_ver" "$tseq_github_
 downloader_mod_state="$(module_state_text "$downloader_installed" "$downloader_ver" "$downloader_github_ver")"
 upgbuilder_mod_state="$(module_state_text "$upgbuilder_installed" "$upgbuilder_ver" "$upgbuilder_github_ver")"
 serviceguard_mod_state="$(module_state_text "$serviceguard_installed" "$serviceguard_ver" "$serviceguard_github_ver")"
+certswap_mod_state="$(module_state_text "$certswap_installed" "$certswap_ver" "$certswap_github_ver")"
 
 upg_cleanup_hook="NO"
 if [[ -f "$HOME/.bashrc" ]] && grep -qF "# >>> UPG XML cleanup (auto) >>>" "$HOME/.bashrc" 2>/dev/null; then
@@ -1210,6 +1216,7 @@ modules_body+="$(module_row "TSEQ" "${tseq_installed:-NO}" "${tseq_ver:-UNKNOWN}
 modules_body+="$(module_row "Downloader" "${downloader_installed:-NO}" "${downloader_ver:-UNKNOWN}" "${downloader_github_ver:-UNKNOWN}" "$downloader_mod_state")"$'\n'
 modules_body+="$(module_row "UPGbuilder" "${upgbuilder_installed:-NO}" "${upgbuilder_ver:-UNKNOWN}" "${upgbuilder_github_ver:-UNKNOWN}" "$upgbuilder_mod_state")"$'\n'
 modules_body+="$(module_row "SvcGuard" "${serviceguard_installed:-NO}" "${serviceguard_ver:-UNKNOWN}" "${serviceguard_github_ver:-UNKNOWN}" "$serviceguard_mod_state")"$'\n'
+modules_body+="$(module_row "CertSwap" "${certswap_installed:-NO}" "${certswap_ver:-UNKNOWN}" "${certswap_github_ver:-UNKNOWN}" "$certswap_mod_state")"$'\n'
 modules_body+="${DIM}UPGclean hook: bashrc:${upg_cleanup_hook}${RESET}"
 
 echo
