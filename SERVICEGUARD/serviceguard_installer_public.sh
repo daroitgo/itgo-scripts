@@ -7,7 +7,7 @@ fi
 
 set -euo pipefail 2>/dev/null || set -eu
 
-VERSION="0.1.3"
+VERSION="0.1.4"
 
 MODE="install"
 TARGET_USER="${SUDO_USER:-${USER:-itgo}}"
@@ -306,7 +306,7 @@ unit_file_contains_path() {
 }
 
 append_app() {
-  local app_type="${1:?}" app_path="${2:?}" expected="${3:-}" found status existing
+  local app_type="${1:?}" app_path="${2:?}" expected="${3:-}" found status existing legacy_found
 
   if path_has_technical_shadow_component "$app_path"; then
     return 0
@@ -321,24 +321,29 @@ append_app() {
     return 0
   fi
 
-  found="$(find_service_by_path "$app_path" || true)"
   if [ -z "$expected" ]; then
+    found="$(find_service_by_path "$app_path" || true)"
     status="UNKNOWN"
     expected="manual name required"
-  elif [ -n "$found" ] && [ "$found" = "$expected" ]; then
-    status="OK"
-  elif [ -n "$found" ] && [ "$found" != "$expected" ]; then
-    status="NAME MISMATCH"
   elif unit_file_contains_path "$expected" "$app_path"; then
     found="$expected"
     status="OK"
+    legacy_found="$(find_service_by_path "$app_path" || true)"
+    if [ -n "${legacy_found:-}" ] && [ "$legacy_found" != "$expected" ]; then
+      echo "INFO: legacy service $legacy_found also references $app_path; expected $expected is preferred" >&2
+    fi
   elif unit_file_exists "$expected"; then
     found="$expected"
     status="NAME CONFLICT"
   elif expected_collision_exists "$expected" "$app_path"; then
     status="SERVICE NAME COLLISION"
   else
-    status="MISSING"
+    found="$(find_service_by_path "$app_path" || true)"
+    if [ -n "$found" ]; then
+      status="NAME MISMATCH"
+    else
+      status="MISSING"
+    fi
   fi
 
   APP_TYPES+=("$app_type")
@@ -505,9 +510,9 @@ After=network.target
 [Service]
 Type=forking
 User=$service_user
-WorkingDirectory=$app_path
-ExecStart=$app_path/bin/startup.sh
-ExecStop=$app_path/bin/shutdown.sh
+WorkingDirectory=$app_path/apache-tomcat
+ExecStart=$app_path/apache-tomcat/bin/startup.sh
+ExecStop=$app_path/apache-tomcat/bin/shutdown.sh
 Restart=on-failure
 
 [Install]
@@ -630,21 +635,84 @@ resolve_apply_service() {
   esac
 }
 
+require_sudo_noninteractive() {
+  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    return 0
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "ERROR: sudo is required for --apply systemd operations." >&2
+    exit 1
+  fi
+  if ! sudo -n true >/dev/null 2>&1; then
+    echo "ERROR: --apply requires passwordless sudo for systemd/unit file operations." >&2
+    echo "Grant this user NOPASSWD sudo for writing systemd unit files and running systemctl." >&2
+    exit 1
+  fi
+}
+
+sudo_cmd() {
+  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    "$@"
+  else
+    sudo -n "$@"
+  fi
+}
+
+write_root_file() {
+  local target_file="${1:?}" tmp_file
+  tmp_file="$(mktemp)"
+  cat > "$tmp_file"
+  sudo_cmd install -m 0644 "$tmp_file" "$target_file"
+  sudo_cmd chmod 0644 "$target_file"
+  rm -f "$tmp_file"
+}
+
 write_unit() {
   local service="${1:?}" app_type="${2:?}" app_path="${3:?}" target_file
   target_file="$SYSTEMD_DIR/$service"
-  install -d -m 0755 "$SYSTEMD_DIR"
-  unit_content "$app_type" "$app_path" > "$target_file"
-  chmod 0644 "$target_file"
-  systemctl daemon-reload
+  sudo_cmd install -d -m 0755 "$SYSTEMD_DIR"
+  unit_content "$app_type" "$app_path" | write_root_file "$target_file"
+  sudo_cmd systemctl daemon-reload
+}
+
+handle_old_mismatch_service() {
+  local old_service="${1:?}" new_service="${2:?}" choice
+
+  echo "NAME MISMATCH old service handling" >&2
+  echo "Current/found: $old_service" >&2
+  echo "New/selected : $new_service" >&2
+  echo "[1] disable and stop old service" >&2
+  echo "[2] disable old service only" >&2
+  echo "[3] leave old service unchanged" >&2
+  printf 'Choose [1-3] (default 3): ' >&2
+  read -r choice || choice="3"
+  [ -n "${choice:-}" ] || choice="3"
+
+  case "$choice" in
+    1)
+      sudo_cmd systemctl disable --now "$old_service"
+      echo "OLD_SERVICE_STOPPED_DISABLED: $old_service"
+      if sudo_cmd systemctl reset-failed "$old_service"; then
+        echo "OLD_SERVICE_FAILED_STATE_RESET: $old_service"
+      else
+        echo "WARN: OLD_SERVICE_FAILED_STATE_RESET_FAILED: $old_service" >&2
+      fi
+      ;;
+    2)
+      sudo_cmd systemctl disable "$old_service"
+      echo "OLD_SERVICE_DISABLED: $old_service"
+      ;;
+    *)
+      echo "OLD_SERVICE_LEFT_UNCHANGED: $old_service"
+      ;;
+  esac
 }
 
 apply_apps() {
-  local idx service target_file status
+  local idx service status old_service
 
-  if [ "$MODE" = "apply" ] && [ "${EUID:-$(id -u)}" -ne 0 ]; then
-    echo "ERROR: --apply requires root because it writes to $SYSTEMD_DIR" >&2
-    exit 1
+  if [ "$MODE" = "apply" ]; then
+    require_sudo_noninteractive
   fi
 
   for idx in "${!APP_PATHS[@]}"; do
@@ -662,7 +730,7 @@ apply_apps() {
           echo "DRY RUN: manual service name required for ${APP_PATHS[$idx]}"
           ;;
         NAME\ MISMATCH)
-          echo "DRY RUN: --apply would ask how to handle ${APP_FOUND[$idx]:-unknown} vs ${APP_EXPECTED[$idx]}"
+          echo "DRY RUN: --apply would ask how to handle ${APP_FOUND[$idx]:-unknown} vs ${APP_EXPECTED[$idx]} and how to handle the old service"
           ;;
         NAME\ CONFLICT|SERVICE\ NAME\ COLLISION)
           echo "DRY RUN: --apply would require a custom service name or skip for ${APP_PATHS[$idx]}"
@@ -687,10 +755,10 @@ apply_apps() {
       APP_EXPECTED[$idx]="$service"
       APP_STATUS[$idx]="OK"
       if [ "$MODE" = "apply" ] && [ "$ENABLE_SERVICE" = "1" ]; then
-        systemctl enable "$service"
+        sudo_cmd systemctl enable "$service"
       fi
       if [ "$MODE" = "apply" ] && [ "$START_SERVICE" = "1" ]; then
-        systemctl start "$service"
+        sudo_cmd systemctl start "$service"
       fi
       continue
     fi
@@ -703,18 +771,22 @@ apply_apps() {
       continue
     fi
 
-    target_file="$SYSTEMD_DIR/$service"
+    old_service="${APP_FOUND[$idx]:-}"
 
     write_unit "$service" "${APP_TYPES[$idx]}" "${APP_PATHS[$idx]}"
     APP_EXPECTED[$idx]="$service"
     APP_FOUND[$idx]="$service"
     APP_STATUS[$idx]="CREATED"
 
+    if [ "$status" = "NAME MISMATCH" ] && [ -n "${old_service:-}" ] && [ "$service" != "$old_service" ]; then
+      handle_old_mismatch_service "$old_service" "$service"
+    fi
+
     if [ "$ENABLE_SERVICE" = "1" ]; then
-      systemctl enable "$service"
+      sudo_cmd systemctl enable "$service"
     fi
     if [ "$START_SERVICE" = "1" ]; then
-      systemctl start "$service"
+      sudo_cmd systemctl start "$service"
     fi
   done
 }
