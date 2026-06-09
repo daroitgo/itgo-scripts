@@ -6,7 +6,7 @@
 # ==========================================================
 # UPGBUILDER_VERSION={{UPGBUILDER_VERSION}}
 # TEMPLATE_NAME=template_update_platforms_zm.sh
-# TEMPLATE_VERSION=1.2.0
+# TEMPLATE_VERSION=1.3.0
 # RULE_NAME=platforms_zm
 # GENERATED_AT={{GENERATED_AT}}
 # GENERATED_HOST={{HOSTNAME}}
@@ -17,7 +17,7 @@ set -euo pipefail
 
 UPGBUILDER_VERSION="{{UPGBUILDER_VERSION}}"
 TEMPLATE_NAME="template_update_platforms_zm.sh"
-TEMPLATE_VERSION="1.2.0"
+TEMPLATE_VERSION="1.3.0"
 UPDATER_VERSION="${TEMPLATE_VERSION}"
 RULE_NAME="platforms_zm"
 TARGET_USER="{{TARGET_USER}}"
@@ -130,7 +130,7 @@ step_guard_compose_stopped() {
   local -a container_ids=()
   local -a running_containers=()
 
-  echo "[0/7] Sprawdzam, czy docelowy projekt Docker Compose jest zatrzymany: ${target_dir}"
+  echo "[0/8] Sprawdzam, czy docelowy projekt Docker Compose jest zatrzymany: ${target_dir}"
 
   if [[ ! -d "$target_dir" ]]; then
     echo "[ERROR] Nie można potwierdzić zatrzymania docelowej aplikacji."
@@ -280,7 +280,7 @@ calc_total_delta_bytes() {
 }
 
 step_clear_logs() {
-  echo "[1/7] Czyszczenie logów Tomcata dla platformy..."
+  echo "[1/8] Czyszczenie logów Tomcata dla platformy..."
   if [[ -d "${PLATFORM_DIR}/apache-tomcat/logs" ]]; then
     rm -rf "${PLATFORM_DIR}/apache-tomcat/logs/"* || true
   else
@@ -306,7 +306,7 @@ TODAY_BK=""
 NEW_BACKUP=""
 
 step_prepare_backup() {
-  echo "[2/7] Przygotowanie katalogu backupu..."
+  echo "[2/8] Przygotowanie katalogu backupu..."
   mkdir -p "$BACKUP_DIR"
 
   mapfile -t TO_DEL < <(ls -1dt "${BACKUP_DIR}"/*/ 2>/dev/null | tail -n +3 || true)
@@ -323,8 +323,27 @@ step_prepare_backup() {
   mkdir -p "$NEW_BACKUP"
 }
 
+step_backup_zm_docker() {
+  local zm_docker_name=""
+
+  echo "[3/8] Backup katalogu ZM Docker..."
+  if [[ -z "${NEW_BACKUP:-}" ]]; then
+    echo "[ERROR] Zmienna NEW_BACKUP nie jest ustawiona."
+    return 1
+  fi
+
+  if [[ ! -d "$ZM_DOCKER_DIR" ]]; then
+    echo "[WARN] Brak katalogu ZM Docker: ${ZM_DOCKER_DIR} (pomijam backup)"
+    return 0
+  fi
+
+  zm_docker_name="$(basename "$ZM_DOCKER_DIR")"
+  echo "[INFO] rsync ${ZM_DOCKER_DIR}/ -> ${NEW_BACKUP}/${zm_docker_name}/"
+  rsync -a "$ZM_DOCKER_DIR"/ "${NEW_BACKUP}/${zm_docker_name}/"
+}
+
 step_move_platform_to_backup() {
-  echo "[3/7] Przenoszenie katalogu platformy do backupu..."
+  echo "[4/8] Przenoszenie katalogu platformy do backupu..."
   if [[ -z "${NEW_BACKUP:-}" ]]; then
     echo "[ERROR] Zmienna NEW_BACKUP nie jest ustawiona."
     return 1
@@ -348,7 +367,7 @@ is_empty_src() {
 }
 
 step_sync_upg_to_zm() {
-  echo "[4/7] Synchronizacja ${UPG_DIR} -> ${ZM_DOCKER_DIR} ..."
+  echo "[5/8] Synchronizacja ${UPG_DIR} -> ${ZM_DOCKER_DIR} ..."
   sudo mkdir -p "$ZM_DOCKER_DIR"
 
   if is_empty_src; then
@@ -363,7 +382,7 @@ step_sync_upg_to_zm() {
 }
 
 step_rename_new_dirs() {
-  echo "[5/7] Zmiana nazw katalogów *_NEW..."
+  echo "[6/8] Zmiana nazw katalogów *_NEW..."
 
   shopt -s nullglob
   local dir new_name
@@ -391,7 +410,7 @@ step_rename_new_dirs() {
 }
 
 step_set_permissions() {
-  echo "[6/7] Nadawanie uprawnień 775 dla katalogu platformy..."
+  echo "[7/8] Nadawanie uprawnień 775 dla katalogu platformy..."
   if [[ -d "$PLATFORM_DIR" ]]; then
     sudo chmod -R 775 "$PLATFORM_DIR"
   else
@@ -400,7 +419,7 @@ step_set_permissions() {
 }
 
 step_docker_cleanup_restart_and_pull() {
-  echo "[7/7] Docker: akcje interaktywne + compose pull (w ${ZM_DOCKER_DIR})"
+  echo "[8/8] Docker: akcje interaktywne + compose pull (w ${ZM_DOCKER_DIR})"
 
   command -v docker >/dev/null 2>&1 || {
     echo "[ERROR] 'docker' nie znaleziony w PATH." >&2
@@ -545,6 +564,7 @@ step_docker_cleanup_restart_and_pull() {
 run_step "Guard: docelowy Compose zatrzymany"              step_guard_compose_stopped
 run_step "Czyszczenie logów"                               step_clear_logs
 run_step "Przygotowanie backupu"                           step_prepare_backup
+run_step "Backup ZM Docker"                                step_backup_zm_docker
 run_step "Przeniesienie platformy do backupu"              step_move_platform_to_backup
 run_step "Synchronizacja UPG -> ZM Docker"                 step_sync_upg_to_zm
 run_step "Zmiana nazw *_NEW"                               step_rename_new_dirs
