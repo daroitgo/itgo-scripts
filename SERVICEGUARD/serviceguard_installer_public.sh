@@ -7,7 +7,7 @@ fi
 
 set -euo pipefail 2>/dev/null || set -eu
 
-VERSION="0.1.4"
+VERSION="0.1.5"
 
 MODE="install"
 TARGET_USER="${SUDO_USER:-${USER:-itgo}}"
@@ -208,6 +208,20 @@ is_wildfly_hazelcast_helper_dir() {
   done
 
   [ "$has_wildfly_context" = "1" ]
+}
+
+path_is_nested_under_any_root() {
+  local path="${1:?}" root
+  shift || true
+
+  for root in "$@"; do
+    case "$path" in
+      "$root"/*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
 }
 
 find_scannable_app_dirs() {
@@ -434,14 +448,33 @@ scan_wildfly() {
 
 scan_docker_compose() {
   local root dir expected compose_file
+  local -a compose_dirs accepted_compose_roots
   for root in "${SCAN_ROOTS[@]}"; do
     [ -d "$root" ] || continue
+    compose_dirs=()
+    accepted_compose_roots=()
+
     while IFS= read -r -d '' dir; do
       compose_file="$(compose_file_for_dir "$dir" || true)"
       [ -n "${compose_file:-}" ] || continue
+      compose_dirs+=("$dir")
+    done < <(find_scannable_app_dirs "$root")
+
+    while IFS= read -r dir; do
+      [ -n "$dir" ] || continue
+      if path_has_technical_shadow_component "$dir"; then
+        continue
+      fi
+      if is_wildfly_hazelcast_helper_dir "$dir"; then
+        continue
+      fi
+      if path_is_nested_under_any_root "$dir" "${accepted_compose_roots[@]}"; then
+        continue
+      fi
       expected="$(expected_for_app "docker-compose" "$dir" || true)"
       append_app "docker-compose" "$dir" "$expected"
-    done < <(find_scannable_app_dirs "$root")
+      accepted_compose_roots+=("$dir")
+    done < <(printf '%s\n' "${compose_dirs[@]}" | awk '{ print length($0) "\t" $0 }' | sort -n -k1,1 | cut -f2-)
   done
 }
 
