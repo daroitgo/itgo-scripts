@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.55"
+MASTER_VERSION="1.2.56"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.17"
@@ -455,7 +455,7 @@ set -eu
 set -o pipefail 2>/dev/null || true
 
 target_user="${1:-itgo}"
-repo_api="https://api.github.com/repos/daroitgo/itgo-scripts/tags?per_page=100"
+repo_api="https://api.github.com/repos/daroitgo/itgo-scripts/git/matching-refs/tags/master-"
 tmp_script="$(mktemp)"
 
 cleanup() {
@@ -470,8 +470,8 @@ fi
 
 latest_tag="$(
   wget -qO- "$repo_api" \
-    | grep -o '"name":[[:space:]]*"master-[^"]*"' \
-    | sed 's/.*"name":[[:space:]]*"\(master-[^"]*\)"/\1/' \
+    | grep -o '"ref":[[:space:]]*"refs/tags/master-[^"]*"' \
+    | sed 's#.*"ref":[[:space:]]*"refs/tags/\(master-[^"]*\)".*#\1#' \
     | sort -V \
     | tail -n1
 )"
@@ -503,7 +503,7 @@ set -eu
 set -o pipefail 2>/dev/null || true
 
 target_user="${1:-itgo}"
-repo_api="https://api.github.com/repos/daroitgo/itgo-scripts/tags?per_page=100"
+repo_api="https://api.github.com/repos/daroitgo/itgo-scripts/git/matching-refs/tags/master-"
 tmp_script="$(mktemp)"
 
 cleanup() {
@@ -518,8 +518,8 @@ fi
 
 latest_tag="$(
   wget -qO- "$repo_api" \
-    | grep -o '"name":[[:space:]]*"master-[^"]*"' \
-    | sed 's/.*"name":[[:space:]]*"\(master-[^"]*\)"/\1/' \
+    | grep -o '"ref":[[:space:]]*"refs/tags/master-[^"]*"' \
+    | sed 's#.*"ref":[[:space:]]*"refs/tags/\(master-[^"]*\)".*#\1#' \
     | sort -V \
     | tail -n1
 )"
