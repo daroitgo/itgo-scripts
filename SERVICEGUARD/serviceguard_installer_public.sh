@@ -7,7 +7,7 @@ fi
 
 set -euo pipefail 2>/dev/null || set -eu
 
-VERSION="0.1.5"
+VERSION="0.1.6"
 
 MODE="install"
 TARGET_USER="${SUDO_USER:-${USER:-itgo}}"
@@ -460,6 +460,10 @@ scan_docker_compose() {
       compose_dirs+=("$dir")
     done < <(find_scannable_app_dirs "$root")
 
+    if [ "${#compose_dirs[@]}" -eq 0 ]; then
+      continue
+    fi
+
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue
       if path_has_technical_shadow_component "$dir"; then
@@ -468,7 +472,7 @@ scan_docker_compose() {
       if is_wildfly_hazelcast_helper_dir "$dir"; then
         continue
       fi
-      if path_is_nested_under_any_root "$dir" "${accepted_compose_roots[@]}"; then
+      if [ "${#accepted_compose_roots[@]}" -gt 0 ] && path_is_nested_under_any_root "$dir" "${accepted_compose_roots[@]}"; then
         continue
       fi
       expected="$(expected_for_app "docker-compose" "$dir" || true)"
