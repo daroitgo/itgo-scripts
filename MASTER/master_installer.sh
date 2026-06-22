@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.59"
+MASTER_VERSION="1.2.61"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.18"
@@ -860,6 +860,35 @@ cleanup_old_bash_backups() {
   done
 }
 
+is_safe_itgo_home_child_path() {
+  local path="${1:-}" home="${ITGO_HOME:-}"
+
+  [[ -n "$path" && -n "$home" ]] || return 1
+  [[ "$path" != "/" && "$home" != "/" ]] || return 1
+  [[ "$home" != "/root" ]] || return 1
+  [[ "$path" != "/root" ]] || return 1
+  [[ "$path" == "$home/"* ]] || return 1
+  return 0
+}
+
+is_safe_itgo_utility_path() {
+  local path="${1:-}" home="${ITGO_HOME:-}"
+
+  [[ -n "$path" && -n "$home" ]] || return 1
+  [[ "$path" != "/" && "$home" != "/" ]] || return 1
+  [[ "$home" != "/root" ]] || return 1
+  [[ "$path" == "$home/UTILITY" ]] || return 1
+  return 0
+}
+
+file_has_itgo_shell_marker() {
+  local file="${1:?}"
+
+  [[ -f "$file" ]] || return 1
+  grep -Eq 'ITGO LOCAL MODULE PATHS|ITGO HISTORY CLEAR ON LOGOUT|UPG XML cleanup|UTILITY/(MASTER|STATUS|TSEQ|DOWNLOADER_APP|UPGbuilder|AMCS)|/home/itgo/UPG' "$file" 2>/dev/null \
+    || { [[ -n "${ITGO_HOME:-}" ]] && grep -Fq "$ITGO_HOME/UPG" "$file" 2>/dev/null; }
+}
+
 ensure_user_and_password_if_missing() {
   if have_user; then
     prelog "OK: user '$TARGET_USER' exists (skip create/passwd)."
@@ -1180,7 +1209,9 @@ install_bash_logout_history_clear() {
   local BLOCK
   BLOCK=$(cat <<'BEOF'
 # >>> ITGO HISTORY CLEAR ON LOGOUT (auto) >>>
-history -c && history -w
+history -c 2>/dev/null || true
+history -w 2>/dev/null || true
+: > "$HOME/.bash_history" 2>/dev/null || true
 # <<< ITGO HISTORY CLEAR ON LOGOUT (auto) <<<
 BEOF
 )
@@ -1871,8 +1902,41 @@ remove_block_from_file() {
   rm -f "$tmp"
 }
 
+retain_bash_logout_history_clear_no_backup() {
+  local bl=""
+  local bl_start="# >>> ITGO HISTORY CLEAR ON LOGOUT (auto) >>>"
+  local bl_end="# <<< ITGO HISTORY CLEAR ON LOGOUT (auto) <<<"
+  local block
+
+  if [[ -z "${ITGO_HOME:-}" || "$ITGO_HOME" == "/" || "$ITGO_HOME" == "/root" ]]; then
+    add_summary "MASTER purge residual cleanup: SKIP history clear retain unsafe path"
+    return 0
+  fi
+
+  bl="$ITGO_HOME/.bash_logout"
+  if ! is_safe_itgo_home_child_path "$bl"; then
+    add_summary "MASTER purge residual cleanup: SKIP history clear retain unsafe path"
+    return 0
+  fi
+
+  block=$(cat <<'BEOF'
+# >>> ITGO HISTORY CLEAR ON LOGOUT (auto) >>>
+history -c 2>/dev/null || true
+history -w 2>/dev/null || true
+: > "$HOME/.bash_history" 2>/dev/null || true
+# <<< ITGO HISTORY CLEAR ON LOGOUT (auto) <<<
+BEOF
+)
+
+  touch "$bl"
+  remove_block_from_file "$bl" "$bl_start" "$bl_end"
+  printf "\n%s\n" "$block" >> "$bl"
+  chown "$TARGET_USER:$TARGET_USER" "$bl" 2>/dev/null || true
+  chmod 0644 "$bl" 2>/dev/null || true
+}
+
 restore_master_shell_settings() {
-  local bp bl launcher_dir install_launcher update_launcher
+  local bp br bl launcher_dir install_launcher update_launcher
   local legacy_install_launcher="/usr/local/bin/master-install"
   local legacy_update_launcher="/usr/local/bin/master-update"
   local bp_start="# >>> ITGO SSH HISTORY PROMPT (auto) >>>"
@@ -1881,6 +1945,8 @@ restore_master_shell_settings() {
   local legacy_path_end="# <<< ITGO MASTER PATH (auto) <<<"
   local path_start="# >>> ITGO LOCAL MODULE PATHS (auto) >>>"
   local path_end="# <<< ITGO LOCAL MODULE PATHS (auto) <<<"
+  local upg_xml_start="# >>> UPG XML cleanup (auto) >>>"
+  local upg_xml_end="# <<< UPG XML cleanup (auto) <<<"
   local bl_start="# >>> ITGO HISTORY CLEAR ON LOGOUT (auto) >>>"
   local bl_end="# <<< ITGO HISTORY CLEAR ON LOGOUT (auto) <<<"
 
@@ -1896,6 +1962,7 @@ restore_master_shell_settings() {
   fi
 
   bp="$ITGO_HOME/.bash_profile"
+  br="$ITGO_HOME/.bashrc"
   bl="$ITGO_HOME/.bash_logout"
   launcher_dir="$ITGO_HOME/UTILITY/MASTER"
   install_launcher="$launcher_dir/master-install"
@@ -1908,6 +1975,13 @@ restore_master_shell_settings() {
     remove_block_from_file "$bp" "$path_start" "$path_end"
     chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
     chmod 0644 "$bp" 2>/dev/null || true
+  fi
+
+  if [[ -f "$br" ]]; then
+    safe_backup "$br"
+    remove_block_from_file "$br" "$upg_xml_start" "$upg_xml_end"
+    chown "$TARGET_USER:$TARGET_USER" "$br" 2>/dev/null || true
+    chmod 0644 "$br" 2>/dev/null || true
   fi
 
   if [[ -f "$bl" ]]; then
@@ -1950,6 +2024,93 @@ restore_master_shell_settings() {
   fi
 
   add_summary "Restore shell settings MASTER: wykonane"
+}
+
+purge_master_residual_cleanup_all() {
+  local utility_dir config_dir config_parent backup_file backup_match
+  local shell_bases=(
+    "$ITGO_HOME/.bashrc"
+    "$ITGO_HOME/.bash_profile"
+    "$ITGO_HOME/.bash_logout"
+    "$ITGO_HOME/.profile"
+    "$ITGO_HOME/.zshrc"
+  )
+  local removed_any_backup=0
+
+  if ! have_user; then
+    add_summary "MASTER purge residual cleanup: SKIP (user missing)"
+    return 0
+  fi
+
+  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+  if [[ -z "${ITGO_HOME:-}" ]]; then
+    add_summary "MASTER purge residual cleanup: SKIP (cannot resolve home)"
+    return 0
+  fi
+  if [[ "$ITGO_HOME" == "/" || "$ITGO_HOME" == "/root" ]]; then
+    add_summary "MASTER purge residual cleanup: SKIP unsafe target home ($ITGO_HOME)"
+    return 0
+  fi
+
+  utility_dir="$ITGO_HOME/UTILITY"
+  if [[ -d "$utility_dir" ]]; then
+    if is_safe_itgo_utility_path "$utility_dir"; then
+      rm -rf -- "$utility_dir"
+      add_summary "MASTER purge residual cleanup: removed ~/UTILITY"
+    else
+      add_summary "MASTER purge residual cleanup: SKIP unsafe ~/UTILITY path"
+    fi
+  else
+    add_summary "MASTER purge residual cleanup: SKIP ~/UTILITY not present"
+  fi
+
+  config_dir="$ITGO_HOME/.config/itgo"
+  config_parent="$ITGO_HOME/.config"
+  if [[ -d "$config_dir" ]]; then
+    if is_safe_itgo_home_child_path "$config_dir"; then
+      rm -rf -- "$config_dir"
+      add_summary "MASTER purge residual cleanup: removed ~/.config/itgo"
+    else
+      add_summary "MASTER purge residual cleanup: SKIP unsafe ~/.config/itgo path"
+    fi
+  else
+    add_summary "MASTER purge residual cleanup: SKIP ~/.config/itgo not present"
+  fi
+
+  if [[ -d "$config_parent" ]]; then
+    if is_safe_itgo_home_child_path "$config_parent" && rmdir -- "$config_parent" 2>/dev/null; then
+      add_summary "MASTER purge residual cleanup: removed empty ~/.config"
+    else
+      add_summary "MASTER purge residual cleanup: retained ~/.config"
+    fi
+  fi
+
+  for backup_file in "${shell_bases[@]}"; do
+    backup_file="${backup_file}.bak"
+    if file_has_itgo_shell_marker "$backup_file"; then
+      rm -f -- "$backup_file"
+      add_summary "MASTER purge residual cleanup: removed shell backup ~/${backup_file#$ITGO_HOME/}"
+      removed_any_backup=1
+    fi
+  done
+
+  for backup_file in "${shell_bases[@]}"; do
+    for backup_match in "${backup_file}.bak."*; do
+      [[ -e "$backup_match" || -L "$backup_match" ]] || continue
+      if file_has_itgo_shell_marker "$backup_match"; then
+        rm -f -- "$backup_match"
+        add_summary "MASTER purge residual cleanup: removed shell backup ~/${backup_match#$ITGO_HOME/}"
+        removed_any_backup=1
+      fi
+    done
+  done
+
+  if [[ "$removed_any_backup" -eq 0 ]]; then
+    add_summary "MASTER purge residual cleanup: no ITGO shell backups found"
+  fi
+
+  retain_bash_logout_history_clear_no_backup
+  add_summary "MASTER purge residual cleanup: history clear retained"
 }
 
 install_ssh_history_prompt_block() {
@@ -2560,6 +2721,7 @@ main() {
         run_all_module_uninstalls "$status_sh" "$cleanup_sh" "$tseq_sh" "$serviceguard_sh"
         restore_master_shell_settings
         cleanup_tmp_installers_after_uninstall
+        purge_master_residual_cleanup_all
         print_summary
         exit 0
       elif [[ "$uninstall_scope" == "single" ]]; then
