@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.61"
+MASTER_VERSION="1.2.62"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.18"
@@ -878,6 +878,16 @@ is_safe_itgo_utility_path() {
   [[ "$path" != "/" && "$home" != "/" ]] || return 1
   [[ "$home" != "/root" ]] || return 1
   [[ "$path" == "$home/UTILITY" ]] || return 1
+  return 0
+}
+
+is_safe_itgo_upg_path() {
+  local path="${1:-}" home="${ITGO_HOME:-}"
+
+  [[ -n "$path" && -n "$home" ]] || return 1
+  [[ "$path" != "/" && "$home" != "/" ]] || return 1
+  [[ "$home" != "/root" ]] || return 1
+  [[ "$path" == "$home/UPG" ]] || return 1
   return 0
 }
 
@@ -2027,7 +2037,7 @@ restore_master_shell_settings() {
 }
 
 purge_master_residual_cleanup_all() {
-  local utility_dir config_dir config_parent backup_file backup_match
+  local utility_dir upg_dir config_dir config_parent backup_file backup_match
   local shell_bases=(
     "$ITGO_HOME/.bashrc"
     "$ITGO_HOME/.bash_profile"
@@ -2062,6 +2072,18 @@ purge_master_residual_cleanup_all() {
     fi
   else
     add_summary "MASTER purge residual cleanup: SKIP ~/UTILITY not present"
+  fi
+
+  upg_dir="$ITGO_HOME/UPG"
+  if [[ -d "$upg_dir" ]]; then
+    if is_safe_itgo_upg_path "$upg_dir"; then
+      rm -rf -- "$upg_dir"
+      add_summary "MASTER purge residual cleanup: removed ~/UPG"
+    else
+      add_summary "MASTER purge residual cleanup: SKIP unsafe ~/UPG path"
+    fi
+  else
+    add_summary "MASTER purge residual cleanup: SKIP ~/UPG not present"
   fi
 
   config_dir="$ITGO_HOME/.config/itgo"
