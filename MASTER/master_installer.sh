@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.62"
+MASTER_VERSION="1.2.63"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.18"
@@ -68,6 +68,7 @@ DOWNLOADER_APP_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_R
 UPGBUILDER_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/upgbuilder-${UPGBUILDER_VERSION}/UPGBUILDER/upgbuilder.sh"
 SERVICEGUARD_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/serviceguard-${SERVICEGUARD_VERSION}/SERVICEGUARD/serviceguard_installer_public.sh"
 # <<< AUTO-MODULE-VERSIONS END <<<
+CLIENT_CATALOG_URL="https://helpdesk.itgo.com.pl/nextcloud/index.php/s/FFbZwPNHtegWXo4/download"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="${SOURCE_DIR:-}"
@@ -931,6 +932,7 @@ ensure_home_dirs() {
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$ITGO_HOME/UPG"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$ITGO_HOME/BACKUP"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR/ITGO-CONFIG"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR/AMCS"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR/AMCS/resources"
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$LOG_DIR"
@@ -940,6 +942,188 @@ ensure_home_dirs() {
 
   cleanup_old_bash_backups
   start_final_logging_if_possible
+}
+
+json_escape_string() {
+  local s="${1:-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\r'/}"
+  s="${s//$'\n'/ }"
+  printf "%s" "$s"
+}
+
+prompt_client_identity_manual() {
+  local code="" name=""
+
+  while true; do
+    printf "%s" "client_code [a-z0-9_-]: " >&2
+    read -r code || true
+    code="${code//$'\r'/}"
+    code="${code#"${code%%[![:space:]]*}"}"
+    code="${code%"${code##*[![:space:]]}"}"
+
+    if [[ "$code" =~ ^[a-z0-9_-]+$ ]]; then
+      break
+    fi
+    echo "Wpisz client_code zgodny z regex: ^[a-z0-9_-]+$" >&2
+  done
+
+  while true; do
+    printf "%s" "client_name: " >&2
+    read -r name || true
+    name="${name//$'\r'/}"
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+
+    if [[ -n "$name" ]]; then
+      break
+    fi
+    echo "client_name nie może być pusty." >&2
+  done
+
+  CLIENT_IDENTITY_CODE="$code"
+  CLIENT_IDENTITY_NAME="$name"
+}
+
+select_client_identity_from_catalog() {
+  local catalog_lines="" ans="" idx="" line="" code="" name="" prompt_out="/dev/stderr"
+  local codes=() names=()
+
+  command -v wget >/dev/null 2>&1 || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+
+  if ! catalog_lines="$(wget -qO- "$CLIENT_CATALOG_URL" 2>/dev/null | python3 -c '
+import json
+import re
+import sys
+
+try:
+    data = json.load(sys.stdin)
+    clients = data.get("clients", [])
+    if not isinstance(clients, list):
+        raise ValueError("clients must be a list")
+
+    for client in clients:
+        if not isinstance(client, dict):
+            continue
+        code = str(client.get("client_code", "")).strip()
+        name = str(client.get("client_name", "")).strip()
+        if re.match(r"^[a-z0-9_-]+$", code) and name:
+            print(f"{code}\t{name}")
+except Exception:
+    sys.exit(1)
+')"; then
+    return 1
+  fi
+
+  [[ -n "$catalog_lines" ]] || return 1
+
+  while IFS=$'\t' read -r code name; do
+    [[ -n "$code" && -n "$name" ]] || continue
+    codes+=("$code")
+    names+=("$name")
+  done <<< "$catalog_lines"
+
+  [[ "${#codes[@]}" -gt 0 ]] || return 1
+
+  [[ -w /dev/tty ]] && prompt_out="/dev/tty"
+
+  echo "Dostępni klienci z katalogu publicznego:" > "$prompt_out"
+  for idx in "${!codes[@]}"; do
+    printf "%2d) %s - %s\n" "$((idx + 1))" "${codes[$idx]}" "${names[$idx]}" > "$prompt_out"
+  done
+  echo " m) wpisz klienta ręcznie" > "$prompt_out"
+
+  while true; do
+    printf "%s" "Wybierz klienta [1-${#codes[@]}/m]: " > "$prompt_out"
+    read -r ans || true
+    ans="${ans//$'\r'/}"
+    ans="${ans#"${ans%%[![:space:]]*}"}"
+    ans="${ans%"${ans##*[![:space:]]}"}"
+
+    case "${ans,,}" in
+      m|manual|r|recznie|ręcznie)
+        return 1
+        ;;
+      ''|*[!0-9]*)
+        echo "Wpisz numer klienta albo m." > "$prompt_out"
+        ;;
+      *)
+        if (( ans >= 1 && ans <= ${#codes[@]} )); then
+          line=$((ans - 1))
+          CLIENT_IDENTITY_CODE="${codes[$line]}"
+          CLIENT_IDENTITY_NAME="${names[$line]}"
+          return 0
+        fi
+        echo "Numer poza zakresem." > "$prompt_out"
+        ;;
+    esac
+  done
+}
+
+write_client_identity_file() {
+  local identity_file="${1:?}" code name
+  code="$(json_escape_string "$CLIENT_IDENTITY_CODE")"
+  name="$(json_escape_string "$CLIENT_IDENTITY_NAME")"
+
+  cat > "$identity_file" <<EOF_CLIENT_IDENTITY
+{
+  "schema_version": "1.0",
+  "client_code": "$code",
+  "client_name": "$name",
+  "managed_by": "ITGO",
+  "created_by": "itgo-installer"
+}
+EOF_CLIENT_IDENTITY
+
+  chown "$TARGET_USER:$TARGET_USER" "$identity_file" 2>/dev/null || true
+  chmod 0644 "$identity_file" 2>/dev/null || true
+}
+
+ensure_client_identity_file() {
+  local config_dir identity_file
+  CLIENT_IDENTITY_CODE=""
+  CLIENT_IDENTITY_NAME=""
+
+  if ! have_user; then
+    echo "[$(ts)] WARN: user '$TARGET_USER' missing. Pomijam client-identity.json."
+    add_summary "Client identity: SKIP (user missing)"
+    return 0
+  fi
+
+  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+  [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] WARN: cannot resolve HOME. Pomijam client-identity.json."; add_summary "Client identity: SKIP (cannot resolve home)"; return 0; }
+
+  UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+  config_dir="$UTILITY_DIR/ITGO-CONFIG"
+  identity_file="$config_dir/client-identity.json"
+
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$config_dir"
+
+  if [[ -f "$identity_file" ]]; then
+    echo "[$(ts)] INFO: istnieje $identity_file"
+    echo "----- current client-identity.json -----"
+    cat "$identity_file" || true
+    echo "----- end current client-identity.json -----"
+
+    if ! prompt_yn "Nadpisać istniejący client-identity.json?" "N"; then
+      echo "[$(ts)] SKIP: client-identity.json pozostawiony bez zmian."
+      add_summary "Client identity: kept existing ~/UTILITY/ITGO-CONFIG/client-identity.json"
+      return 0
+    fi
+  fi
+
+  echo "[$(ts)] INFO: konfiguracja lokalnej identyfikacji klienta dla InfoCenter."
+  if ! select_client_identity_from_catalog; then
+    echo "[$(ts)] INFO: katalog klientów niedostępny albo wybrano wpis ręczny."
+    prompt_client_identity_manual
+  fi
+
+  write_client_identity_file "$identity_file"
+  echo "[$(ts)] OK: zapisano ~/UTILITY/ITGO-CONFIG/client-identity.json"
+  add_summary "Client identity: written ~/UTILITY/ITGO-CONFIG/client-identity.json ($CLIENT_IDENTITY_CODE)"
 }
 
 ensure_sudo_nopasswd_block() {
@@ -2787,6 +2971,8 @@ main() {
   else
     echo "[$(ts)] SKIP: pakiety bazowe."
   fi
+
+  ensure_client_identity_file
 
   section "SEKCJA 3/8 - ZACHOWANIE SHELLA"
   if prompt_yn "KROK: ustawić w ~/.bash_logout: history -c && history -w ?" "Y"; then
