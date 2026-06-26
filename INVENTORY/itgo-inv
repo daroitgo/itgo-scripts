@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+set -u
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  while [ -L "$SCRIPT_PATH" ]; do
+    link_target="$(readlink "$SCRIPT_PATH")"
+    case "$link_target" in
+      /*) SCRIPT_PATH="$link_target" ;;
+      *) SCRIPT_PATH="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)/${link_target}" ;;
+    esac
+  done
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ITGO_HOME="$(cd "${BASE_DIR}/../.." && pwd)"
+COLLECTOR="${BASE_DIR}/bin/collect_inventory.py"
+REPORTS_DIR="${BASE_DIR}/reports"
+LOGS_DIR="${BASE_DIR}/logs"
+VERSION_FILE="${BASE_DIR}/inventory.version"
+IDENTITY_FILE="${ITGO_HOME}/UTILITY/ITGO-CONFIG/client-identity.json"
+
+usage() {
+  cat <<'EOF'
+Usage: itgo-inv [collect|latest|version|help]
+
+Commands:
+  collect   Generate an offline inventory JSON report
+  latest    Show the newest local inventory report
+  version   Show module and collector versions
+  help      Show this help
+EOF
+}
+
+safe_filename_part() {
+  local value="${1:-unknown}"
+  value="$(printf '%s' "$value" | tr -c 'A-Za-z0-9._-' '_' | sed 's/_\+/_/g; s/^_//; s/_$//')"
+  if [ -z "$value" ]; then
+    value="unknown"
+  fi
+  printf '%s' "$value"
+}
+
+python_command() {
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "python3"
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1; then
+    printf '%s' "python"
+    return 0
+  fi
+  return 1
+}
+
+read_client_code() {
+  local code="unknown"
+  local py_cmd
+
+  if [ -f "$IDENTITY_FILE" ]; then
+    if py_cmd="$(python_command)"; then
+      code="$("$py_cmd" -c 'import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+    value = data.get("client_code", "unknown")
+    print(value if isinstance(value, str) and value else "unknown")
+except Exception:
+    print("unknown")
+' "$IDENTITY_FILE" 2>/dev/null)"
+    else
+      code="$(sed -n 's/.*"client_code"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$IDENTITY_FILE" 2>/dev/null | head -n 1)"
+      if [ -z "$code" ]; then
+        code="unknown"
+      fi
+    fi
+  fi
+
+  safe_filename_part "$code"
+}
+
+collector_has_output_option() {
+  [ -f "$COLLECTOR" ] && grep -Eq -- '(^|[^A-Za-z0-9_-])--output([^A-Za-z0-9_-]|$)' "$COLLECTOR"
+}
+
+run_collector() {
+  local output_path="$1"
+  local log_path="$2"
+  local py_cmd
+
+  if ! py_cmd="$(python_command)"; then
+    printf 'error: python3/python is required to run the inventory collector\n' >&2
+    return 1
+  fi
+
+  if collector_has_output_option; then
+    "$py_cmd" "$COLLECTOR" --output "$output_path" >>"$log_path" 2>&1
+  else
+    "$py_cmd" "$COLLECTOR" >"$output_path" 2>>"$log_path"
+  fi
+}
+
+collect_report() {
+  local client_code hostname timestamp report_name report_path temp_path log_path
+
+  if [ ! -f "$COLLECTOR" ]; then
+    printf 'error: collector not found: %s\n' "$COLLECTOR" >&2
+    return 1
+  fi
+
+  mkdir -p "$REPORTS_DIR" "$LOGS_DIR" || {
+    printf 'error: could not create reports/logs directories\n' >&2
+    return 1
+  }
+
+  client_code="$(read_client_code)"
+  hostname="$(safe_filename_part "$(hostname 2>/dev/null || printf 'unknown')")"
+  timestamp="$(date '+%Y%m%d_%H%M%S')"
+  report_name="inventory_${client_code}_${hostname}_${timestamp}.json"
+  report_path="${REPORTS_DIR}/${report_name}"
+  temp_path="${REPORTS_DIR}/.${report_name}.tmp.$$"
+  log_path="${LOGS_DIR}/inventory_${timestamp}.log"
+
+  rm -f "$temp_path"
+
+  if ! run_collector "$temp_path" "$log_path"; then
+    rm -f "$temp_path"
+    printf 'error: inventory report generation failed\n' >&2
+    printf 'log: %s\n' "$log_path" >&2
+    return 1
+  fi
+
+  if [ ! -s "$temp_path" ]; then
+    rm -f "$temp_path"
+    printf 'error: inventory collector produced an empty report\n' >&2
+    printf 'log: %s\n' "$log_path" >&2
+    return 1
+  fi
+
+  mv "$temp_path" "$report_path" || {
+    rm -f "$temp_path"
+    printf 'error: could not save inventory report\n' >&2
+    printf 'log: %s\n' "$log_path" >&2
+    return 1
+  }
+
+  chmod 0600 "$report_path" 2>/dev/null || true
+  printf 'Inventory report: %s\n' "$report_path"
+}
+
+show_latest() {
+  local latest
+
+  if [ ! -d "$REPORTS_DIR" ]; then
+    printf 'No inventory reports found in %s\n' "$REPORTS_DIR"
+    return 1
+  fi
+
+  latest="$(find "$REPORTS_DIR" -maxdepth 1 -type f -name 'inventory_*.json' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR == 1 {sub(/^[^ ]+ /, ""); print}')"
+  if [ -z "$latest" ]; then
+    printf 'No inventory reports found in %s\n' "$REPORTS_DIR"
+    return 1
+  fi
+
+  printf '%s\n' "$latest"
+}
+
+show_version() {
+  local inventory_version="unknown"
+  local collector_version="unknown"
+
+  if [ -f "$VERSION_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$VERSION_FILE"
+    inventory_version="${INVENTORY_VERSION:-unknown}"
+    collector_version="${COLLECTOR_VERSION:-unknown}"
+  fi
+
+  printf 'Inventory module: %s\n' "$inventory_version"
+  printf 'Inventory collector: %s\n' "$collector_version"
+}
+
+command_name="${1:-collect}"
+
+case "$command_name" in
+  collect)
+    collect_report
+    ;;
+  latest)
+    show_latest
+    ;;
+  version)
+    show_version
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    printf 'error: unknown command: %s\n\n' "$command_name" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
