@@ -50,6 +50,8 @@ Paczka offline zawiera artefakty release następujących modułów:
 - `TSEQ`
 - `DOWNLOADER_APP`
 - `UPGBUILDER`
+- `SERVICEGUARD`
+- `INVENTORY`
 
 Zakres plików kopiowanych do paczki wynika z `release.manifest.psd1` każdego modułu.
 
@@ -73,6 +75,7 @@ Skrypt `install.sh`:
 - weryfikuje obecność:
   - `payload/MASTER/master_installer.sh`
   - `payload/UPGBUILDER/template`
+  - `payload/INVENTORY`
 - uruchamia `MASTER`, przekazując mu lokalne źródło artefaktów zamiast GitHub RAW.
 
 W praktyce `install.sh` jest cienkim launcherem trybu offline.
