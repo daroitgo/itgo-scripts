@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.63"
+MASTER_VERSION="1.2.64"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.18"
@@ -46,6 +46,7 @@ TSEQ_VERSION="3.12.9"
 DOWNLOADER_APP_VERSION="1.0.4"
 UPGBUILDER_VERSION="0.1.12"
 SERVICEGUARD_VERSION="0.1.6"
+INVENTORY_VERSION="0.1.0"
 
 MODE="install"
 UPDATE_ONLY_MODE="0"
@@ -67,6 +68,7 @@ TSEQ_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/tseq-
 DOWNLOADER_APP_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/downloader_app-${DOWNLOADER_APP_VERSION}/DOWNLOADER_APP/upg_installer.sh"
 UPGBUILDER_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/upgbuilder-${UPGBUILDER_VERSION}/UPGBUILDER/upgbuilder.sh"
 SERVICEGUARD_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/serviceguard-${SERVICEGUARD_VERSION}/SERVICEGUARD/serviceguard_installer_public.sh"
+INVENTORY_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/inventory-${INVENTORY_VERSION}/INVENTORY/inventory_installer_public.sh"
 # <<< AUTO-MODULE-VERSIONS END <<<
 CLIENT_CATALOG_URL="https://helpdesk.itgo.com.pl/nextcloud/index.php/s/FFbZwPNHtegWXo4/download"
 
@@ -88,6 +90,8 @@ TSEQ_LOCAL_PATH="${SOURCE_DIR}/TSEQ/tseq_installer_public.sh"
 DOWNLOADER_APP_LOCAL_PATH="${SOURCE_DIR}/DOWNLOADER_APP/upg_installer.sh"
 UPGBUILDER_LOCAL_PATH="${SOURCE_DIR}/UPGBUILDER/upgbuilder.sh"
 SERVICEGUARD_LOCAL_PATH="${SOURCE_DIR}/SERVICEGUARD/serviceguard_installer_public.sh"
+INVENTORY_LOCAL_DIR="${SOURCE_DIR}/INVENTORY"
+INVENTORY_LOCAL_PATH="${INVENTORY_LOCAL_DIR}/inventory_installer_public.sh"
 UPGBUILDER_LOCAL_MAP="${SOURCE_DIR}/UPGBUILDER/upgbuilder.map"
 UPGBUILDER_LOCAL_TEMPLATE_DIR="${SOURCE_DIR}/UPGBUILDER/template"
 
@@ -552,13 +556,13 @@ EOF_MASTER_UPDATE_LAUNCHER
   safe_backup "$bp"
   remove_block_from_file "$bp" "$legacy_path_start" "$legacy_path_end"
   remove_block_from_file "$bp" "$path_start" "$path_end"
-  printf "\n%s\nexport PATH=\"\$HOME/UTILITY/MASTER:\$HOME/UTILITY/STATUS/bin:\$HOME/UTILITY/TSEQ/bin:\$HOME/UTILITY/DOWNLOADER_APP/bin:\$HOME/UTILITY/UPGbuilder/bin:\$HOME/UTILITY/AMCS:\$HOME/UTILITY/TOOLS:\$PATH\"\n%s\n" "$path_start" "$path_end" >> "$bp"
+  printf "\n%s\nexport PATH=\"\$HOME/UTILITY/MASTER:\$HOME/UTILITY/STATUS/bin:\$HOME/UTILITY/TSEQ/bin:\$HOME/UTILITY/DOWNLOADER_APP/bin:\$HOME/UTILITY/UPGbuilder/bin:\$HOME/UTILITY/INVENTORY/bin:\$HOME/UTILITY/AMCS:\$HOME/UTILITY/TOOLS:\$PATH\"\n%s\n" "$path_start" "$path_end" >> "$bp"
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
   chmod 0644 "$bp" 2>/dev/null || true
 
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-install"
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-update"
-  add_summary "User-local PATH updated for MASTER, STATUS, TSEQ, DOWNLOADER_APP, UPGbuilder, AMCS, TOOLS"
+  add_summary "User-local PATH updated for MASTER, STATUS, TSEQ, DOWNLOADER_APP, UPGbuilder, INVENTORY, AMCS, TOOLS"
 }
 
 ITGO_HOME=""
@@ -593,6 +597,7 @@ start_final_logging_if_possible() {
   echo "[$(ts)]   DOWNLOADER_APP: $DOWNLOADER_APP_VERSION"
   echo "[$(ts)]   UPGBUILDER    : $UPGBUILDER_VERSION"
   echo "[$(ts)]   SERVICEGUARD  : $SERVICEGUARD_VERSION"
+  echo "[$(ts)]   INVENTORY     : $INVENTORY_VERSION"
 
   if [[ -f "$TMP_LOG" ]]; then
     echo "[$(ts)] --- pre-log (from $TMP_LOG) ---"
@@ -634,6 +639,14 @@ read_version_file() {
   fi
 }
 
+read_inventory_version_file() {
+  local version_file="${1:?}" version=""
+  if [[ -f "$version_file" ]]; then
+    version="$(sed -n 's/^INVENTORY_VERSION=["'\'']\{0,1\}\([^"'\'']*\)["'\'']\{0,1\}$/\1/p' "$version_file" 2>/dev/null | head -n1 | tr -d '\r')"
+  fi
+  printf "%s\n" "$version"
+}
+
 version_file_for_module() {
   local module="${1:?}"
 
@@ -646,6 +659,7 @@ version_file_for_module() {
     DOWNLOADER_APP) printf "%s\n" "$ITGO_HOME/UTILITY/DOWNLOADER_APP/.downloader_version" ;;
     UPGBUILDER)     printf "%s\n" "$ITGO_HOME/UTILITY/UPGbuilder/.upgbuilder_version" ;;
     SERVICEGUARD)   printf "%s\n" "$ITGO_HOME/UTILITY/SERVICEGUARD/.serviceguard_version" ;;
+    INVENTORY)      printf "%s\n" "$ITGO_HOME/UTILITY/INVENTORY/inventory.version" ;;
     *) return 1 ;;
   esac
 }
@@ -660,6 +674,7 @@ target_version_for_module() {
     DOWNLOADER_APP) printf "%s\n" "$DOWNLOADER_APP_VERSION" ;;
     UPGBUILDER)     printf "%s\n" "$UPGBUILDER_VERSION" ;;
     SERVICEGUARD)   printf "%s\n" "$SERVICEGUARD_VERSION" ;;
+    INVENTORY)      printf "%s\n" "$INVENTORY_VERSION" ;;
     *) return 1 ;;
   esac
 }
@@ -667,6 +682,10 @@ target_version_for_module() {
 installed_version_for_module() {
   local module="${1:?}" version_file
   version_file="$(version_file_for_module "$module")" || return 1
+  if [[ "$module" == "INVENTORY" ]]; then
+    read_inventory_version_file "$version_file"
+    return 0
+  fi
   read_version_file "$version_file"
 }
 
@@ -719,6 +738,15 @@ module_health_for_module() {
     SERVICEGUARD)
       [[ -d "$ITGO_HOME/UTILITY/SERVICEGUARD" && -f "$version_file" && -x "$ITGO_HOME/UTILITY/SERVICEGUARD/serviceguard.sh" && -x "$ITGO_HOME/UTILITY/TOOLS/svcguard" ]] && echo "OK" || echo "BROKEN"
       ;;
+    INVENTORY)
+      [[ -d "$ITGO_HOME/UTILITY/INVENTORY" \
+        && -f "$version_file" \
+        && -x "$ITGO_HOME/UTILITY/INVENTORY/bin/itgo-inv" \
+        && -x "$ITGO_HOME/UTILITY/INVENTORY/bin/collect_inventory.py" \
+        && -d "$ITGO_HOME/UTILITY/INVENTORY/reports" \
+        && -d "$ITGO_HOME/UTILITY/INVENTORY/logs" \
+        && -L /usr/local/bin/itgo-inv ]] && echo "OK" || echo "BROKEN"
+      ;;
     *)
       echo "UNKNOWN"
       ;;
@@ -744,7 +772,7 @@ compare_versions() {
 }
 
 detect_installed_modules() {
-  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER SERVICEGUARD)
+  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER SERVICEGUARD INVENTORY)
   local module installed_version target_version health
 
   for module in "${modules[@]}"; do
@@ -758,7 +786,7 @@ detect_installed_modules() {
 }
 
 any_itgo_module_installed() {
-  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER SERVICEGUARD)
+  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER SERVICEGUARD INVENTORY)
   local module
 
   for module in "${modules[@]}"; do
@@ -896,7 +924,7 @@ file_has_itgo_shell_marker() {
   local file="${1:?}"
 
   [[ -f "$file" ]] || return 1
-  grep -Eq 'ITGO LOCAL MODULE PATHS|ITGO HISTORY CLEAR ON LOGOUT|UPG XML cleanup|UTILITY/(MASTER|STATUS|TSEQ|DOWNLOADER_APP|UPGbuilder|AMCS)|/home/itgo/UPG' "$file" 2>/dev/null \
+  grep -Eq 'ITGO LOCAL MODULE PATHS|ITGO HISTORY CLEAR ON LOGOUT|UPG XML cleanup|UTILITY/(MASTER|STATUS|TSEQ|DOWNLOADER_APP|UPGbuilder|INVENTORY|AMCS)|/home/itgo/UPG' "$file" 2>/dev/null \
     || { [[ -n "${ITGO_HOME:-}" ]] && grep -Fq "$ITGO_HOME/UPG" "$file" 2>/dev/null; }
 }
 
@@ -1481,6 +1509,46 @@ download_to_tmp() {
   chown "$TARGET_USER:$TARGET_USER" "$out" 2>/dev/null || true
 }
 
+download_inventory_payload() {
+  local out_dir="${1:?}"
+  local item source_path out_path url
+  local items=(
+    "inventory_installer_public.sh"
+    "collect_inventory.py"
+    "itgo-inv"
+    "inventory.version"
+    "README.md"
+    "CHANGELOG.md"
+  )
+
+  [[ -d "$TMP_DIR" ]] || { echo "[$(ts)] ERROR: missing $TMP_DIR"; return 1; }
+
+  rm -rf "$out_dir"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$out_dir"
+
+  for item in "${items[@]}"; do
+    out_path="$out_dir/$item"
+    if [[ "$OFFLINE_MODE" == "1" ]]; then
+      source_path="$INVENTORY_LOCAL_DIR/$item"
+      [[ -f "$source_path" ]] || { echo "[$(ts)] ERROR: local source missing: $source_path"; return 1; }
+      echo "[$(ts)] COPY(local): $source_path -> $out_path"
+      cp "$source_path" "$out_path"
+    else
+      if [[ "$item" == "inventory_installer_public.sh" ]]; then
+        url="$INVENTORY_URL"
+      else
+        url="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/inventory-${INVENTORY_VERSION}/INVENTORY/${item}"
+      fi
+      echo "[$(ts)] DOWNLOAD: $url -> $out_path"
+      wget -qO "$out_path" "$url"
+    fi
+  done
+
+  chmod 0755 "$out_dir/inventory_installer_public.sh" "$out_dir/collect_inventory.py" "$out_dir/itgo-inv"
+  chmod 0644 "$out_dir/inventory.version" "$out_dir/README.md" "$out_dir/CHANGELOG.md"
+  chown -R "$TARGET_USER:$TARGET_USER" "$out_dir" 2>/dev/null || true
+}
+
 run_module_root() {
   local script="${1:?}"
   shift || true
@@ -2054,8 +2122,9 @@ EOF_UPGBUILDER_LAUNCHER
 cleanup_downloaded_installers() {
   if [[ -d "$TMP_DIR" ]]; then
     if prompt_yn "Usunąć pobrane instalery (*.sh) z $TMP_DIR?" "Y"; then
-      echo "[$(ts)] ACTION: rm -f $TMP_DIR/*.sh"
+      echo "[$(ts)] ACTION: rm -f $TMP_DIR/*.sh; rm -rf $TMP_DIR/INVENTORY"
       rm -f -- "$TMP_DIR"/*.sh 2>/dev/null || true
+      rm -rf -- "$TMP_DIR/INVENTORY" 2>/dev/null || true
       echo "[$(ts)] OK: installers removed."
     else
       echo "[$(ts)] SKIP: keeping downloaded installers."
@@ -2066,7 +2135,8 @@ cleanup_downloaded_installers() {
 cleanup_tmp_installers_after_uninstall() {
   if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
     rm -f -- "$TMP_DIR"/*.sh 2>/dev/null || true
-    add_summary "TMP cleanup po uninstall: wykonane ($TMP_DIR/*.sh)"
+    rm -rf -- "$TMP_DIR/INVENTORY" 2>/dev/null || true
+    add_summary "TMP cleanup po uninstall: wykonane ($TMP_DIR/*.sh, $TMP_DIR/INVENTORY)"
   else
     add_summary "TMP cleanup po uninstall: SKIP (TMP_DIR unavailable)"
   fi
@@ -2075,7 +2145,8 @@ cleanup_tmp_installers_after_uninstall() {
 cleanup_tmp_installers_no_prompt() {
   if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
     rm -f -- "$TMP_DIR"/*.sh 2>/dev/null || true
-    add_summary "TMP cleanup: wykonane ($TMP_DIR/*.sh)"
+    rm -rf -- "$TMP_DIR/INVENTORY" 2>/dev/null || true
+    add_summary "TMP cleanup: wykonane ($TMP_DIR/*.sh, $TMP_DIR/INVENTORY)"
   else
     add_summary "TMP cleanup: SKIP (TMP_DIR unavailable)"
   fi
@@ -2640,6 +2711,59 @@ install_serviceguard_step() {
   fi
 }
 
+install_inventory_step() {
+  local inventory_dir="${1:?}"
+  local inventory_sh="$inventory_dir/inventory_installer_public.sh"
+
+  if should_install_or_update_module "INVENTORY"; then
+    if [[ "$MODULE_DECISION" == "install" ]]; then
+      if prompt_yn "KROK: zainstalować Inventory Collector (itgo-inv)?" "Y"; then
+        ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+
+        if ! have_user; then
+          echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+          exit 1
+        fi
+
+        ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+        [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+        UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+        TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+
+        [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+        [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+
+        download_inventory_payload "$inventory_dir"
+        run_module_root "$inventory_sh" "$TARGET_USER"
+        echo "[$(ts)] OK: INVENTORY done."
+      else
+        echo "[$(ts)] SKIP: INVENTORY."
+      fi
+    else
+      ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+
+      if ! have_user; then
+        echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+        exit 1
+      fi
+
+      ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+      [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+      UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+      TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+
+      [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+      [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+
+      download_inventory_payload "$inventory_dir"
+      run_module_root "$inventory_sh" "$TARGET_USER"
+      echo "[$(ts)] OK: INVENTORY done."
+    fi
+  fi
+}
+
 bootstrap_block() {
   ensure_user_and_password_if_missing
   ensure_home_dirs
@@ -2715,10 +2839,11 @@ prompt_uninstall_module_choice() {
   echo "4) DOWNLOADER_APP" >&2
   echo "5) UPGBUILDER" >&2
   echo "6) SERVICEGUARD" >&2
+  echo "7) INVENTORY" >&2
   echo "q) Anuluj uninstall" >&2
 
   while true; do
-    printf "%s" "Wybierz [1-6/q]: " >&2
+    printf "%s" "Wybierz [1-7/q]: " >&2
     read -r ans || true
     case "$ans" in
       1) echo "STATUS"; return 0 ;;
@@ -2727,8 +2852,9 @@ prompt_uninstall_module_choice() {
       4) echo "DOWNLOADER_APP"; return 0 ;;
       5) echo "UPGBUILDER"; return 0 ;;
       6) echo "SERVICEGUARD"; return 0 ;;
+      7) echo "INVENTORY"; return 0 ;;
       q|Q) echo "cancel"; return 0 ;;
-      *) echo "Wpisz liczbę od 1 do 6 albo q." >&2 ;;
+      *) echo "Wpisz liczbę od 1 do 7 albo q." >&2 ;;
     esac
   done
 }
@@ -2815,6 +2941,27 @@ uninstall_serviceguard_step() {
   add_summary "Uninstall: SERVICEGUARD"
 }
 
+uninstall_inventory_step() {
+  local app_dir legacy_link
+
+  if ! have_user; then
+    echo "[$(ts)] WARN: user '$TARGET_USER' missing. Pomijam INVENTORY uninstall."
+    return 0
+  fi
+
+  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+  [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] WARN: cannot resolve home for '$TARGET_USER'. Pomijam INVENTORY uninstall."; return 0; }
+
+  app_dir="$ITGO_HOME/UTILITY/INVENTORY"
+  legacy_link="/usr/local/bin/itgo-inv"
+
+  rm -f "$legacy_link" "${legacy_link}.bak" "${legacy_link}.bak."* 2>/dev/null || true
+  rm -rf "$app_dir" 2>/dev/null || true
+
+  echo "[$(ts)] OK: INVENTORY uninstall done."
+  add_summary "Uninstall: INVENTORY"
+}
+
 run_single_module_uninstall() {
   local module="${1:?}" status_sh="${2:?}" cleanup_sh="${3:?}" tseq_sh="${4:?}" serviceguard_sh="${5:?}"
 
@@ -2825,6 +2972,7 @@ run_single_module_uninstall() {
     DOWNLOADER_APP) uninstall_downloader_app_step ;;
     UPGBUILDER)     uninstall_upgbuilder_step ;;
     SERVICEGUARD)   uninstall_serviceguard_step "$serviceguard_sh" ;;
+    INVENTORY)      uninstall_inventory_step ;;
     *) echo "[$(ts)] ERROR: unknown module for uninstall: $module"; exit 1 ;;
   esac
 }
@@ -2838,6 +2986,7 @@ run_all_module_uninstalls() {
   uninstall_downloader_app_step
   uninstall_upgbuilder_step
   uninstall_serviceguard_step "$serviceguard_sh"
+  uninstall_inventory_step
 }
 
 section() {
@@ -2849,7 +2998,7 @@ section() {
 
 main() {
   local detected_modules="" uninstall_scope="" uninstall_module=""
-  local status_sh cleanup_sh tseq_sh downloader_app_sh upgbuilder_sh serviceguard_sh
+  local status_sh cleanup_sh tseq_sh downloader_app_sh upgbuilder_sh serviceguard_sh inventory_dir
 
   need_root
   prelog "BEGIN: ITGO Master Installer v$MASTER_VERSION user=$TARGET_USER"
@@ -2889,6 +3038,7 @@ main() {
     downloader_app_sh="$TMP_DIR/upg_installer.sh"
     upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
     serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
+    inventory_dir="$TMP_DIR/INVENTORY"
 
     section "UPDATE-ONLY - MODUŁY"
     install_status_step "$status_sh"
@@ -2897,6 +3047,7 @@ main() {
     install_downloader_app_step "$downloader_app_sh"
     install_upgbuilder_step "$upgbuilder_sh"
     install_serviceguard_step "$serviceguard_sh"
+    install_inventory_step "$inventory_dir"
     install_amcs_step
 
     cleanup_tmp_installers_no_prompt
@@ -2920,6 +3071,7 @@ main() {
       downloader_app_sh="$TMP_DIR/upg_installer.sh"
       upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
       serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
+      inventory_dir="$TMP_DIR/INVENTORY"
 
       uninstall_scope="$(prompt_uninstall_scope)"
       if [[ "$uninstall_scope" == "all" ]]; then
@@ -3008,6 +3160,7 @@ main() {
   downloader_app_sh="$TMP_DIR/upg_installer.sh"
   upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
   serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
+  inventory_dir="$TMP_DIR/INVENTORY"
 
   section "SEKCJA 4/8 - MODUŁY CORE"
   install_status_step "$status_sh"
@@ -3037,6 +3190,7 @@ main() {
   install_downloader_app_step "$downloader_app_sh"
   install_upgbuilder_step "$upgbuilder_sh"
   install_serviceguard_step "$serviceguard_sh"
+  install_inventory_step "$inventory_dir"
 
   section "SEKCJA 6/8 - TOOLS"
   if prompt_yn "MODUŁ: TOOLS/cp-upg (lokalny helper kopiowania produkcji do ~/UPG/EDM, ZM, MPI, P1ADAPTER)?" "Y"; then
