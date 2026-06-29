@@ -37,4 +37,4 @@ chmod 0644 "${INSTALL_DIR}/inventory.version"
 
 ln -sfn "${BIN_DIR}/itgo-inv" /usr/local/bin/itgo-inv
 
-itgo-inv version
+"${BIN_DIR}/itgo-inv" version
