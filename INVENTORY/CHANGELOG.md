@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 - 2026-06-29
+
+- Added Python 2.7 compatibility for the inventory collector on legacy Linux systems.
+- Hardened interpreter selection in itgo-inv for mixed Python 2/Python 3 environments.
+
 ## 0.1.1 - 2026-06-29
 
 - Fixed installer post-install version check to call the installed wrapper by absolute path instead of relying on PATH.

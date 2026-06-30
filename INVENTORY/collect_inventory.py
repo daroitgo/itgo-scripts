@@ -1,17 +1,25 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """Generate a bounded, read-only Linux inventory report."""
 
+from __future__ import print_function
+
 import argparse
+import errno
+import io
 import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import tempfile
+import time
+from datetime import datetime
+
+try:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
 COLLECTOR_VERSION = "0.1.0"
@@ -31,7 +39,7 @@ COMPOSE_FILENAMES = (
     "compose.yml",
     "compose.yaml",
 )
-DOCKER_EXACT_HINTS = {
+DOCKER_EXACT_HINTS = set((
     "zm_docker",
     "p1cer",
     "erej",
@@ -39,7 +47,7 @@ DOCKER_EXACT_HINTS = {
     "ekrn",
     "sgds",
     "p1adapter",
-}
+))
 DOCKER_CONTAINS_HINTS = ("amdx", "mpi")
 SAFE_COMMAND_ENV = {
     "DOCKER_CONFIG": "/nonexistent",
@@ -50,25 +58,17 @@ SAFE_COMMAND_ENV = {
 }
 
 
-class CommandSpec:
+class CommandSpec(object):
     __slots__ = ("name", "executable", "arguments", "version_parser")
 
-    def __init__(
-        self,
-        name: str,
-        executable: str,
-        arguments: Tuple[str, ...],
-        version_parser: Callable[[str, str], Optional[str]],
-    ) -> None:
+    def __init__(self, name, executable, arguments, version_parser):
         self.name = name
         self.executable = executable
         self.arguments = arguments
         self.version_parser = version_parser
 
 
-def add_warning(
-    warnings: List[Dict[str, str]], code: str, subject: str, message: str
-) -> None:
+def add_warning(warnings, code, subject, message):
     if len(warnings) >= MAX_WARNINGS:
         return
     warnings.append(
@@ -80,21 +80,23 @@ def add_warning(
     )
 
 
-def parse_first_match(pattern: str, stdout: str, stderr: str) -> Optional[str]:
+def parse_first_match(pattern, stdout, stderr):
     bounded_text = (stdout + "\n" + stderr)[:MAX_COMMAND_OUTPUT_CHARS]
     match = re.search(pattern, bounded_text, flags=re.MULTILINE)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1)
+    return None
 
 
-def parse_systemd_version(stdout: str, stderr: str) -> Optional[str]:
+def parse_systemd_version(stdout, stderr):
     return parse_first_match(r"^systemd\s+(\S+)", stdout, stderr)
 
 
-def parse_docker_version(stdout: str, stderr: str) -> Optional[str]:
+def parse_docker_version(stdout, stderr):
     return parse_first_match(r"^Docker version\s+([^,\s]+)", stdout, stderr)
 
 
-def parse_compose_version(stdout: str, stderr: str) -> Optional[str]:
+def parse_compose_version(stdout, stderr):
     return parse_first_match(
         r"^(?:Docker Compose version|docker-compose version)\s+v?([^,\s]+)",
         stdout,
@@ -102,7 +104,7 @@ def parse_compose_version(stdout: str, stderr: str) -> Optional[str]:
     )
 
 
-def parse_java_version(stdout: str, stderr: str) -> Optional[str]:
+def parse_java_version(stdout, stderr):
     return parse_first_match(r'^(?:openjdk|java) version "([^"]+)"', stdout, stderr)
 
 
@@ -125,7 +127,17 @@ COMMAND_SPECS = (
 )
 
 
-def parse_os_release_value(raw_value: str) -> Optional[str]:
+def which(executable, path):
+    for directory in path.split(os.pathsep):
+        if not directory:
+            continue
+        candidate = os.path.join(directory, executable)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def parse_os_release_value(raw_value):
     try:
         values = shlex.split(raw_value, comments=False, posix=True)
     except ValueError:
@@ -135,9 +147,12 @@ def parse_os_release_value(raw_value: str) -> Optional[str]:
     return values[0][:256]
 
 
-def read_os_release(
-    warnings: List[Dict[str, str]], path: str = "/etc/os-release"
-) -> Dict[str, Optional[str]]:
+def read_text_file(path, limit):
+    with io.open(path, "r", encoding="utf-8", errors="strict") as input_file:
+        return input_file.read(limit + 1)
+
+
+def read_os_release(warnings, path="/etc/os-release"):
     allowed_fields = {"ID": "id", "NAME": "name", "VERSION_ID": "version_id"}
     result = {
         "id": None,
@@ -146,9 +161,8 @@ def read_os_release(
     }
 
     try:
-        with open(path, encoding="utf-8", errors="strict") as os_release_file:
-            contents = os_release_file.read(MAX_OS_RELEASE_CHARS + 1)
-    except (OSError, UnicodeError):
+        contents = read_text_file(path, MAX_OS_RELEASE_CHARS)
+    except (IOError, OSError, UnicodeError):
         add_warning(
             warnings,
             "OS_RELEASE_READ_FAILED",
@@ -178,8 +192,8 @@ def read_os_release(
             add_warning(
                 warnings,
                 "OS_RELEASE_PARSE_ISSUE",
-                f"host.os.{output_key}",
-                f"Could not parse allowlisted OS field {key}",
+                "host.os." + output_key,
+                "Could not parse allowlisted OS field " + key,
             )
             continue
         result[output_key] = value
@@ -187,9 +201,7 @@ def read_os_release(
     return result
 
 
-def add_invalid_identity_warning(
-    warnings: List[Dict[str, str]], message: str
-) -> None:
+def add_invalid_identity_warning(warnings, message):
     add_warning(
         warnings,
         "INVALID_ITGO_IDENTITY",
@@ -198,12 +210,9 @@ def add_invalid_identity_warning(
     )
 
 
-def read_itgo_identity(
-    warnings: List[Dict[str, str]], path: str = ITGO_IDENTITY_PATH
-) -> Optional[Dict[str, str]]:
-    identity_path = Path(path)
+def read_itgo_identity(warnings, path=ITGO_IDENTITY_PATH):
     try:
-        exists = identity_path.is_file()
+        exists = os.path.isfile(path)
     except OSError:
         add_invalid_identity_warning(
             warnings,
@@ -215,9 +224,8 @@ def read_itgo_identity(
         return None
 
     try:
-        with identity_path.open(encoding="utf-8", errors="strict") as identity_file:
-            contents = identity_file.read(MAX_ITGO_IDENTITY_CHARS + 1)
-    except (OSError, UnicodeError):
+        contents = read_text_file(path, MAX_ITGO_IDENTITY_CHARS)
+    except (IOError, OSError, UnicodeError):
         add_invalid_identity_warning(
             warnings,
             "Could not read ITGO identity file",
@@ -253,13 +261,13 @@ def read_itgo_identity(
     managed_by = parsed.get("managed_by")
     created_by = parsed.get("created_by")
 
-    if not isinstance(schema_version, str):
+    if not isinstance(schema_version, string_types):
         add_invalid_identity_warning(
             warnings,
             "ITGO identity schema_version must be a string",
         )
         return None
-    if not isinstance(client_code, str) or not ITGO_CLIENT_CODE_PATTERN.match(
+    if not isinstance(client_code, string_types) or not ITGO_CLIENT_CODE_PATTERN.match(
         client_code
     ):
         add_invalid_identity_warning(
@@ -267,19 +275,19 @@ def read_itgo_identity(
             "ITGO identity client_code is invalid",
         )
         return None
-    if not isinstance(client_name, str) or not client_name:
+    if not isinstance(client_name, string_types) or not client_name:
         add_invalid_identity_warning(
             warnings,
             "ITGO identity client_name must be a non-empty string",
         )
         return None
-    if managed_by is not None and not isinstance(managed_by, str):
+    if managed_by is not None and not isinstance(managed_by, string_types):
         add_invalid_identity_warning(
             warnings,
             "ITGO identity managed_by must be a string when present",
         )
         return None
-    if created_by is not None and not isinstance(created_by, str):
+    if created_by is not None and not isinstance(created_by, string_types):
         add_invalid_identity_warning(
             warnings,
             "ITGO identity created_by must be a string when present",
@@ -290,7 +298,7 @@ def read_itgo_identity(
         "schema_version": schema_version,
         "client_code": client_code,
         "client_name": client_name,
-        "source_path": str(identity_path),
+        "source_path": path,
     }
     if managed_by is not None:
         identity["managed_by"] = managed_by
@@ -299,13 +307,66 @@ def read_itgo_identity(
     return identity
 
 
-def probe_command(
-    spec: CommandSpec, warnings: List[Dict[str, str]]
-) -> Dict[str, Any]:
-    executable_path = shutil.which(
-        spec.executable,
-        path=SAFE_COMMAND_ENV["PATH"],
-    )
+def read_temp_output(temp_file):
+    temp_file.seek(0)
+    data = temp_file.read(MAX_COMMAND_OUTPUT_CHARS)
+    if not isinstance(data, string_types):
+        data = data.decode("utf-8", "replace")
+    return data
+
+
+def run_command_with_timeout(command, timeout_seconds, env):
+    stdout_file = tempfile.TemporaryFile()
+    stderr_file = tempfile.TemporaryFile()
+    process = None
+    try:
+        process = subprocess.Popen(
+            command,
+            shell=False,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            env=env,
+            close_fds=True,
+        )
+        deadline = time.time() + timeout_seconds
+        while process.poll() is None:
+            if time.time() >= deadline:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                time.sleep(0.2)
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except (AttributeError, OSError):
+                        pass
+                return {
+                    "timeout": True,
+                    "returncode": None,
+                    "stdout": read_temp_output(stdout_file),
+                    "stderr": read_temp_output(stderr_file),
+                }
+            time.sleep(0.05)
+
+        return {
+            "timeout": False,
+            "returncode": process.returncode,
+            "stdout": read_temp_output(stdout_file),
+            "stderr": read_temp_output(stderr_file),
+        }
+    finally:
+        if process is not None and process.poll() is None:
+            try:
+                process.kill()
+            except (AttributeError, OSError):
+                pass
+        stdout_file.close()
+        stderr_file.close()
+
+
+def probe_command(spec, warnings):
+    executable_path = which(spec.executable, SAFE_COMMAND_ENV["PATH"])
     item = {
         "source": "command",
         "source_path": executable_path,
@@ -320,53 +381,50 @@ def probe_command(
             warnings,
             "COMMAND_NOT_FOUND",
             spec.name,
-            f"{spec.executable} is not available",
+            spec.executable + " is not available",
         )
         return item
 
-    command = [executable_path, *spec.arguments]
+    command = [executable_path] + list(spec.arguments)
     try:
-        completed = subprocess.run(
+        completed = run_command_with_timeout(
             command,
-            shell=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            timeout=COMMAND_TIMEOUT_SECONDS,
-            check=False,
-            env=SAFE_COMMAND_ENV,
+            COMMAND_TIMEOUT_SECONDS,
+            SAFE_COMMAND_ENV,
         )
-    except subprocess.TimeoutExpired:
-        item["status"] = "timeout"
-        add_warning(
-            warnings,
-            "COMMAND_TIMEOUT",
-            spec.name,
-            f"{spec.name} version probe timed out",
-        )
-        return item
     except OSError:
         item["status"] = "failed"
         add_warning(
             warnings,
             "COMMAND_FAILED",
             spec.name,
-            f"{spec.name} version probe could not be started",
+            spec.name + " version probe could not be started",
         )
         return item
 
-    if completed.returncode != 0:
+    if completed["timeout"]:
+        item["status"] = "timeout"
+        add_warning(
+            warnings,
+            "COMMAND_TIMEOUT",
+            spec.name,
+            spec.name + " version probe timed out",
+        )
+        return item
+
+    if completed["returncode"] != 0:
         item["status"] = "failed"
         add_warning(
             warnings,
             "COMMAND_FAILED",
             spec.name,
-            f"{spec.name} version probe failed with exit status {completed.returncode}",
+            "%s version probe failed with exit status %s"
+            % (spec.name, completed["returncode"]),
         )
         return item
 
-    stdout = (completed.stdout or "")[:MAX_COMMAND_OUTPUT_CHARS]
-    stderr = (completed.stderr or "")[:MAX_COMMAND_OUTPUT_CHARS]
+    stdout = (completed["stdout"] or "")[:MAX_COMMAND_OUTPUT_CHARS]
+    stderr = (completed["stderr"] or "")[:MAX_COMMAND_OUTPUT_CHARS]
     version = spec.version_parser(stdout, stderr)
     if version is None:
         item["status"] = "parse_issue"
@@ -374,7 +432,7 @@ def probe_command(
             warnings,
             "VERSION_PARSE_ISSUE",
             spec.name,
-            f"Could not parse {spec.name} version output",
+            "Could not parse " + spec.name + " version output",
         )
         return item
 
@@ -382,7 +440,7 @@ def probe_command(
     return item
 
 
-def is_legacy_application_directory_name(name: str) -> bool:
+def is_legacy_application_directory_name(name):
     tokens = [
         token
         for token in re.split(r"[^a-z0-9]+", name.lower())
@@ -391,7 +449,7 @@ def is_legacy_application_directory_name(name: str) -> bool:
     return "old" in tokens
 
 
-def match_application_candidate(name: str) -> Optional[Tuple[str, str]]:
+def match_application_candidate(name):
     lower_name = name.lower()
 
     # One candidate record is emitted per directory. When a directory name could
@@ -408,39 +466,41 @@ def match_application_candidate(name: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def collect_compose_files(candidate_path: Path) -> List[str]:
-    compose_files = []  # type: List[str]
+def collect_compose_files(candidate_path):
+    compose_files = []
     for filename in COMPOSE_FILENAMES:
-        compose_path = candidate_path / filename
+        compose_path = os.path.join(candidate_path, filename)
         try:
-            if compose_path.is_file():
-                compose_files.append(str(compose_path))
+            if os.path.isfile(compose_path):
+                compose_files.append(compose_path)
         except OSError:
             continue
     return compose_files
 
 
-def collect_application_candidates(
-    warnings: List[Dict[str, str]],
-    base_paths: Tuple[str, ...] = APPLICATION_BASE_PATHS,
-) -> List[Dict[str, Any]]:
-    candidates = []  # type: List[Dict[str, Any]]
+def list_directory(path):
+    try:
+        return os.listdir(path), None
+    except OSError as error:
+        return None, error
+
+
+def collect_application_candidates(warnings, base_paths=APPLICATION_BASE_PATHS):
+    candidates = []
 
     for base_path in sorted(base_paths):
-        base = Path(base_path)
-        try:
-            children = list(base.iterdir())
-        except FileNotFoundError:
-            continue
-        except PermissionError:
-            add_warning(
-                warnings,
-                "APPLICATION_BASE_READ_DENIED",
-                "application_candidates",
-                "Could not read allowlisted application base path",
-            )
-            continue
-        except OSError:
+        children, error = list_directory(base_path)
+        if error is not None:
+            if error.errno == errno.ENOENT:
+                continue
+            if error.errno in (errno.EACCES, errno.EPERM):
+                add_warning(
+                    warnings,
+                    "APPLICATION_BASE_READ_DENIED",
+                    "application_candidates",
+                    "Could not read allowlisted application base path",
+                )
+                continue
             add_warning(
                 warnings,
                 "APPLICATION_BASE_READ_FAILED",
@@ -449,33 +509,34 @@ def collect_application_candidates(
             )
             continue
 
-        for child in sorted(children, key=lambda item: (str(item), item.name)):
+        for child_name in sorted(children):
+            child_path = os.path.join(base_path, child_name)
             try:
-                if not child.is_dir():
+                if not os.path.isdir(child_path):
                     continue
             except OSError:
                 continue
 
-            if is_legacy_application_directory_name(child.name):
+            if is_legacy_application_directory_name(child_name):
                 continue
 
-            match = match_application_candidate(child.name)
+            match = match_application_candidate(child_name)
             if match is None:
                 continue
 
             candidate_type, matched_hint = match
             fields = {
-                "base_path": str(base),
+                "base_path": base_path,
                 "matched_hint": matched_hint,
-            }  # type: Dict[str, Any]
+            }
             if candidate_type == "docker_compose":
-                fields["compose_files"] = collect_compose_files(child)
+                fields["compose_files"] = collect_compose_files(child_path)
 
             candidates.append(
                 {
                     "source": "filesystem_allowlist",
-                    "source_path": str(child),
-                    "name": child.name,
+                    "source_path": child_path,
+                    "name": child_name,
                     "candidate_type": candidate_type,
                     "status": "candidate",
                     "fields": fields,
@@ -486,23 +547,20 @@ def collect_application_candidates(
 
 
 def collect_report(
-    generated_at: Optional[str] = None,
-    application_base_paths: Tuple[str, ...] = APPLICATION_BASE_PATHS,
-    itgo_identity_path: str = ITGO_IDENTITY_PATH,
-) -> Dict[str, Any]:
-    warnings = []  # type: List[Dict[str, str]]
+    generated_at=None,
+    application_base_paths=APPLICATION_BASE_PATHS,
+    itgo_identity_path=ITGO_IDENTITY_PATH,
+):
+    warnings = []
     timestamp = generated_at or (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
+        datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     )
 
     try:
         uname = os.uname()
-        kernel = uname.release[:256]
-        architecture = uname.machine[:128]
-    except OSError:
+        kernel = uname[2][:256]
+        architecture = uname[4][:128]
+    except (AttributeError, OSError):
         kernel = None
         architecture = None
         add_warning(
@@ -542,52 +600,62 @@ def collect_report(
     }
 
 
-def write_report(output_path: Path, report: Dict[str, Any]) -> None:
-    payload = (json.dumps(report, indent=2, sort_keys=True) + "\n").encode("utf-8")
+def write_report(output_path, report):
+    payload = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if not isinstance(payload, bytes):
+        payload = payload.encode("utf-8")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     descriptor = os.open(output_path, flags, 0o600)
     try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=True) as output_file:
-            descriptor = -1
+        try:
+            os.fchmod(descriptor, 0o600)
+        except (AttributeError, OSError):
+            pass
+        output_file = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        try:
             output_file.write(payload)
             output_file.flush()
             os.fsync(output_file.fileno())
+        finally:
+            output_file.close()
     except Exception:
         if descriptor >= 0:
             os.close(descriptor)
         try:
-            output_path.unlink()
+            os.unlink(output_path)
         except OSError:
             pass
         raise
 
 
-def build_argument_parser() -> argparse.ArgumentParser:
+def build_argument_parser():
     parser = argparse.ArgumentParser(
         description="Generate a read-only ITGO InfoCenter inventory JSON report."
     )
     parser.add_argument(
         "--output",
         required=True,
-        type=Path,
         help="New JSON output file; existing files are never overwritten.",
     )
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv=None):
     arguments = build_argument_parser().parse_args(argv)
     try:
         write_report(arguments.output, collect_report())
-    except FileExistsError:
-        print(f"error: output file already exists: {arguments.output}", file=sys.stderr)
-        return 2
-    except (OSError, ValueError, TypeError) as error:
-        print(f"error: could not write inventory report: {error}", file=sys.stderr)
+    except OSError as error:
+        if getattr(error, "errno", None) == errno.EEXIST:
+            print("error: output file already exists: " + arguments.output, file=sys.stderr)
+            return 2
+        print("error: could not write inventory report: " + str(error), file=sys.stderr)
+        return 1
+    except (ValueError, TypeError) as error:
+        print("error: could not write inventory report: " + str(error), file=sys.stderr)
         return 1
 
-    print(f"Inventory report written to {arguments.output}")
+    print("Inventory report written to " + arguments.output)
     return 0
 
 

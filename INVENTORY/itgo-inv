@@ -43,14 +43,13 @@ safe_filename_part() {
 }
 
 python_command() {
-  if command -v python3 >/dev/null 2>&1; then
-    printf '%s' "python3"
-    return 0
-  fi
-  if command -v python >/dev/null 2>&1; then
-    printf '%s' "python"
-    return 0
-  fi
+  local candidate
+  for candidate in python3 python3.11 python3.9 python3.8 python3.7 python3.6 python python2 python2.7; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
   return 1
 }
 
@@ -60,12 +59,18 @@ read_client_code() {
 
   if [ -f "$IDENTITY_FILE" ]; then
     if py_cmd="$(python_command)"; then
-      code="$("$py_cmd" -c 'import json, sys
+      code="$("$py_cmd" -c 'import io
+import json
+import sys
 try:
-    with open(sys.argv[1], encoding="utf-8") as fh:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
+try:
+    with io.open(sys.argv[1], "r", encoding="utf-8") as fh:
         data = json.load(fh)
     value = data.get("client_code", "unknown")
-    print(value if isinstance(value, str) and value else "unknown")
+    print(value if isinstance(value, string_types) and value else "unknown")
 except Exception:
     print("unknown")
 ' "$IDENTITY_FILE" 2>/dev/null)"
@@ -90,7 +95,7 @@ run_collector() {
   local py_cmd
 
   if ! py_cmd="$(python_command)"; then
-    printf 'error: python3/python is required to run the inventory collector\n' >&2
+    printf 'error: no working Python interpreter found; tried python3, python3.11, python3.9, python3.8, python3.7, python3.6, python, python2, python2.7\n' >&2
     return 1
   fi
 
