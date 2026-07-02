@@ -22,7 +22,7 @@ except NameError:
     string_types = (str,)
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.0"
+COLLECTOR_VERSION = "0.1.1"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -30,6 +30,7 @@ MAX_OS_RELEASE_CHARS = 65536
 MAX_ITGO_IDENTITY_CHARS = 8192
 MAX_WARNINGS = 32
 MAX_WARNING_MESSAGE_CHARS = 200
+MAX_HOSTNAME_CHARS = 255
 ITGO_IDENTITY_PATH = "/home/itgo/UTILITY/ITGO-CONFIG/client-identity.json"
 ITGO_CLIENT_CODE_PATTERN = re.compile(r"^[a-z0-9_-]+$")
 APPLICATION_BASE_PATHS = ("/srv", "/opt")
@@ -150,6 +151,11 @@ def parse_os_release_value(raw_value):
 def read_text_file(path, limit):
     with io.open(path, "r", encoding="utf-8", errors="strict") as input_file:
         return input_file.read(limit + 1)
+
+
+def normalize_hostname(value):
+    hostname = value.strip()[:MAX_HOSTNAME_CHARS]
+    return hostname if hostname else None
 
 
 def read_os_release(warnings, path="/etc/os-release"):
@@ -552,22 +558,22 @@ def collect_report(
     itgo_identity_path=ITGO_IDENTITY_PATH,
 ):
     warnings = []
-    timestamp = generated_at or (
-        datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    )
+    timestamp = generated_at or datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
     try:
         uname = os.uname()
+        hostname = normalize_hostname(uname[1])
         kernel = uname[2][:256]
         architecture = uname[4][:128]
     except (AttributeError, OSError):
+        hostname = None
         kernel = None
         architecture = None
         add_warning(
             warnings,
             "UNAME_FAILED",
             "host",
-            "Could not read kernel and architecture information",
+            "Could not read uname host information",
         )
 
     itgo_identity = read_itgo_identity(warnings, itgo_identity_path)
@@ -585,6 +591,7 @@ def collect_report(
         "itgo_identity": itgo_identity,
         "host": {
             "os": read_os_release(warnings),
+            "hostname": hostname,
             "kernel": kernel,
             "architecture": architecture,
         },
@@ -601,9 +608,7 @@ def collect_report(
 
 
 def write_report(output_path, report):
-    payload = json.dumps(report, indent=2, sort_keys=True) + "\n"
-    if not isinstance(payload, bytes):
-        payload = payload.encode("utf-8")
+    payload = (json.dumps(report, indent=2, sort_keys=True) + "\n").encode("utf-8")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     descriptor = os.open(output_path, flags, 0o600)
     try:
@@ -643,16 +648,20 @@ def build_argument_parser():
 
 def main(argv=None):
     arguments = build_argument_parser().parse_args(argv)
+    if os.path.exists(arguments.output):
+        sys.stderr.write("error: output file already exists: " + arguments.output + "\n")
+        return 2
+
     try:
         write_report(arguments.output, collect_report())
     except OSError as error:
         if getattr(error, "errno", None) == errno.EEXIST:
-            print("error: output file already exists: " + arguments.output, file=sys.stderr)
+            sys.stderr.write("error: output file already exists: " + arguments.output + "\n")
             return 2
-        print("error: could not write inventory report: " + str(error), file=sys.stderr)
+        sys.stderr.write("error: could not write inventory report: " + str(error) + "\n")
         return 1
     except (ValueError, TypeError) as error:
-        print("error: could not write inventory report: " + str(error), file=sys.stderr)
+        sys.stderr.write("error: could not write inventory report: " + str(error) + "\n")
         return 1
 
     print("Inventory report written to " + arguments.output)
