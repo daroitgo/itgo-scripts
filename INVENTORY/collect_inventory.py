@@ -1,7 +1,8 @@
 #!/usr/bin/env python
-"""Generate a bounded, read-only Linux inventory report."""
-
+# -*- coding: utf-8 -*-
 from __future__ import print_function
+
+"""Generate a bounded, read-only Linux inventory report."""
 
 import argparse
 import errno
@@ -12,22 +13,22 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
 import time
-from datetime import datetime
-
-try:
-    string_types = (basestring,)
-except NameError:
-    string_types = (str,)
+import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.1"
+COLLECTOR_VERSION = "0.1.2"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
 MAX_OS_RELEASE_CHARS = 65536
 MAX_ITGO_IDENTITY_CHARS = 8192
+MAX_ARCHIVE_ANALYSIS_BYTES = 256 * 1024 * 1024
+MAX_ARCHIVE_METADATA_ENTRY_BYTES = 1024 * 1024
+MAX_NESTED_WAR_ENTRY_BYTES = 256 * 1024 * 1024
+MAX_POM_PROPERTIES_CHARS = 8192
+MAX_INTEGRATION_WEBAPPS = 64
+MAX_INTEGRATION_MAVEN_ARTIFACT_DIRS = 32
 MAX_WARNINGS = 32
 MAX_WARNING_MESSAGE_CHARS = 200
 MAX_HOSTNAME_CHARS = 255
@@ -40,7 +41,7 @@ COMPOSE_FILENAMES = (
     "compose.yml",
     "compose.yaml",
 )
-DOCKER_EXACT_HINTS = set((
+DOCKER_EXACT_HINTS = {
     "zm_docker",
     "p1cer",
     "erej",
@@ -48,8 +49,25 @@ DOCKER_EXACT_HINTS = set((
     "ekrn",
     "sgds",
     "p1adapter",
-))
+}
 DOCKER_CONTAINS_HINTS = ("amdx", "mpi")
+AMMS_EAR_RELATIVE_PATH = (
+    "wildfly-26.0.1.Final",
+    "standalone",
+    "deployments",
+    "amms.ear",
+)
+AMMS_WAR_ENTRY_NAME = "amms-war.war"
+AMMS_BUILD_JSON_ENTRIES = (
+    "WEB-INF/classes/mspa/build.json",
+    "mspa/build.json",
+)
+INTEGRATION_WEBAPPS_RELATIVE_PATH = ("apache-tomcat", "webapps")
+INTEGRATION_MAVEN_GROUP_RELATIVE_PATH = (
+    "META-INF",
+    "maven",
+    "pl.asseco.poz.integration",
+)
 SAFE_COMMAND_ENV = {
     "DOCKER_CONFIG": "/nonexistent",
     "HOME": "/nonexistent",
@@ -58,15 +76,36 @@ SAFE_COMMAND_ENV = {
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
 }
 
+try:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
+
 
 class CommandSpec(object):
     __slots__ = ("name", "executable", "arguments", "version_parser")
 
-    def __init__(self, name, executable, arguments, version_parser):
+    def __init__(
+        self,
+        name,
+        executable,
+        arguments,
+        version_parser,
+    ):
         self.name = name
         self.executable = executable
         self.arguments = arguments
         self.version_parser = version_parser
+
+
+class CommandResult(object):
+    __slots__ = ("returncode", "stdout", "stderr", "timed_out")
+
+    def __init__(self, returncode, stdout, stderr, timed_out):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timed_out = timed_out
 
 
 def add_warning(warnings, code, subject, message):
@@ -84,9 +123,7 @@ def add_warning(warnings, code, subject, message):
 def parse_first_match(pattern, stdout, stderr):
     bounded_text = (stdout + "\n" + stderr)[:MAX_COMMAND_OUTPUT_CHARS]
     match = re.search(pattern, bounded_text, flags=re.MULTILINE)
-    if match:
-        return match.group(1)
-    return None
+    return match.group(1) if match else None
 
 
 def parse_systemd_version(stdout, stderr):
@@ -128,14 +165,18 @@ COMMAND_SPECS = (
 )
 
 
-def which(executable, path):
-    for directory in path.split(os.pathsep):
-        if not directory:
-            continue
-        candidate = os.path.join(directory, executable)
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return None
+def read_utf8_text_file(path, maximum_chars):
+    try:
+        with open(path, "rb") as text_file:
+            payload = text_file.read(maximum_chars + 1)
+    except OSError:
+        return None
+    if len(payload) > maximum_chars:
+        return None
+    try:
+        return payload.decode("utf-8")
+    except UnicodeError:
+        return None
 
 
 def parse_os_release_value(raw_value):
@@ -146,11 +187,6 @@ def parse_os_release_value(raw_value):
     if len(values) != 1:
         return None
     return values[0][:256]
-
-
-def read_text_file(path, limit):
-    with io.open(path, "r", encoding="utf-8", errors="strict") as input_file:
-        return input_file.read(limit + 1)
 
 
 def normalize_hostname(value):
@@ -166,9 +202,8 @@ def read_os_release(warnings, path="/etc/os-release"):
         "version_id": None,
     }
 
-    try:
-        contents = read_text_file(path, MAX_OS_RELEASE_CHARS)
-    except (IOError, OSError, UnicodeError):
+    contents = read_utf8_text_file(path, MAX_OS_RELEASE_CHARS)
+    if contents is None:
         add_warning(
             warnings,
             "OS_RELEASE_READ_FAILED",
@@ -198,8 +233,8 @@ def read_os_release(warnings, path="/etc/os-release"):
             add_warning(
                 warnings,
                 "OS_RELEASE_PARSE_ISSUE",
-                "host.os." + output_key,
-                "Could not parse allowlisted OS field " + key,
+                "host.os.{}".format(output_key),
+                "Could not parse allowlisted OS field {}".format(key),
             )
             continue
         result[output_key] = value
@@ -217,8 +252,9 @@ def add_invalid_identity_warning(warnings, message):
 
 
 def read_itgo_identity(warnings, path=ITGO_IDENTITY_PATH):
+    identity_path = path
     try:
-        exists = os.path.isfile(path)
+        exists = os.path.isfile(identity_path)
     except OSError:
         add_invalid_identity_warning(
             warnings,
@@ -229,9 +265,8 @@ def read_itgo_identity(warnings, path=ITGO_IDENTITY_PATH):
     if not exists:
         return None
 
-    try:
-        contents = read_text_file(path, MAX_ITGO_IDENTITY_CHARS)
-    except (IOError, OSError, UnicodeError):
+    contents = read_utf8_text_file(identity_path, MAX_ITGO_IDENTITY_CHARS)
+    if contents is None:
         add_invalid_identity_warning(
             warnings,
             "Could not read ITGO identity file",
@@ -304,7 +339,7 @@ def read_itgo_identity(warnings, path=ITGO_IDENTITY_PATH):
         "schema_version": schema_version,
         "client_code": client_code,
         "client_name": client_name,
-        "source_path": path,
+        "source_path": "{}".format(identity_path),
     }
     if managed_by is not None:
         identity["managed_by"] = managed_by
@@ -313,66 +348,51 @@ def read_itgo_identity(warnings, path=ITGO_IDENTITY_PATH):
     return identity
 
 
-def read_temp_output(temp_file):
-    temp_file.seek(0)
-    data = temp_file.read(MAX_COMMAND_OUTPUT_CHARS)
-    if not isinstance(data, string_types):
-        data = data.decode("utf-8", "replace")
-    return data
+def find_executable(executable, path):
+    for directory in path.split(os.pathsep):
+        if not directory:
+            continue
+        executable_path = os.path.join(directory, executable)
+        if os.path.isfile(executable_path) and os.access(executable_path, os.X_OK):
+            return executable_path
+    return None
 
 
-def run_command_with_timeout(command, timeout_seconds, env):
-    stdout_file = tempfile.TemporaryFile()
-    stderr_file = tempfile.TemporaryFile()
-    process = None
-    try:
-        process = subprocess.Popen(
-            command,
-            shell=False,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            env=env,
-            close_fds=True,
-        )
-        deadline = time.time() + timeout_seconds
-        while process.poll() is None:
-            if time.time() >= deadline:
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
-                time.sleep(0.2)
-                if process.poll() is None:
-                    try:
-                        process.kill()
-                    except (AttributeError, OSError):
-                        pass
-                return {
-                    "timeout": True,
-                    "returncode": None,
-                    "stdout": read_temp_output(stdout_file),
-                    "stderr": read_temp_output(stderr_file),
-                }
-            time.sleep(0.05)
+def run_command_with_timeout(command, timeout_seconds):
+    process = subprocess.Popen(
+        command,
+        shell=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=SAFE_COMMAND_ENV,
+    )
+    deadline = time.time() + timeout_seconds
+    timed_out = False
 
-        return {
-            "timeout": False,
-            "returncode": process.returncode,
-            "stdout": read_temp_output(stdout_file),
-            "stderr": read_temp_output(stderr_file),
-        }
-    finally:
-        if process is not None and process.poll() is None:
-            try:
-                process.kill()
-            except (AttributeError, OSError):
-                pass
-        stdout_file.close()
-        stderr_file.close()
+    while process.poll() is None:
+        if time.time() >= deadline:
+            timed_out = True
+            process.kill()
+            break
+        time.sleep(0.05)
+
+    stdout, stderr = process.communicate()
+    return CommandResult(process.returncode, stdout, stderr, timed_out)
+
+
+def normalize_command_output(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value
 
 
 def probe_command(spec, warnings):
-    executable_path = which(spec.executable, SAFE_COMMAND_ENV["PATH"])
+    executable_path = find_executable(
+        spec.executable,
+        SAFE_COMMAND_ENV["PATH"],
+    )
     item = {
         "source": "command",
         "source_path": executable_path,
@@ -387,50 +407,47 @@ def probe_command(spec, warnings):
             warnings,
             "COMMAND_NOT_FOUND",
             spec.name,
-            spec.executable + " is not available",
+            "{} is not available".format(spec.executable),
         )
         return item
 
     command = [executable_path] + list(spec.arguments)
     try:
-        completed = run_command_with_timeout(
-            command,
-            COMMAND_TIMEOUT_SECONDS,
-            SAFE_COMMAND_ENV,
-        )
+        completed = run_command_with_timeout(command, COMMAND_TIMEOUT_SECONDS)
     except OSError:
         item["status"] = "failed"
         add_warning(
             warnings,
             "COMMAND_FAILED",
             spec.name,
-            spec.name + " version probe could not be started",
+            "{} version probe could not be started".format(spec.name),
         )
         return item
 
-    if completed["timeout"]:
+    if completed.timed_out:
         item["status"] = "timeout"
         add_warning(
             warnings,
             "COMMAND_TIMEOUT",
             spec.name,
-            spec.name + " version probe timed out",
+            "{} version probe timed out".format(spec.name),
         )
         return item
-
-    if completed["returncode"] != 0:
+    if completed.returncode != 0:
         item["status"] = "failed"
         add_warning(
             warnings,
             "COMMAND_FAILED",
             spec.name,
-            "%s version probe failed with exit status %s"
-            % (spec.name, completed["returncode"]),
+            "{} version probe failed with exit status {}".format(
+                spec.name,
+                completed.returncode,
+            ),
         )
         return item
 
-    stdout = (completed["stdout"] or "")[:MAX_COMMAND_OUTPUT_CHARS]
-    stderr = (completed["stderr"] or "")[:MAX_COMMAND_OUTPUT_CHARS]
+    stdout = normalize_command_output(completed.stdout)[:MAX_COMMAND_OUTPUT_CHARS]
+    stderr = normalize_command_output(completed.stderr)[:MAX_COMMAND_OUTPUT_CHARS]
     version = spec.version_parser(stdout, stderr)
     if version is None:
         item["status"] = "parse_issue"
@@ -438,7 +455,7 @@ def probe_command(spec, warnings):
             warnings,
             "VERSION_PARSE_ISSUE",
             spec.name,
-            "Could not parse " + spec.name + " version output",
+            "Could not parse {} version output".format(spec.name),
         )
         return item
 
@@ -484,21 +501,215 @@ def collect_compose_files(candidate_path):
     return compose_files
 
 
-def list_directory(path):
+def is_path_file_within_limit(path, maximum_bytes):
     try:
-        return os.listdir(path), None
-    except OSError as error:
-        return None, error
+        stat_result = os.stat(path)
+    except OSError:
+        return False
+    return stat_result.st_size <= maximum_bytes and os.path.isfile(path)
 
 
-def collect_application_candidates(warnings, base_paths=APPLICATION_BASE_PATHS):
+def find_zip_entry(archive, entry_name):
+    for entry in archive.infolist():
+        if entry.filename == entry_name:
+            return entry
+    return None
+
+
+def read_zip_entry_bytes(archive, entry, maximum_bytes):
+    if entry.file_size > maximum_bytes:
+        return None
+    entry_file = archive.open(entry)
+    try:
+        payload = entry_file.read(maximum_bytes + 1)
+    finally:
+        entry_file.close()
+    if len(payload) > maximum_bytes:
+        return None
+    return payload
+
+
+def read_amms_build_metadata(candidate_path):
+    ear_path = os.path.join(candidate_path, *AMMS_EAR_RELATIVE_PATH)
+    if not is_path_file_within_limit(ear_path, MAX_ARCHIVE_ANALYSIS_BYTES):
+        return None
+
+    ear_archive = None
+    try:
+        ear_archive = zipfile.ZipFile(ear_path)
+        war_entry = find_zip_entry(ear_archive, AMMS_WAR_ENTRY_NAME)
+        if war_entry is None:
+            return None
+        war_payload = read_zip_entry_bytes(
+            ear_archive,
+            war_entry,
+            MAX_NESTED_WAR_ENTRY_BYTES,
+        )
+        if war_payload is None:
+            return None
+    except (OSError, zipfile.BadZipFile, RuntimeError):
+        return None
+    finally:
+        if ear_archive is not None:
+            ear_archive.close()
+
+    war_archive = None
+    try:
+        war_archive = zipfile.ZipFile(io.BytesIO(war_payload))
+        for build_entry_name in AMMS_BUILD_JSON_ENTRIES:
+            try:
+                build_entry = war_archive.getinfo(build_entry_name)
+            except KeyError:
+                continue
+            build_payload = read_zip_entry_bytes(
+                war_archive,
+                build_entry,
+                MAX_ARCHIVE_METADATA_ENTRY_BYTES,
+            )
+            if build_payload is None:
+                continue
+            try:
+                parsed = json.loads(build_payload.decode("utf-8"))
+            except (UnicodeError, ValueError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            build_number = parsed.get("buildNumber")
+            build_date = parsed.get("buildDate")
+            result = {
+                "kind": "amms_build",
+                "source_path": "{}".format(ear_path),
+                "source_entry": AMMS_WAR_ENTRY_NAME + "!/" + build_entry_name,
+            }
+            if isinstance(build_number, string_types) and build_number:
+                result["version"] = build_number[:128]
+            if isinstance(build_date, string_types) and build_date:
+                result["build_date"] = build_date[:128]
+            if "version" in result or "build_date" in result:
+                return result
+    except (OSError, zipfile.BadZipFile, RuntimeError):
+        return None
+    finally:
+        if war_archive is not None:
+            war_archive.close()
+
+    return None
+
+
+def parse_pom_properties(contents):
+    result = {}
+    allowed_keys = {
+        "groupId": "group_id",
+        "artifactId": "artifact_id",
+        "version": "version",
+    }
+    for line in contents.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        output_key = allowed_keys.get(key.strip())
+        if output_key is None:
+            continue
+        value = value.strip()
+        if value:
+            result[output_key] = value[:255]
+    if result.get("group_id") != "pl.asseco.poz.integration":
+        return {}
+    return result
+
+
+def read_pom_properties(path):
+    if not is_path_file_within_limit(path, MAX_POM_PROPERTIES_CHARS):
+        return {}
+    contents = read_utf8_text_file(path, MAX_POM_PROPERTIES_CHARS)
+    if contents is None:
+        return {}
+    return parse_pom_properties(contents)
+
+
+def collect_integration_webapps(candidate_path):
+    webapps_path = os.path.join(candidate_path, *INTEGRATION_WEBAPPS_RELATIVE_PATH)
+    try:
+        children = [os.path.join(webapps_path, name) for name in os.listdir(webapps_path)]
+    except OSError:
+        return []
+
+    webapps = []
+    for child in sorted(children, key=lambda item: (item, os.path.basename(item))):
+        if len(webapps) >= MAX_INTEGRATION_WEBAPPS:
+            break
+        try:
+            if not os.path.isdir(child):
+                continue
+        except OSError:
+            continue
+
+        webapp = {
+            "name": os.path.basename(child),
+            "path": child,
+        }
+        group_path = os.path.join(child, *INTEGRATION_MAVEN_GROUP_RELATIVE_PATH)
+        try:
+            artifact_dirs = [os.path.join(group_path, name) for name in os.listdir(group_path)]
+        except OSError:
+            artifact_dirs = []
+
+        checked_artifact_dirs = 0
+        for artifact_dir in sorted(artifact_dirs, key=lambda item: (item, os.path.basename(item))):
+            if checked_artifact_dirs >= MAX_INTEGRATION_MAVEN_ARTIFACT_DIRS:
+                break
+            try:
+                if not os.path.isdir(artifact_dir):
+                    continue
+            except OSError:
+                continue
+            checked_artifact_dirs += 1
+            properties_path = os.path.join(artifact_dir, "pom.properties")
+            metadata = read_pom_properties(properties_path)
+            if not metadata:
+                continue
+            webapp["group_id"] = metadata.get("group_id")
+            webapp["artifact_id"] = metadata.get("artifact_id")
+            webapp["version"] = metadata.get("version")
+            webapp["source_path"] = properties_path
+            break
+
+        webapps.append(webapp)
+
+    return webapps
+
+
+def collect_integration_version_metadata(candidate_path):
+    webapps = collect_integration_webapps(candidate_path)
+    if not webapps:
+        return None, []
+
+    for webapp in webapps:
+        version = webapp.get("version")
+        if isinstance(version, string_types) and version:
+            return {
+                "kind": "maven",
+                "version": version,
+                "group_id": webapp.get("group_id"),
+                "artifact_id": webapp.get("artifact_id"),
+                "source_path": webapp.get("source_path"),
+            }, webapps
+
+    return None, webapps
+
+
+def collect_application_candidates(
+    warnings,
+    base_paths=APPLICATION_BASE_PATHS,
+):
     candidates = []
 
     for base_path in sorted(base_paths):
-        children, error = list_directory(base_path)
-        if error is not None:
-            if error.errno == errno.ENOENT:
-                continue
+        base = base_path
+        try:
+            children = [os.path.join(base, name) for name in os.listdir(base)]
+        except OSError as error:
             if error.errno in (errno.EACCES, errno.EPERM):
                 add_warning(
                     warnings,
@@ -506,43 +717,51 @@ def collect_application_candidates(warnings, base_paths=APPLICATION_BASE_PATHS):
                     "application_candidates",
                     "Could not read allowlisted application base path",
                 )
-                continue
-            add_warning(
-                warnings,
-                "APPLICATION_BASE_READ_FAILED",
-                "application_candidates",
-                "Could not read allowlisted application base path",
-            )
+            elif error.errno != errno.ENOENT:
+                add_warning(
+                    warnings,
+                    "APPLICATION_BASE_READ_FAILED",
+                    "application_candidates",
+                    "Could not read allowlisted application base path",
+                )
             continue
 
-        for child_name in sorted(children):
-            child_path = os.path.join(base_path, child_name)
+        for child in sorted(children, key=lambda item: (item, os.path.basename(item))):
             try:
-                if not os.path.isdir(child_path):
+                if not os.path.isdir(child):
                     continue
             except OSError:
                 continue
 
-            if is_legacy_application_directory_name(child_name):
+            if is_legacy_application_directory_name(os.path.basename(child)):
                 continue
 
-            match = match_application_candidate(child_name)
+            match = match_application_candidate(os.path.basename(child))
             if match is None:
                 continue
 
             candidate_type, matched_hint = match
             fields = {
-                "base_path": base_path,
+                "base_path": base,
                 "matched_hint": matched_hint,
             }
             if candidate_type == "docker_compose":
-                fields["compose_files"] = collect_compose_files(child_path)
+                fields["compose_files"] = collect_compose_files(child)
+            elif candidate_type == "wildfly_jboss":
+                application_version = read_amms_build_metadata(child)
+                if application_version is not None:
+                    fields["application_version"] = application_version
+            elif candidate_type == "integration_platform":
+                application_version, webapps = collect_integration_version_metadata(child)
+                if application_version is not None:
+                    fields["application_version"] = application_version
+                fields["webapps"] = webapps
 
             candidates.append(
                 {
                     "source": "filesystem_allowlist",
-                    "source_path": child_path,
-                    "name": child_name,
+                    "source_path": child,
+                    "name": os.path.basename(child),
                     "candidate_type": candidate_type,
                     "status": "candidate",
                     "fields": fields,
@@ -558,14 +777,16 @@ def collect_report(
     itgo_identity_path=ITGO_IDENTITY_PATH,
 ):
     warnings = []
-    timestamp = generated_at or datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    timestamp = generated_at or (
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    )
 
     try:
         uname = os.uname()
-        hostname = normalize_hostname(uname[1])
-        kernel = uname[2][:256]
-        architecture = uname[4][:128]
-    except (AttributeError, OSError):
+        hostname = normalize_hostname(uname.nodename)
+        kernel = uname.release[:256]
+        architecture = uname.machine[:128]
+    except OSError:
         hostname = None
         kernel = None
         architecture = None
@@ -612,18 +833,12 @@ def write_report(output_path, report):
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     descriptor = os.open(output_path, flags, 0o600)
     try:
-        try:
-            os.fchmod(descriptor, 0o600)
-        except (AttributeError, OSError):
-            pass
-        output_file = os.fdopen(descriptor, "wb")
-        descriptor = -1
-        try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as output_file:
+            descriptor = -1
             output_file.write(payload)
             output_file.flush()
             os.fsync(output_file.fileno())
-        finally:
-            output_file.close()
     except Exception:
         if descriptor >= 0:
             os.close(descriptor)
@@ -641,6 +856,7 @@ def build_argument_parser():
     parser.add_argument(
         "--output",
         required=True,
+        type=str,
         help="New JSON output file; existing files are never overwritten.",
     )
     return parser
@@ -648,23 +864,19 @@ def build_argument_parser():
 
 def main(argv=None):
     arguments = build_argument_parser().parse_args(argv)
-    if os.path.exists(arguments.output):
-        sys.stderr.write("error: output file already exists: " + arguments.output + "\n")
-        return 2
-
     try:
         write_report(arguments.output, collect_report())
     except OSError as error:
-        if getattr(error, "errno", None) == errno.EEXIST:
-            sys.stderr.write("error: output file already exists: " + arguments.output + "\n")
+        if error.errno == errno.EEXIST:
+            sys.stderr.write("error: output file already exists: {}\n".format(arguments.output))
             return 2
-        sys.stderr.write("error: could not write inventory report: " + str(error) + "\n")
+        sys.stderr.write("error: could not write inventory report: {}\n".format(error))
         return 1
     except (ValueError, TypeError) as error:
-        sys.stderr.write("error: could not write inventory report: " + str(error) + "\n")
+        sys.stderr.write("error: could not write inventory report: {}\n".format(error))
         return 1
 
-    print("Inventory report written to " + arguments.output)
+    print("Inventory report written to {}".format(arguments.output))
     return 0
 
 
