@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.68"
+MASTER_VERSION="1.2.69"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.19"
@@ -46,7 +46,7 @@ TSEQ_VERSION="3.12.9"
 DOWNLOADER_APP_VERSION="1.0.4"
 UPGBUILDER_VERSION="0.1.12"
 SERVICEGUARD_VERSION="0.1.6"
-INVENTORY_VERSION="0.1.3"
+INVENTORY_VERSION="0.1.4"
 
 MODE="install"
 UPDATE_ONLY_MODE="0"
@@ -96,6 +96,7 @@ UPGBUILDER_LOCAL_MAP="${SOURCE_DIR}/UPGBUILDER/upgbuilder.map"
 UPGBUILDER_LOCAL_TEMPLATE_DIR="${SOURCE_DIR}/UPGBUILDER/template"
 
 TMP_LOG=""
+OS_FAMILY=""
 
 ts() { date "+%F %T"; }
 
@@ -171,9 +172,69 @@ resolve_home() {
   echo "$h"
 }
 
-pkg_installed() {
+detect_os_family() {
+  local ids="" lower=""
+
+  if [[ -r /etc/os-release ]]; then
+    ids="$(
+      . /etc/os-release 2>/dev/null || true
+      printf "%s %s\n" "${ID:-}" "${ID_LIKE:-}"
+    )"
+  fi
+
+  lower="${ids,,}"
+  case "$lower" in
+    *rhel*|*fedora*|*centos*|*rocky*|*almalinux*|*' ol '*|ol\ *|*\ ol|*oracle*) printf "rhel_family\n" ;;
+    *debian*|*ubuntu*) printf "debian_family\n" ;;
+    *) printf "unknown\n" ;;
+  esac
+}
+
+os_family() {
+  if [[ -z "${OS_FAMILY:-}" ]]; then
+    OS_FAMILY="$(detect_os_family)"
+  fi
+  printf "%s\n" "$OS_FAMILY"
+}
+
+has_package_manager() {
+  command -v dnf >/dev/null 2>&1 \
+    || command -v yum >/dev/null 2>&1 \
+    || command -v apt-get >/dev/null 2>&1
+}
+
+pkg_is_installed() {
   local pkg="${1:?}"
-  rpm -q "$pkg" >/dev/null 2>&1
+  local family
+
+  family="$(os_family)"
+  case "$family" in
+    rhel_family)
+      if ! command -v rpm >/dev/null 2>&1; then
+        echo "[$(ts)] WARN: rpm unavailable; cannot verify package: $pkg" >&2
+        return 1
+      fi
+      rpm -q "$pkg" >/dev/null 2>&1
+      ;;
+    debian_family)
+      if command -v dpkg-query >/dev/null 2>&1; then
+        dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q "install ok installed"
+      elif command -v dpkg >/dev/null 2>&1; then
+        dpkg -s "$pkg" >/dev/null 2>&1
+      else
+        echo "[$(ts)] WARN: dpkg/dpkg-query unavailable; cannot verify package: $pkg" >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "[$(ts)] WARN: unknown OS family; cannot verify package: $pkg" >&2
+      return 1
+      ;;
+  esac
+}
+
+pkg_installed() {
+  pkg_is_installed "$@"
 }
 
 install_packages() {
@@ -186,8 +247,13 @@ install_packages() {
   elif command -v yum >/dev/null 2>&1; then
     echo "[$(ts)] ACTION: yum -y install ${missing[*]}"
     yum -y install "${missing[@]}"
+  elif command -v apt-get >/dev/null 2>&1; then
+    echo "[$(ts)] ACTION: apt-get update"
+    apt-get update
+    echo "[$(ts)] ACTION: DEBIAN_FRONTEND=noninteractive apt-get install -y ${missing[*]}"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
   else
-    echo "[$(ts)] ERROR: brak dnf/yum."
+    echo "[$(ts)] ERROR: brak obsługiwanego package managera (dnf/yum/apt-get)."
     return 1
   fi
 }
@@ -214,8 +280,11 @@ remove_packages() {
   elif command -v yum >/dev/null 2>&1; then
     echo "[$(ts)] ACTION: yum -y remove ${pkgs[*]}"
     yum -y remove "${pkgs[@]}"
+  elif command -v apt-get >/dev/null 2>&1; then
+    echo "[$(ts)] ACTION: DEBIAN_FRONTEND=noninteractive apt-get remove -y ${pkgs[*]}"
+    DEBIAN_FRONTEND=noninteractive apt-get remove -y "${pkgs[@]}"
   else
-    echo "[$(ts)] ERROR: brak dnf/yum."
+    echo "[$(ts)] ERROR: brak obsługiwanego package managera (dnf/yum/apt-get)."
     return 1
   fi
 }
@@ -235,11 +304,26 @@ get_active_command_path() {
   readlink -f "$cmd_path" 2>/dev/null || printf "%s\n" "$cmd_path"
 }
 
-get_rpm_owner_name_for_path() {
+pkg_owner_of_path() {
   local path="${1:?}"
+  local owner=""
 
-  [[ -e "$path" ]] || return 1
-  rpm -qf --qf '%{NAME}\n' "$path" 2>/dev/null
+  [[ -e "$path" ]] || return 0
+  case "$(os_family)" in
+    rhel_family)
+      command -v rpm >/dev/null 2>&1 || return 0
+      rpm -qf --qf '%{NAME}\n' "$path" 2>/dev/null | head -n 1 || true
+      ;;
+    debian_family)
+      command -v dpkg-query >/dev/null 2>&1 || return 0
+      owner="$(dpkg-query -S "$path" 2>/dev/null | head -n 1 || true)"
+      owner="${owner%%:*}"
+      printf "%s\n" "$owner"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
 }
 
 command_reports_java8() {
@@ -282,7 +366,7 @@ remove_unmanaged_local_java_wrappers() {
     fi
 
     resolved_path="$(readlink -f "$raw_path" 2>/dev/null || printf "%s\n" "$raw_path")"
-    owner="$(get_rpm_owner_name_for_path "$raw_path" 2>/dev/null || true)"
+    owner="$(pkg_owner_of_path "$raw_path" 2>/dev/null || true)"
     if [[ -z "$owner" && "$resolved_path" != /usr/bin/* ]]; then
       echo "[$(ts)] ACTION: removing unmanaged local $cmd wrapper: $raw_path"
       rm -f "$raw_path"
@@ -300,10 +384,10 @@ collect_amcs_java_state() {
   javac_path="$(get_active_command_path javac 2>/dev/null || true)"
 
   if [[ -n "$java_path" ]]; then
-    java_owner="$(get_rpm_owner_name_for_path "$java_path" 2>/dev/null || true)"
+    java_owner="$(pkg_owner_of_path "$java_path" 2>/dev/null || true)"
   fi
   if [[ -n "$javac_path" ]]; then
-    javac_owner="$(get_rpm_owner_name_for_path "$javac_path" 2>/dev/null || true)"
+    javac_owner="$(pkg_owner_of_path "$javac_path" 2>/dev/null || true)"
   fi
 
   if command_reports_java8 java && is_amcs_java_runtime_owner_compatible "$java_owner"; then
@@ -330,6 +414,13 @@ ensure_amcs_java_runtime() {
   local java_ok="0" javac_ok="0"
   local remove_list=()
 
+  if [[ "$(os_family)" != "rhel_family" ]]; then
+    echo "[$(ts)] SKIP: AMCS Java 8 package enforcement is currently implemented for RHEL/RPM package names only."
+    echo "[$(ts)] INFO: Debian/Ubuntu AMCS Java package naming is not enforced by MASTER yet."
+    add_summary "AMCS Java runtime: SKIP (non-RHEL package naming not enforced)"
+    return 0
+  fi
+
   remove_unmanaged_local_java_wrappers
 
   state="$(collect_amcs_java_state)"
@@ -348,10 +439,10 @@ ensure_amcs_java_runtime() {
 
   echo "[$(ts)] INFO: active java command path: ${java_raw_path:-MISSING}"
   echo "[$(ts)] INFO: active java path: ${java_path:-MISSING}"
-  echo "[$(ts)] INFO: active java rpm owner: ${java_owner:-UNKNOWN}"
+  echo "[$(ts)] INFO: active java package owner: ${java_owner:-UNKNOWN}"
   echo "[$(ts)] INFO: active javac command path: ${javac_raw_path:-MISSING}"
   echo "[$(ts)] INFO: active javac path: ${javac_path:-MISSING}"
-  echo "[$(ts)] INFO: active javac rpm owner: ${javac_owner:-UNKNOWN}"
+  echo "[$(ts)] INFO: active javac package owner: ${javac_owner:-UNKNOWN}"
 
   if pkg_installed "$target_pkg" && [[ "$java_ok" == "1" && "$javac_ok" == "1" ]]; then
     echo "[$(ts)] OK: active java and javac already match Java 8 from $target_pkg"
@@ -367,7 +458,7 @@ ensure_amcs_java_runtime() {
   fi
 
   if [[ "${#remove_list[@]}" -gt 0 ]]; then
-    echo "[$(ts)] INFO: removing incompatible active Java RPM package(s): ${remove_list[*]}"
+    echo "[$(ts)] INFO: removing incompatible active Java package(s): ${remove_list[*]}"
     remove_packages "${remove_list[@]}"
   fi
 
@@ -398,13 +489,13 @@ ensure_amcs_java_runtime() {
 
   echo "[$(ts)] INFO: post-install active java command path: ${java_raw_path:-MISSING}"
   echo "[$(ts)] INFO: post-install active java path: ${java_path:-MISSING}"
-  echo "[$(ts)] INFO: post-install active java rpm owner: ${java_owner:-UNKNOWN}"
+  echo "[$(ts)] INFO: post-install active java package owner: ${java_owner:-UNKNOWN}"
   echo "[$(ts)] INFO: post-install active javac command path: ${javac_raw_path:-MISSING}"
   echo "[$(ts)] INFO: post-install active javac path: ${javac_path:-MISSING}"
-  echo "[$(ts)] INFO: post-install active javac rpm owner: ${javac_owner:-UNKNOWN}"
+  echo "[$(ts)] INFO: post-install active javac package owner: ${javac_owner:-UNKNOWN}"
 
   if ! pkg_installed "$target_pkg" || [[ "$java_ok" != "1" || "$javac_ok" != "1" ]]; then
-    echo "[$(ts)] ERROR: AMCS requires installed $target_pkg plus active Java 8 java/javac from compatible OpenJDK 8 RPM packages."
+    echo "[$(ts)] ERROR: AMCS requires installed $target_pkg plus active Java 8 java/javac from compatible OpenJDK 8 packages."
     echo "[$(ts)] ERROR: active java command=${java_raw_path:-MISSING} resolved=${java_path:-MISSING} owner=${java_owner:-UNKNOWN}"
     echo "[$(ts)] ERROR: active javac command=${javac_raw_path:-MISSING} resolved=${javac_path:-MISSING} owner=${javac_owner:-UNKNOWN}"
     exit 1
@@ -1473,21 +1564,12 @@ ensure_wget() {
     return 0
   fi
 
-  if ! prompt_yn "Brak wget. Zainstalować wget teraz (dnf/yum)?" "Y"; then
+  if ! prompt_yn "Brak wget. Zainstalować wget teraz (dnf/yum/apt-get)?" "Y"; then
     echo "[$(ts)] ERROR: wget wymagany do pobrania modułów."
     return 1
   fi
 
-  if command -v dnf >/dev/null 2>&1; then
-    echo "[$(ts)] ACTION: dnf -y install wget"
-    dnf -y install wget
-  elif command -v yum >/dev/null 2>&1; then
-    echo "[$(ts)] ACTION: yum -y install wget"
-    yum -y install wget
-  else
-    echo "[$(ts)] ERROR: brak dnf/yum."
-    return 1
-  fi
+  install_packages wget
 }
 
 download_to_tmp() {
