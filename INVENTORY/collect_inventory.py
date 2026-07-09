@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.3"
+COLLECTOR_VERSION = "0.1.4"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -549,7 +549,7 @@ def read_zip_entry_bytes(archive, entry, maximum_bytes):
 
 def read_amms_build_metadata(candidate_path):
     ear_path = os.path.join(candidate_path, *AMMS_EAR_RELATIVE_PATH)
-    if not is_path_file_within_limit(ear_path, MAX_ARCHIVE_ANALYSIS_BYTES):
+    if not os.path.isfile(ear_path):
         return None
 
     ear_archive = None
