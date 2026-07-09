@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.2"
+COLLECTOR_VERSION = "0.1.3"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -189,7 +189,25 @@ def parse_os_release_value(raw_value):
     return values[0][:256]
 
 
+def get_uname_value(uname_result, attribute_name, index):
+    value = getattr(uname_result, attribute_name, None)
+    if value is not None:
+        return value
+    try:
+        return uname_result[index]
+    except (IndexError, TypeError):
+        return None
+
+
+def bounded_string(value, maximum_chars):
+    if not isinstance(value, string_types):
+        return None
+    return value[:maximum_chars]
+
+
 def normalize_hostname(value):
+    if not isinstance(value, string_types):
+        return None
     hostname = value.strip()[:MAX_HOSTNAME_CHARS]
     return hostname if hostname else None
 
@@ -783,9 +801,9 @@ def collect_report(
 
     try:
         uname = os.uname()
-        hostname = normalize_hostname(uname.nodename)
-        kernel = uname.release[:256]
-        architecture = uname.machine[:128]
+        hostname = normalize_hostname(get_uname_value(uname, "nodename", 1))
+        kernel = bounded_string(get_uname_value(uname, "release", 2), 256)
+        architecture = bounded_string(get_uname_value(uname, "machine", 4), 128)
     except OSError:
         hostname = None
         kernel = None
