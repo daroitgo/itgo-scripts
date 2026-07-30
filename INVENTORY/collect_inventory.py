@@ -6,18 +6,18 @@ from __future__ import print_function
 
 import argparse
 import errno
-import io
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.4"
+COLLECTOR_VERSION = "0.1.5"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -25,7 +25,8 @@ MAX_OS_RELEASE_CHARS = 65536
 MAX_ITGO_IDENTITY_CHARS = 8192
 MAX_ARCHIVE_ANALYSIS_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_METADATA_ENTRY_BYTES = 1024 * 1024
-MAX_NESTED_WAR_ENTRY_BYTES = 256 * 1024 * 1024
+MAX_NESTED_WAR_ENTRY_BYTES = 1024 * 1024 * 1024
+NESTED_WAR_COPY_CHUNK_BYTES = 1024 * 1024
 MAX_POM_PROPERTIES_CHARS = 8192
 MAX_INTEGRATION_WEBAPPS = 64
 MAX_INTEGRATION_MAVEN_ARTIFACT_DIRS = 32
@@ -547,23 +548,71 @@ def read_zip_entry_bytes(archive, entry, maximum_bytes):
     return payload
 
 
+def stream_zip_entry_to_temporary_file(archive, entry, maximum_bytes):
+    """Copy one bounded ZIP entry to a private temporary file in /tmp."""
+    if entry.file_size > maximum_bytes:
+        return None
+
+    descriptor = None
+    temporary_path = None
+    entry_file = None
+    temporary_file = None
+    completed = False
+    copied_bytes = 0
+    try:
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix="itgo-amms-war-", dir="/tmp"
+        )
+        os.fchmod(descriptor, 0o600)
+        temporary_file = os.fdopen(descriptor, "wb")
+        descriptor = None
+        entry_file = archive.open(entry)
+        while True:
+            chunk = entry_file.read(NESTED_WAR_COPY_CHUNK_BYTES)
+            if not chunk:
+                break
+            copied_bytes += len(chunk)
+            if copied_bytes > maximum_bytes:
+                return None
+            temporary_file.write(chunk)
+        temporary_file.close()
+        temporary_file = None
+        completed = True
+        return temporary_path
+    except (OSError, RuntimeError, zipfile.BadZipFile):
+        return None
+    finally:
+        if entry_file is not None:
+            entry_file.close()
+        if temporary_file is not None:
+            temporary_file.close()
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary_path is not None and not completed:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+
+
 def read_amms_build_metadata(candidate_path):
     ear_path = os.path.join(candidate_path, *AMMS_EAR_RELATIVE_PATH)
     if not os.path.isfile(ear_path):
         return None
 
     ear_archive = None
+    temporary_war_path = None
     try:
         ear_archive = zipfile.ZipFile(ear_path)
         war_entry = find_zip_entry(ear_archive, AMMS_WAR_ENTRY_NAME)
         if war_entry is None:
             return None
-        war_payload = read_zip_entry_bytes(
+        temporary_war_path = stream_zip_entry_to_temporary_file(
             ear_archive,
             war_entry,
             MAX_NESTED_WAR_ENTRY_BYTES,
         )
-        if war_payload is None:
+        if temporary_war_path is None:
             return None
     except (OSError, zipfile.BadZipFile, RuntimeError):
         return None
@@ -573,7 +622,7 @@ def read_amms_build_metadata(candidate_path):
 
     war_archive = None
     try:
-        war_archive = zipfile.ZipFile(io.BytesIO(war_payload))
+        war_archive = zipfile.ZipFile(temporary_war_path)
         for build_entry_name in AMMS_BUILD_JSON_ENTRIES:
             try:
                 build_entry = war_archive.getinfo(build_entry_name)
@@ -610,6 +659,11 @@ def read_amms_build_metadata(candidate_path):
     finally:
         if war_archive is not None:
             war_archive.close()
+        if temporary_war_path is not None:
+            try:
+                os.unlink(temporary_war_path)
+            except OSError:
+                pass
 
     return None
 
