@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.73"
+MASTER_VERSION="1.2.74"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.19"
@@ -46,7 +46,7 @@ TSEQ_VERSION="3.12.9"
 DOWNLOADER_APP_VERSION="1.0.4"
 UPGBUILDER_VERSION="0.1.12"
 SERVICEGUARD_VERSION="0.1.6"
-INVENTORY_VERSION="0.1.8"
+INVENTORY_VERSION="0.1.9"
 
 MODE="install"
 UPDATE_ONLY_MODE="0"
@@ -1073,6 +1073,44 @@ json_escape_string() {
   printf "%s" "$s"
 }
 
+client_catalog_python_command() {
+  local candidate
+  for candidate in python3 python3.11 python3.9 python3.8 python3.7 python3.6 python python2 python2.7; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import json, sys; sys.exit(0)' >/dev/null 2>&1; then
+      printf "%s" "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+download_client_catalog() {
+  local output=""
+  CLIENT_CATALOG_JSON=""
+
+  if command -v wget >/dev/null 2>&1; then
+    output="$(wget -qO- "$CLIENT_CATALOG_URL" 2>/dev/null)" || output=""
+    if [[ -n "$output" ]]; then
+      CLIENT_CATALOG_JSON="$output"
+      CLIENT_CATALOG_LOADED_FROM="$CLIENT_CATALOG_URL via wget"
+      return 0
+    fi
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    output="$(curl -fsSL "$CLIENT_CATALOG_URL" 2>/dev/null)" || output=""
+    if [[ -n "$output" ]]; then
+      CLIENT_CATALOG_JSON="$output"
+      CLIENT_CATALOG_LOADED_FROM="$CLIENT_CATALOG_URL via curl"
+      return 0
+    fi
+  fi
+
+  CLIENT_CATALOG_JSON=""
+  CLIENT_CATALOG_LOADED_FROM=""
+  return 1
+}
+
 prompt_client_identity_manual() {
   local code="" name=""
 
@@ -1107,16 +1145,32 @@ prompt_client_identity_manual() {
 }
 
 select_client_identity_from_catalog() {
-  local catalog_lines="" ans="" idx="" line="" code="" name="" prompt_out="/dev/stderr"
+  local catalog_json="" catalog_lines="" py_cmd="" ans="" idx="" line="" code="" name="" prompt_out="/dev/stderr"
   local codes=() names=()
 
-  command -v wget >/dev/null 2>&1 || return 1
-  command -v python3 >/dev/null 2>&1 || return 1
+  CLIENT_CATALOG_JSON=""
+  CLIENT_CATALOG_LOADED_FROM=""
 
-  if ! catalog_lines="$(wget -qO- "$CLIENT_CATALOG_URL" 2>/dev/null | python3 -c '
+  py_cmd="$(client_catalog_python_command)" || return 1
+  download_client_catalog || return 1
+  catalog_json="$CLIENT_CATALOG_JSON"
+
+  if ! catalog_lines="$(printf "%s" "$catalog_json" | "$py_cmd" -c '
 import json
 import re
 import sys
+
+try:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
+
+def clean_text(value):
+    if value is None:
+        return u""
+    if not isinstance(value, string_types):
+        value = str(value)
+    return value.strip()
 
 try:
     data = json.load(sys.stdin)
@@ -1127,10 +1181,13 @@ try:
     for client in clients:
         if not isinstance(client, dict):
             continue
-        code = str(client.get("client_code", "")).strip()
-        name = str(client.get("client_name", "")).strip()
+        code = clean_text(client.get("client_code", ""))
+        name = clean_text(client.get("client_name", ""))
         if re.match(r"^[a-z0-9_-]+$", code) and name:
-            print(f"{code}\t{name}")
+            line = u"%s\t%s\n" % (code, name)
+            if sys.version_info[0] < 3:
+                line = line.encode("utf-8")
+            sys.stdout.write(line)
 except Exception:
     sys.exit(1)
 ')"; then
@@ -1146,6 +1203,7 @@ except Exception:
   done <<< "$catalog_lines"
 
   [[ "${#codes[@]}" -gt 0 ]] || return 1
+  CLIENT_CATALOG_LOADED_FROM="$CLIENT_CATALOG_LOADED_FROM; parser: $py_cmd"
 
   [[ -w /dev/tty ]] && prompt_out="/dev/tty"
 
@@ -1237,7 +1295,11 @@ ensure_client_identity_file() {
   echo "[$(ts)] INFO: konfiguracja lokalnej identyfikacji klienta dla InfoCenter."
   if ! select_client_identity_from_catalog; then
     echo "[$(ts)] INFO: katalog klientów niedostępny albo wybrano wpis ręczny."
+    add_summary "Client catalog: not loaded from $CLIENT_CATALOG_URL"
     prompt_client_identity_manual
+  else
+    echo "[$(ts)] OK: katalog klientów wczytany z $CLIENT_CATALOG_LOADED_FROM"
+    add_summary "Client catalog: loaded from $CLIENT_CATALOG_LOADED_FROM"
   fi
 
   write_client_identity_file "$identity_file"
