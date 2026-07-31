@@ -106,6 +106,37 @@ run_collector() {
   fi
 }
 
+reports_dir_is_safe() {
+  local reports_real base_real parent_real
+
+  [ -n "${REPORTS_DIR:-}" ] || return 1
+  [ -n "${BASE_DIR:-}" ] || return 1
+
+  reports_real="$(cd "$REPORTS_DIR" 2>/dev/null && pwd -P)" || return 1
+  base_real="$(cd "$BASE_DIR" 2>/dev/null && pwd -P)" || return 1
+  parent_real="$(cd "${BASE_DIR}/.." 2>/dev/null && pwd -P)" || return 1
+
+  case "$reports_real" in
+    ""|"/"|"/root"|"/root/"*) return 1 ;;
+  esac
+
+  [ "$reports_real" = "${base_real}/reports" ] || return 1
+  [ "$(basename "$reports_real")" = "reports" ] || return 1
+  [ "$(basename "$base_real")" = "INVENTORY" ] || return 1
+  [ "$(basename "$parent_real")" = "UTILITY" ] || return 1
+
+  return 0
+}
+
+clean_old_inventory_reports() {
+  if ! reports_dir_is_safe; then
+    printf 'error: refusing to clean unsafe inventory reports directory: %s\n' "$REPORTS_DIR" >&2
+    return 1
+  fi
+
+  find "$REPORTS_DIR" -maxdepth 1 -type f \( -name 'inventory_*.json' -o -name '.inventory_*.json.tmp.*' \) -exec rm -f -- {} \;
+}
+
 collect_report() {
   local client_code hostname timestamp report_name report_path temp_path log_path
 
@@ -118,6 +149,11 @@ collect_report() {
     printf 'error: could not create reports/logs directories\n' >&2
     return 1
   }
+
+  if ! reports_dir_is_safe; then
+    printf 'error: unsafe inventory reports directory: %s\n' "$REPORTS_DIR" >&2
+    return 1
+  fi
 
   client_code="$(read_client_code)"
   hostname="$(safe_filename_part "$(hostname 2>/dev/null || printf 'unknown')")"
@@ -139,6 +175,12 @@ collect_report() {
   if [ ! -s "$temp_path" ]; then
     rm -f "$temp_path"
     printf 'error: inventory collector produced an empty report\n' >&2
+    printf 'log: %s\n' "$log_path" >&2
+    return 1
+  fi
+
+  if ! clean_old_inventory_reports; then
+    rm -f "$temp_path"
     printf 'log: %s\n' "$log_path" >&2
     return 1
   fi
