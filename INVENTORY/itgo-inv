@@ -129,12 +129,40 @@ reports_dir_is_safe() {
 }
 
 clean_old_inventory_reports() {
+  local current_temp_path="${1:-}" reports_real current_temp_real current_temp_dir
+
   if ! reports_dir_is_safe; then
     printf 'error: refusing to clean unsafe inventory reports directory: %s\n' "$REPORTS_DIR" >&2
     return 1
   fi
 
-  find "$REPORTS_DIR" -maxdepth 1 -type f \( -name 'inventory_*.json' -o -name '.inventory_*.json.tmp.*' \) -exec rm -f -- {} \;
+  reports_real="$(cd "$REPORTS_DIR" 2>/dev/null && pwd -P)" || return 1
+
+  if [ -n "$current_temp_path" ]; then
+    current_temp_dir="$(dirname "$current_temp_path")"
+    current_temp_real="$(cd "$current_temp_dir" 2>/dev/null && pwd -P)/$(basename "$current_temp_path")" || return 1
+    case "$current_temp_real" in
+      "$reports_real"/.inventory_*.json.tmp.*) ;;
+      *)
+        printf 'error: refusing to preserve temp file outside inventory reports directory: %s\n' "$current_temp_path" >&2
+        return 1
+        ;;
+    esac
+  fi
+
+  find "$reports_real" -maxdepth 1 -type f -name 'inventory_*.json' -exec rm -f -- {} \;
+
+  if [ -n "$current_temp_path" ]; then
+    find "$reports_real" -maxdepth 1 -type f -name '.inventory_*.json.tmp.*' -exec sh -c '
+      current_temp="$1"
+      shift
+      for candidate_path in "$@"; do
+        [ "$candidate_path" = "$current_temp" ] || rm -f -- "$candidate_path"
+      done
+    ' sh "$current_temp_real" {} +
+  else
+    find "$reports_real" -maxdepth 1 -type f -name '.inventory_*.json.tmp.*' -exec rm -f -- {} \;
+  fi
 }
 
 collect_report() {
@@ -179,7 +207,7 @@ collect_report() {
     return 1
   fi
 
-  if ! clean_old_inventory_reports; then
+  if ! clean_old_inventory_reports "$temp_path"; then
     rm -f "$temp_path"
     printf 'log: %s\n' "$log_path" >&2
     return 1
