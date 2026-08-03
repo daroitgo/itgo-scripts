@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.5"
+COLLECTOR_VERSION = "0.1.6"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -28,6 +28,7 @@ MAX_ARCHIVE_METADATA_ENTRY_BYTES = 1024 * 1024
 MAX_NESTED_WAR_ENTRY_BYTES = 1024 * 1024 * 1024
 NESTED_WAR_COPY_CHUNK_BYTES = 1024 * 1024
 MAX_POM_PROPERTIES_CHARS = 8192
+MAX_MPI_ENV_BYTES = 64 * 1024
 MAX_INTEGRATION_WEBAPPS = 64
 MAX_INTEGRATION_MAVEN_ARTIFACT_DIRS = 32
 MAX_WARNINGS = 32
@@ -52,6 +53,9 @@ DOCKER_EXACT_HINTS = {
     "p1adapter",
 }
 DOCKER_CONTAINS_HINTS = ("amdx", "mpi")
+MPI_ENV_VERSION_PATTERN = re.compile(
+    r"^(?P<commented>#\s*)?VERSION=(?P<version>[A-Za-z0-9._-]{1,128})\s*\Z"
+)
 AMMS_EAR_RELATIVE_PATH = (
     "wildfly-26.0.1.Final",
     "standalone",
@@ -520,6 +524,36 @@ def collect_compose_files(candidate_path):
     return compose_files
 
 
+def read_mpi_env_version(candidate_path):
+    """Read the sole allowlisted MPI application version from candidate_path/.env."""
+    if os.path.basename(os.path.dirname(candidate_path)) != "srv":
+        return None
+    if not os.path.basename(candidate_path).lower().startswith("mpi"):
+        return None
+
+    env_path = os.path.join(candidate_path, ".env")
+    if not is_path_file_within_limit(env_path, MAX_MPI_ENV_BYTES):
+        return None
+    contents = read_utf8_text_file(env_path, MAX_MPI_ENV_BYTES)
+    if contents is None:
+        return None
+
+    for line in contents.splitlines():
+        match = MPI_ENV_VERSION_PATTERN.match(line)
+        if match is None:
+            continue
+        return {
+            "kind": "mpi_env",
+            "version": match.group("version"),
+            "source_path": env_path,
+            "source_key": "VERSION",
+            "source_state": (
+                "commented" if match.group("commented") is not None else "active"
+            ),
+        }
+    return None
+
+
 def is_path_file_within_limit(path, maximum_bytes):
     try:
         stat_result = os.stat(path)
@@ -819,6 +853,9 @@ def collect_application_candidates(
             }
             if candidate_type == "docker_compose":
                 fields["compose_files"] = collect_compose_files(child)
+                application_version = read_mpi_env_version(child)
+                if application_version is not None:
+                    fields["application_version"] = application_version
             elif candidate_type == "wildfly_jboss":
                 application_version = read_amms_build_metadata(child)
                 if application_version is not None:
