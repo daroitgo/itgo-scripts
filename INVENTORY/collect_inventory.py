@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.6"
+COLLECTOR_VERSION = "0.1.7"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -29,6 +29,7 @@ MAX_NESTED_WAR_ENTRY_BYTES = 1024 * 1024 * 1024
 NESTED_WAR_COPY_CHUNK_BYTES = 1024 * 1024
 MAX_POM_PROPERTIES_CHARS = 8192
 MAX_MPI_ENV_BYTES = 64 * 1024
+MAX_EDM_ENV_BYTES = 64 * 1024
 MAX_INTEGRATION_WEBAPPS = 64
 MAX_INTEGRATION_MAVEN_ARTIFACT_DIRS = 32
 MAX_WARNINGS = 32
@@ -55,6 +56,9 @@ DOCKER_EXACT_HINTS = {
 DOCKER_CONTAINS_HINTS = ("amdx", "mpi")
 MPI_ENV_VERSION_PATTERN = re.compile(
     r"^(?P<commented>#\s*)?VERSION=(?P<version>[A-Za-z0-9._-]{1,128})\s*\Z"
+)
+EDM_ENV_VERSION_PATTERN = re.compile(
+    r"^\s*#\s*EDM_VERSION\s*:\s*(?P<version>.*?)\s*\Z"
 )
 AMMS_EAR_RELATIVE_PATH = (
     "wildfly-26.0.1.Final",
@@ -502,6 +506,8 @@ def match_application_candidate(name):
     # match multiple families, prefer the more specific application family first.
     if name.startswith("IntegrationPlatform_"):
         return ("integration_platform", "IntegrationPlatform_*")
+    if lower_name.startswith("edm"):
+        return ("edm", "prefix:edm")
     if "wildfly" in lower_name:
         return ("wildfly_jboss", "contains:wildfly")
     if lower_name in DOCKER_EXACT_HINTS:
@@ -552,6 +558,40 @@ def read_mpi_env_version(candidate_path):
             ),
         }
     return None
+
+
+def read_edm_env_version(candidate_path):
+    """Read the sole allowlisted EDM application version from candidate_path/.env."""
+    if os.path.basename(os.path.dirname(candidate_path)) != "srv":
+        return None
+    if not os.path.basename(candidate_path).lower().startswith("edm"):
+        return None
+
+    env_path = os.path.join(candidate_path, ".env")
+    if not is_path_file_within_limit(env_path, MAX_EDM_ENV_BYTES):
+        return None
+    contents = read_utf8_text_file(env_path, MAX_EDM_ENV_BYTES)
+    if contents is None:
+        return None
+
+    version = None
+    for line in contents.splitlines():
+        match = EDM_ENV_VERSION_PATTERN.match(line)
+        if match is None:
+            continue
+        value = match.group("version").strip()
+        if value:
+            version = value[:128]
+
+    if version is None:
+        return None
+    return {
+        "kind": "edm_env",
+        "version": version,
+        "source_path": env_path,
+        "source_key": "EDM_VERSION",
+        "source_state": "commented",
+    }
 
 
 def is_path_file_within_limit(path, maximum_bytes):
@@ -839,10 +879,16 @@ def collect_application_candidates(
             except OSError:
                 continue
 
-            if is_legacy_application_directory_name(os.path.basename(child)):
+            candidate_name = os.path.basename(child)
+            if is_legacy_application_directory_name(candidate_name):
+                continue
+            if (
+                candidate_name.lower().startswith("edm")
+                and os.path.basename(base) != "srv"
+            ):
                 continue
 
-            match = match_application_candidate(os.path.basename(child))
+            match = match_application_candidate(candidate_name)
             if match is None:
                 continue
 
@@ -854,6 +900,10 @@ def collect_application_candidates(
             if candidate_type == "docker_compose":
                 fields["compose_files"] = collect_compose_files(child)
                 application_version = read_mpi_env_version(child)
+                if application_version is not None:
+                    fields["application_version"] = application_version
+            elif candidate_type == "edm":
+                application_version = read_edm_env_version(child)
                 if application_version is not None:
                     fields["application_version"] = application_version
             elif candidate_type == "wildfly_jboss":
