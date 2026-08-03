@@ -6,7 +6,7 @@
 # ==========================================================
 # UPGBUILDER_VERSION={{UPGBUILDER_VERSION}}
 # TEMPLATE_NAME=template_update_amdx.sh
-# TEMPLATE_VERSION=1.3.0
+# TEMPLATE_VERSION=1.4.0
 # RULE_NAME=amdx
 # GENERATED_AT={{GENERATED_AT}}
 # GENERATED_HOST={{HOSTNAME}}
@@ -17,13 +17,14 @@ set -euo pipefail
 
 UPGBUILDER_VERSION="{{UPGBUILDER_VERSION}}"
 TEMPLATE_NAME="template_update_amdx.sh"
-TEMPLATE_VERSION="1.3.0"
+TEMPLATE_VERSION="1.4.0"
 UPDATER_VERSION="${TEMPLATE_VERSION}"
 RULE_NAME="amdx"
 TARGET_USER="{{TARGET_USER}}"
 
 SRC_DIR="{{DOCKER_DIR}}"
 UPG_DIR="/home/itgo/UPG/EDM"
+AMDX_PACKAGE_DIR="/home/itgo/UTILITY/AMCS/resources/resources"
 BACKUP_ROOT="/home/itgo/BACKUP"
 APP_LOG_DIR="{{APP_LOG_DIR}}"
 
@@ -97,6 +98,19 @@ run_step() {
   fi
 }
 
+run_required_step() {
+  local desc="$1"; shift
+  echo
+  echo "---------- KROK KRYTYCZNY: $desc ----------"
+  if "$@"; then
+    echo "[OK] $desc"
+  else
+    local rc=$?
+    echo "[FATAL] $desc (kod wyjścia: $rc). Przerywam aktualizację."
+    exit "$rc"
+  fi
+}
+
 COMPOSE_KIND=""
 COMPOSE_VER=""
 COMPOSE_CMD=()
@@ -128,7 +142,7 @@ step_guard_compose_stopped() {
   local -a container_ids=()
   local -a running_containers=()
 
-  echo "[0/7] Sprawdzam, czy docelowy projekt Docker Compose jest zatrzymany: ${target_dir}"
+  echo "[0/8] Sprawdzam, czy docelowy projekt Docker Compose jest zatrzymany: ${target_dir}"
 
   if [[ ! -d "$target_dir" ]]; then
     echo "[ERROR] Nie można potwierdzić zatrzymania docelowej aplikacji."
@@ -278,7 +292,7 @@ calc_total_delta_bytes() {
 }
 
 step_clear_logs() {
-  echo "[1/7] Czyszczę logi aplikacyjne: ${APP_LOG_DIR}"
+  echo "[1/8] Czyszczę logi aplikacyjne: ${APP_LOG_DIR}"
   if [[ -d "$APP_LOG_DIR" ]]; then
     sudo find "$APP_LOG_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
   else
@@ -287,7 +301,7 @@ step_clear_logs() {
 }
 
 step_backup_src() {
-  echo "[2/7] Backup: ${SRC_DIR} -> ${BACKUP_DEST}/"
+  echo "[2/8] Backup: ${SRC_DIR} -> ${BACKUP_DEST}/"
   mkdir -p "$BACKUP_DEST"
   if [[ -d "$SRC_DIR" ]]; then
     rsync -a --delete "$SRC_DIR"/ "${BACKUP_DEST}/edm-docker-amdx-cloud/"
@@ -297,7 +311,7 @@ step_backup_src() {
 }
 
 step_cleanup_old_backups() {
-  echo "[3/7] Czyszczę stare backupy, zostawiam 2 najnowsze w ${BACKUP_ROOT}"
+  echo "[3/8] Czyszczę stare backupy, zostawiam 2 najnowsze w ${BACKUP_ROOT}"
   mkdir -p "$BACKUP_ROOT"
   mapfile -t TO_DEL < <(
     find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d ! -name AMCS -printf '%T@ %p/\n' 2>/dev/null \
@@ -331,7 +345,7 @@ step_cleanup_old_amcs_backups() {
 }
 
 step_move_upg_backup_files() {
-  echo "[4/7] Przenoszę pliki *.backup z UPG do backupu AMCS"
+  echo "[4/8] Przenoszę pliki *.backup z UPG do backupu AMCS"
 
   local amcs_backup_dest="${BACKUP_ROOT}/AMCS/${DATE_STAMP}"
   local moved_count=0
@@ -363,8 +377,91 @@ step_move_upg_backup_files() {
   step_cleanup_old_amcs_backups
 }
 
+step_write_edm_version() {
+  local latest_record latest_package package_name edm_version env_file tmp_env env_mode
+
+  echo "[5/8] Zapisuję EDM_VERSION do ${UPG_DIR}/.env"
+
+  if [[ ! -d "$AMDX_PACKAGE_DIR" ]]; then
+    echo "[ERROR] Brak katalogu pakietów AMDX: ${AMDX_PACKAGE_DIR}" >&2
+    return 1
+  fi
+
+  if [[ ! -d "$UPG_DIR" ]]; then
+    echo "[ERROR] Brak katalogu UPG: ${UPG_DIR}" >&2
+    return 1
+  fi
+
+  latest_record="$(
+    find "$AMDX_PACKAGE_DIR" \
+      -mindepth 1 \
+      -maxdepth 1 \
+      -type f \
+      -name 'package_AMDX_*.amp' \
+      -printf '%T@ %p\n' 2>/dev/null |
+      sort -nr |
+      head -n 1 ||
+      true
+  )"
+  if [[ -z "$latest_record" ]]; then
+    echo "[ERROR] Nie znaleziono plików package_AMDX_*.amp w ${AMDX_PACKAGE_DIR}" >&2
+    return 1
+  fi
+
+  latest_package="${latest_record#* }"
+  package_name="$(basename "$latest_package")"
+  edm_version="${package_name#package_AMDX_}"
+  edm_version="${edm_version%.amp}"
+
+  if [[ -z "$edm_version" || ! "$edm_version" =~ ^[0-9][0-9.A-Za-z_-]*$ ]]; then
+    echo "[ERROR] Nieprawidłowa wersja wyodrębniona z pakietu: ${package_name}" >&2
+    return 1
+  fi
+
+  echo "[INFO] Wybrany pakiet AMDX : ${latest_package}"
+  echo "[INFO] Wykryta wersja EDM  : ${edm_version}"
+
+  env_file="${UPG_DIR}/.env"
+  if [[ -e "$env_file" && ! -f "$env_file" ]]; then
+    echo "[ERROR] Ścieżka ${env_file} istnieje, ale nie jest zwykłym plikiem." >&2
+    return 1
+  fi
+
+  if ! tmp_env="$(mktemp "${UPG_DIR}/.env.tmp.XXXXXX")"; then
+    echo "[ERROR] Nie udało się utworzyć pliku tymczasowego dla ${env_file}" >&2
+    return 1
+  fi
+
+  if [[ -f "$env_file" ]]; then
+    env_mode="$(stat -c '%a' "$env_file" 2>/dev/null || true)"
+    if ! awk '/^[[:space:]]*#?[[:space:]]*EDM_VERSION:[[:space:]]*/ { next } { print }' "$env_file" >"$tmp_env"; then
+      rm -f "$tmp_env"
+      echo "[ERROR] Nie udało się odczytać istniejącego pliku ${env_file}" >&2
+      return 1
+    fi
+  fi
+
+  if ! printf '#EDM_VERSION: %s\n' "$edm_version" >>"$tmp_env"; then
+    echo "[ERROR] Nie udało się zapisać EDM_VERSION do pliku tymczasowego: ${tmp_env}" >&2
+    rm -f "$tmp_env"
+    return 1
+  fi
+
+  if [[ -n "${env_mode:-}" ]]; then
+    chmod "$env_mode" "$tmp_env" || echo "[WARN] Nie udało się zachować uprawnień ${env_file}."
+  fi
+
+  if ! mv -f "$tmp_env" "$env_file"; then
+    echo "[ERROR] Nie udało się opublikować pliku ${env_file}" >&2
+    rm -f "$tmp_env"
+    return 1
+  fi
+
+  echo "[INFO] Zaktualizowano plik  : ${env_file}"
+}
+
 step_deploy_upg() {
-  echo "[5/7] Deploy UPG -> katalog aplikacji"
+  echo "[6/8] Deploy UPG -> katalog aplikacji"
 
   if [[ ! -d "$UPG_DIR" ]]; then
     echo "[ERROR] Brak katalogu UPG: ${UPG_DIR}" >&2
@@ -377,7 +474,7 @@ step_deploy_upg() {
 }
 
 step_docker_cleanup_and_restart() {
-  echo "[6/7] Docker: akcje interaktywne (kontenery / obrazy / wolumeny / restart)"
+  echo "[7/8] Docker: akcje interaktywne (kontenery / obrazy / wolumeny / restart)"
 
   command -v docker >/dev/null 2>&1 || { echo "[ERROR] 'docker' nie znaleziony w PATH." >&2; return 1; }
   detect_compose
@@ -433,7 +530,7 @@ step_docker_cleanup_and_restart() {
 }
 
 step_compose_pull_quiet_summary() {
-  echo "[7/7] Pull obrazów (bez spamu) + podsumowanie"
+  echo "[8/8] Pull obrazów (bez spamu) + podsumowanie"
 
   command -v docker >/dev/null 2>&1 || { echo "[ERROR] 'docker' nie znaleziony w PATH." >&2; return 1; }
   detect_compose
@@ -528,6 +625,7 @@ run_step "Czyszczenie logów aplikacyjnych"            step_clear_logs
 run_step "Backup źródła AMDX"                         step_backup_src
 run_step "Czyszczenie starych backupów"               step_cleanup_old_backups
 run_step "Przenoszenie plików *.backup z UPG"         step_move_upg_backup_files
+run_required_step "Zapis EDM_VERSION"                 step_write_edm_version
 run_step "Deploy UPG -> katalog aplikacji"            step_deploy_upg
 run_step "Docker cleanup + restart (interaktywnie)"   step_docker_cleanup_and_restart
 run_step "Compose pull (bez spamu) + podsumowanie"    step_compose_pull_quiet_summary
