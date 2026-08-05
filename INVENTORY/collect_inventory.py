@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.7"
+COLLECTOR_VERSION = "0.1.8"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -30,6 +30,8 @@ NESTED_WAR_COPY_CHUNK_BYTES = 1024 * 1024
 MAX_POM_PROPERTIES_CHARS = 8192
 MAX_MPI_ENV_BYTES = 64 * 1024
 MAX_EDM_ENV_BYTES = 64 * 1024
+MAX_APPLICATION_ENV_BYTES = 64 * 1024
+MAX_APPLICATION_COMPOSE_BYTES = 256 * 1024
 MAX_INTEGRATION_WEBAPPS = 64
 MAX_INTEGRATION_MAVEN_ARTIFACT_DIRS = 32
 MAX_WARNINGS = 32
@@ -52,6 +54,13 @@ DOCKER_EXACT_HINTS = {
     "ekrn",
     "sgds",
     "p1adapter",
+    "p1rej",
+    "p1ser",
+    "cer",
+    "ser",
+    "ozr",
+    "vitreo",
+    "hazelcast",
 }
 DOCKER_CONTAINS_HINTS = ("amdx", "mpi")
 MPI_ENV_VERSION_PATTERN = re.compile(
@@ -530,6 +539,77 @@ def collect_compose_files(candidate_path):
     return compose_files
 
 
+def is_direct_srv_candidate(candidate_path):
+    return os.path.basename(os.path.dirname(candidate_path)) == "srv"
+
+
+def read_allowlisted_env_values(env_path, allowed_keys):
+    """Return last nonempty active values for exact allowlisted .env keys."""
+    if not is_path_file_within_limit(env_path, MAX_APPLICATION_ENV_BYTES):
+        return {}
+    contents = read_utf8_text_file(env_path, MAX_APPLICATION_ENV_BYTES)
+    if contents is None:
+        return {}
+    allowed = set(allowed_keys)
+    result = {}
+    for line in contents.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if key not in allowed:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("\"", chr(39)):
+            value = value[1:-1].strip()
+        if value:
+            result[key] = value[:128]
+    return result
+
+
+def read_allowlisted_compose_image_tags(compose_path, allowed_repositories):
+    """Return last active tags for exact allowlisted image repositories."""
+    if not is_path_file_within_limit(compose_path, MAX_APPLICATION_COMPOSE_BYTES):
+        return {}
+    contents = read_utf8_text_file(compose_path, MAX_APPLICATION_COMPOSE_BYTES)
+    if contents is None:
+        return {}
+    allowed = set(allowed_repositories)
+    result = {}
+    for line in contents.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(r"^image\s*:\s*(.*?)\s*\Z", stripped)
+        if match is None:
+            continue
+        image = match.group(1).strip()
+        if len(image) >= 2 and image[0] == image[-1] and image[0] in ("\"", chr(39)):
+            image = image[1:-1]
+        if not image or "@" in image or chr(36) + "{" in image:
+            continue
+        for repository in allowed:
+            prefix = repository + ":"
+            if not image.startswith(prefix):
+                continue
+            tag = image[len(prefix):].strip()
+            if tag and not any(character.isspace() for character in tag):
+                result[repository] = tag[:128]
+            break
+    return result
+
+
+def application_version(kind, version, source_path, source_key):
+    return {
+        "kind": kind,
+        "version": version,
+        "source_path": source_path,
+        "source_key": source_key,
+        "source_state": "active",
+    }
+
+
 def read_mpi_env_version(candidate_path):
     """Read the sole allowlisted MPI application version from candidate_path/.env."""
     if os.path.basename(os.path.dirname(candidate_path)) != "srv":
@@ -845,6 +925,105 @@ def collect_integration_version_metadata(candidate_path):
     return None, webapps
 
 
+COMPOSE_SINGLE_COMPONENTS = {
+    "ekrn": "amms.asseco.pl/asseco-poz/ekrn",
+    "ozr": "amms.asseco.pl/asseco-poz/pi-p1-ozr-provider",
+    "vitreo": "amms.asseco.pl/asseco-poz/cpi-szrp-services",
+}
+EREJESTRACJA_DIRECTORIES = {
+    "p1erej", "p1rej", "p1cer", "p1ser", "erej", "cer", "ser"
+}
+EREJESTRACJA_REPOSITORY = "amms.asseco.pl/asseco-poz/pi-p1-erejestracja-provider"
+ZM_COMPONENTS = (
+    ("token-generator", "TOKEN_GENERATOR_VERSION"),
+    ("medical-events-data", "MEDICAL_EVENTS_DATA_VERSION"),
+    ("medical-events-p1", "MEDICAL_EVENTS_P1_VERSION"),
+    ("medical-events-repairer", "MEDICAL_EVENTS_REPAIRER_VERSION"),
+)
+HAZELCAST_COMPONENTS = (
+    ("hazelcast", "hazelcast/hazelcast"),
+    ("hazelcast-management-center", "hazelcast/management-center"),
+)
+
+
+def application_candidate(name, candidate_path, fields):
+    return {
+        "source": "filesystem_allowlist",
+        "source_path": candidate_path,
+        "name": name,
+        "candidate_type": "docker_compose",
+        "status": "candidate",
+        "fields": fields,
+    }
+
+
+def special_application_candidates(candidate_path, base_path, candidate_name):
+    """Return candidates for exact /srv-only version probes, or None if generic."""
+    if not is_direct_srv_candidate(candidate_path):
+        return None
+    lower_name = candidate_name.lower()
+    base_fields = {"base_path": base_path, "matched_hint": lower_name}
+
+    if lower_name == "p1adapter":
+        env_path = os.path.join(candidate_path, ".env")
+        values = read_allowlisted_env_values(env_path, ("P1_ADAPTER_VERSION",))
+        fields = dict(base_fields)
+        if "P1_ADAPTER_VERSION" in values:
+            fields["application_version"] = application_version(
+                "p1adapter_env", values["P1_ADAPTER_VERSION"], env_path, "P1_ADAPTER_VERSION"
+            )
+        return [application_candidate(candidate_name, candidate_path, fields)]
+
+    repository = COMPOSE_SINGLE_COMPONENTS.get(lower_name)
+    if lower_name in EREJESTRACJA_DIRECTORIES:
+        repository = EREJESTRACJA_REPOSITORY
+    if repository is not None:
+        compose_path = os.path.join(candidate_path, "docker-compose.yml")
+        tags = read_allowlisted_compose_image_tags(compose_path, (repository,))
+        fields = dict(base_fields)
+        if repository in tags:
+            fields["application_version"] = application_version(
+                "compose_image", tags[repository], compose_path, repository
+            )
+        return [application_candidate(candidate_name, candidate_path, fields)]
+
+    if lower_name == "zm_docker":
+        env_path = os.path.join(candidate_path, ".env")
+        values = read_allowlisted_env_values(
+            env_path, tuple(source_key for name, source_key in ZM_COMPONENTS)
+        )
+        result = []
+        for name, source_key in ZM_COMPONENTS:
+            version = values.get(source_key)
+            if version is None:
+                continue
+            fields = dict(base_fields)
+            fields["application_version"] = application_version(
+                "zm_env", version, env_path, source_key
+            )
+            result.append(application_candidate(name, candidate_path, fields))
+        return result or None
+
+    if lower_name == "hazelcast":
+        compose_path = os.path.join(candidate_path, "docker-compose.yml")
+        tags = read_allowlisted_compose_image_tags(
+            compose_path, tuple(source_key for name, source_key in HAZELCAST_COMPONENTS)
+        )
+        result = []
+        for name, source_key in HAZELCAST_COMPONENTS:
+            version = tags.get(source_key)
+            if version is None:
+                continue
+            fields = dict(base_fields)
+            fields["application_version"] = application_version(
+                "compose_image", version, compose_path, source_key
+            )
+            result.append(application_candidate(name, candidate_path, fields))
+        return result or None
+
+    return None
+
+
 def collect_application_candidates(
     warnings,
     base_paths=APPLICATION_BASE_PATHS,
@@ -886,6 +1065,13 @@ def collect_application_candidates(
                 candidate_name.lower().startswith("edm")
                 and os.path.basename(base) != "srv"
             ):
+                continue
+
+            special_candidates = special_application_candidates(
+                child, base, candidate_name
+            )
+            if special_candidates is not None:
+                candidates.extend(special_candidates)
                 continue
 
             match = match_application_candidate(candidate_name)
