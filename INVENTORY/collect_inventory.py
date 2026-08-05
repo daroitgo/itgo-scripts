@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.8"
+COLLECTOR_VERSION = "0.1.9"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -33,6 +33,7 @@ MAX_EDM_ENV_BYTES = 64 * 1024
 MAX_APPLICATION_ENV_BYTES = 64 * 1024
 MAX_APPLICATION_COMPOSE_BYTES = 256 * 1024
 MAX_INTEGRATION_WEBAPPS = 64
+MAX_INTEGRATION_MAVEN_GROUP_DIRS = 32
 MAX_INTEGRATION_MAVEN_ARTIFACT_DIRS = 32
 MAX_WARNINGS = 32
 MAX_WARNING_MESSAGE_CHARS = 200
@@ -81,10 +82,9 @@ AMMS_BUILD_JSON_ENTRIES = (
     "mspa/build.json",
 )
 INTEGRATION_WEBAPPS_RELATIVE_PATH = ("apache-tomcat", "webapps")
-INTEGRATION_MAVEN_GROUP_RELATIVE_PATH = (
+INTEGRATION_MAVEN_RELATIVE_PATH = (
     "META-INF",
     "maven",
-    "pl.asseco.poz.integration",
 )
 SAFE_COMMAND_ENV = {
     "DOCKER_CONFIG": "/nonexistent",
@@ -840,8 +840,6 @@ def parse_pom_properties(contents):
         value = value.strip()
         if value:
             result[output_key] = value[:255]
-    if result.get("group_id") != "pl.asseco.poz.integration":
-        return {}
     return result
 
 
@@ -865,6 +863,8 @@ def collect_integration_webapps(candidate_path):
     for child in sorted(children, key=lambda item: (item, os.path.basename(item))):
         if len(webapps) >= MAX_INTEGRATION_WEBAPPS:
             break
+        if os.path.basename(child).lower() == "manager":
+            continue
         try:
             if not os.path.isdir(child):
                 continue
@@ -875,31 +875,49 @@ def collect_integration_webapps(candidate_path):
             "name": os.path.basename(child),
             "path": child,
         }
-        group_path = os.path.join(child, *INTEGRATION_MAVEN_GROUP_RELATIVE_PATH)
+        maven_path = os.path.join(child, *INTEGRATION_MAVEN_RELATIVE_PATH)
         try:
-            artifact_dirs = [os.path.join(group_path, name) for name in os.listdir(group_path)]
+            group_dirs = [os.path.join(maven_path, name) for name in os.listdir(maven_path)]
         except OSError:
-            artifact_dirs = []
+            group_dirs = []
 
-        checked_artifact_dirs = 0
-        for artifact_dir in sorted(artifact_dirs, key=lambda item: (item, os.path.basename(item))):
-            if checked_artifact_dirs >= MAX_INTEGRATION_MAVEN_ARTIFACT_DIRS:
+        checked_group_dirs = 0
+        for group_dir in sorted(group_dirs, key=lambda item: (item, os.path.basename(item))):
+            if checked_group_dirs >= MAX_INTEGRATION_MAVEN_GROUP_DIRS:
                 break
             try:
-                if not os.path.isdir(artifact_dir):
+                if not os.path.isdir(group_dir):
                     continue
             except OSError:
                 continue
-            checked_artifact_dirs += 1
-            properties_path = os.path.join(artifact_dir, "pom.properties")
-            metadata = read_pom_properties(properties_path)
-            if not metadata:
-                continue
-            webapp["group_id"] = metadata.get("group_id")
-            webapp["artifact_id"] = metadata.get("artifact_id")
-            webapp["version"] = metadata.get("version")
-            webapp["source_path"] = properties_path
-            break
+            checked_group_dirs += 1
+
+            try:
+                artifact_dirs = [os.path.join(group_dir, name) for name in os.listdir(group_dir)]
+            except OSError:
+                artifact_dirs = []
+
+            checked_artifact_dirs = 0
+            for artifact_dir in sorted(artifact_dirs, key=lambda item: (item, os.path.basename(item))):
+                if checked_artifact_dirs >= MAX_INTEGRATION_MAVEN_ARTIFACT_DIRS:
+                    break
+                try:
+                    if not os.path.isdir(artifact_dir):
+                        continue
+                except OSError:
+                    continue
+                checked_artifact_dirs += 1
+                properties_path = os.path.join(artifact_dir, "pom.properties")
+                metadata = read_pom_properties(properties_path)
+                if not metadata or not metadata.get("version"):
+                    continue
+                webapp["group_id"] = metadata.get("group_id")
+                webapp["artifact_id"] = metadata.get("artifact_id")
+                webapp["version"] = metadata.get("version")
+                webapp["source_path"] = properties_path
+                break
+            if "source_path" in webapp:
+                break
 
         webapps.append(webapp)
 
