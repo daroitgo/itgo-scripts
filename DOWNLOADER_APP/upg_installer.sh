@@ -14,7 +14,7 @@ set -euo pipefail 2>/dev/null || set -eu
 #
 # Opis:
 # - Pobiera manifest versions.json z Nextcloud
-# - Pyta czy pobrać AMMS, PI, BK czy AMCS
+# - Pyta czy pobrać AMMS, PI, BK, AMCS czy WILDFLY
 # - Pokazuje listę dostępnych wersji
 # - Pobiera wybrany plik lub pliki do ~/UPG
 # - Przed pobraniem usuwa stare pliki zgodnie z wybranym typem:
@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - wget
 # ==========================================================
 
-VERSION="1.0.4"
+VERSION="1.0.5"
 MANIFEST_URL="https://helpdesk.itgo.com.pl/nextcloud/index.php/s/s2778Z6z4rEibLp/download"
 
 TARGET_DIR="${HOME}/UPG"
@@ -134,7 +134,7 @@ cleanup_old_artifacts() {
     bk)
       find "$TARGET_DIR" -maxdepth 1 -type f -name "*.war" -print -delete 2>/dev/null || true
       ;;
-    amcs)
+    amcs|wildfly)
       for target_file in "$@"; do
         if [ -f "$target_file" ]; then
           printf '%s\n' "$target_file"
@@ -171,6 +171,7 @@ resolve_download_urls() {
     amms) channel="core"; key="amms" ;;
     pi) channel="core"; key="pi" ;;
     amcs) channel="amcs"; key="amcs_updater" ;;
+    wildfly) channel="wildfly"; key="wildfly_installer" ;;
     bk)
       printf '%s\n' "$manifest" | jq -r --argjson n "$choice" '
         .channels.bk[$n-1]
@@ -197,6 +198,7 @@ resolve_channel() {
     amms|pi) printf '%s\n' "core" ;;
     bk) printf '%s\n' "bk" ;;
     amcs) printf '%s\n' "amcs" ;;
+    wildfly) printf '%s\n' "wildfly" ;;
     *)
       echo "ERROR: Nieznany typ aplikacji: ${app_type}" >&2
       exit 1
@@ -288,13 +290,15 @@ main() {
   echo "2) PI"
   echo "3) BK"
   echo "4) AMCS"
-  read -r -p "Wybierz [1-4]: " app_choice
+  echo "5) WILDFLY"
+  read -r -p "Wybierz [1-5]: " app_choice
 
   case "$app_choice" in
     1) app_type="amms" ;;
     2) app_type="pi" ;;
     3) app_type="bk" ;;
     4) app_type="amcs" ;;
+    5) app_type="wildfly" ;;
     *)
       echo "ERROR: Błędny wybór."
       exit 1
