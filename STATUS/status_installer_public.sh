@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.19"
+VERSION="3.12.20"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -802,6 +802,27 @@ read_key_version_file() {
   fi
 }
 
+read_p1cert_version_file() {
+  local vf="$1"
+  if [[ -r "$vf" ]]; then
+    sed -n 's/^P1CERT_VERSION="\([^"]*\)"$/\1/p' "$vf" 2>/dev/null | head -n1 | tr -d '\r'
+  else
+    echo ""
+  fi
+}
+
+read_p1cert_used() {
+  local sf="$1" value=""
+  if [[ -r "$sf" ]]; then
+    value="$(sed -n 's/^P1_USED=\(yes\|no\|unknown\)$/\1/p' "$sf" 2>/dev/null | head -n1 | tr -d '\r')"
+  fi
+  case "$value" in
+    yes) echo "TAK" ;;
+    no) echo "NIE" ;;
+    *) echo "N/D" ;;
+  esac
+}
+
 module_state() {
   local vf="$1"
   [[ -f "$vf" ]] && echo "YES" || echo "NO"
@@ -891,6 +912,8 @@ upg_cleanup_vf="$HOME/UTILITY/UPG_CLEANUP/.upg_cleanup_version"
 serviceguard_vf="$HOME/UTILITY/SERVICEGUARD/.serviceguard_version"
 inventory_dir="$HOME/UTILITY/INVENTORY"
 inventory_vf="$inventory_dir/inventory.version"
+p1cert_vf="$HOME/UTILITY/P1CERT/p1cert.version"
+p1cert_state="$HOME/UTILITY/P1CERT/state/p1cert-state"
 
 status_installed="$(module_state "$status_vf")"
 tseq_installed="$(module_state "$tseq_vf")"
@@ -900,6 +923,7 @@ upg_cleanup_installed="$(module_state "$upg_cleanup_vf")"
 serviceguard_installed="$(module_state "$serviceguard_vf")"
 inventory_installed="$(inventory_module_state "$inventory_dir" "$inventory_vf")"
 inventory_health="$(inventory_health_state "$inventory_dir" "$inventory_vf")"
+p1cert_installed="$(module_state "$p1cert_vf")"
 
 inst_ver="$(read_version_file "$status_vf")"
 tseq_ver="$(read_version_file "$tseq_vf")"
@@ -908,6 +932,8 @@ upgbuilder_ver="$(read_version_file "$upgbuilder_vf")"
 upg_cleanup_ver="$(read_version_file "$upg_cleanup_vf")"
 serviceguard_ver="$(read_version_file "$serviceguard_vf")"
 inventory_ver="$(read_key_version_file "$inventory_vf" "INVENTORY_VERSION")"
+p1cert_ver="$(read_p1cert_version_file "$p1cert_vf")"
+p1cert_used="$(read_p1cert_used "$p1cert_state")"
 
 [[ -n "${inst_ver:-}" ]] || inst_ver="UNKNOWN"
 [[ -n "${tseq_ver:-}" ]] || tseq_ver="UNKNOWN"
@@ -916,6 +942,7 @@ inventory_ver="$(read_key_version_file "$inventory_vf" "INVENTORY_VERSION")"
 [[ -n "${upg_cleanup_ver:-}" ]] || upg_cleanup_ver="UNKNOWN"
 [[ -n "${serviceguard_ver:-}" ]] || serviceguard_ver="UNKNOWN"
 [[ -n "${inventory_ver:-}" ]] || inventory_ver="UNKNOWN"
+[[ -n "${p1cert_ver:-}" ]] || p1cert_ver="UNKNOWN"
 
 status_github_ver="$(github_latest_for "status-")"
 upg_cleanup_github_ver="$(github_latest_for "cleanup-")"
@@ -924,6 +951,7 @@ downloader_github_ver="$(github_latest_for "downloader_app-")"
 upgbuilder_github_ver="$(github_latest_for "upgbuilder-")"
 serviceguard_github_ver="$(github_latest_for "serviceguard-")"
 inventory_github_ver="$(github_latest_for "inventory-")"
+p1cert_github_ver="$(github_latest_for "p1cert-")"
 
 status_mod_state="$(module_state_text "$status_installed" "$inst_ver" "$status_github_ver")"
 upg_cleanup_mod_state="$(module_state_text "$upg_cleanup_installed" "$upg_cleanup_ver" "$upg_cleanup_github_ver")"
@@ -936,6 +964,7 @@ if [[ "$inventory_health" == "BROKEN" ]]; then
 else
   inventory_mod_state="$(module_state_text "$inventory_installed" "$inventory_ver" "$inventory_github_ver")"
 fi
+p1cert_mod_state="$(module_state_text "$p1cert_installed" "$p1cert_ver" "$p1cert_github_ver")"
 
 upg_cleanup_hook="NO"
 if [[ -f "$HOME/.bashrc" ]] && grep -qF "# >>> UPG XML cleanup (auto) >>>" "$HOME/.bashrc" 2>/dev/null; then
@@ -1232,6 +1261,7 @@ server_body+="$(kv_line "Host" "$host_value" 54)"$'\n'
 server_body+="$(kv_line "OS" "${os:-UNKNOWN}" 54)"$'\n'
 server_body+="$(kv_line "Kernel" "${kernel:-UNKNOWN}" 54)"$'\n'
 server_body+="$(kv_line "Java" "${java:-UNKNOWN}" 54)"$'\n'
+server_body+="$(kv_line "P1 CERT" "$p1cert_used" 54)"$'\n'
 server_body+="$(kv_line "Updates" "$updates_value" 54)"$'\n'
 server_body+="$(kv_line "Support" "$support_value" 54)"
 
@@ -1266,6 +1296,7 @@ modules_body+="$(module_row "Downloader" "${downloader_installed:-NO}" "${downlo
 modules_body+="$(module_row "UPGbuilder" "${upgbuilder_installed:-NO}" "${upgbuilder_ver:-UNKNOWN}" "${upgbuilder_github_ver:-UNKNOWN}" "$upgbuilder_mod_state")"$'\n'
 modules_body+="$(module_row "SvcGuard" "${serviceguard_installed:-NO}" "${serviceguard_ver:-UNKNOWN}" "${serviceguard_github_ver:-UNKNOWN}" "$serviceguard_mod_state")"$'\n'
 modules_body+="$(module_row "Inventory" "${inventory_installed:-NO}" "${inventory_ver:-UNKNOWN}" "${inventory_github_ver:-UNKNOWN}" "$inventory_mod_state")"$'\n'
+modules_body+="$(module_row "P1CERT" "${p1cert_installed:-NO}" "${p1cert_ver:-UNKNOWN}" "${p1cert_github_ver:-UNKNOWN}" "$p1cert_mod_state")"$'\n'
 modules_body+="${DIM}UPGclean hook: bashrc:${upg_cleanup_hook}${RESET}"
 
 echo
