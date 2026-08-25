@@ -37,16 +37,17 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.82"
+MASTER_VERSION="1.2.83"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
-STATUS_VERSION="3.12.19"
+STATUS_VERSION="3.12.20"
 CLEANUP_VERSION="1.0.3"
 TSEQ_VERSION="3.12.9"
 DOWNLOADER_APP_VERSION="1.0.5"
 UPGBUILDER_VERSION="0.1.14"
 SERVICEGUARD_VERSION="0.1.6"
 INVENTORY_VERSION="0.1.14"
+P1CERT_VERSION="0.1.0"
 
 MODE="install"
 UPDATE_ONLY_MODE="0"
@@ -69,6 +70,7 @@ DOWNLOADER_APP_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_R
 UPGBUILDER_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/upgbuilder-${UPGBUILDER_VERSION}/UPGBUILDER/upgbuilder.sh"
 SERVICEGUARD_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/serviceguard-${SERVICEGUARD_VERSION}/SERVICEGUARD/serviceguard_installer_public.sh"
 INVENTORY_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/inventory-${INVENTORY_VERSION}/INVENTORY/inventory_installer_public.sh"
+P1CERT_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/p1cert-${P1CERT_VERSION}/P1CERT/p1cert_installer_public.sh"
 # <<< AUTO-MODULE-VERSIONS END <<<
 CLIENT_CATALOG_URL="https://helpdesk.itgo.com.pl/nextcloud/index.php/s/FFbZwPNHtegWXo4/download"
 
@@ -92,6 +94,8 @@ UPGBUILDER_LOCAL_PATH="${SOURCE_DIR}/UPGBUILDER/upgbuilder.sh"
 SERVICEGUARD_LOCAL_PATH="${SOURCE_DIR}/SERVICEGUARD/serviceguard_installer_public.sh"
 INVENTORY_LOCAL_DIR="${SOURCE_DIR}/INVENTORY"
 INVENTORY_LOCAL_PATH="${INVENTORY_LOCAL_DIR}/inventory_installer_public.sh"
+P1CERT_LOCAL_DIR="${SOURCE_DIR}/P1CERT"
+P1CERT_LOCAL_PATH="${P1CERT_LOCAL_DIR}/p1cert_installer_public.sh"
 UPGBUILDER_LOCAL_MAP="${SOURCE_DIR}/UPGBUILDER/upgbuilder.map"
 UPGBUILDER_LOCAL_TEMPLATE_DIR="${SOURCE_DIR}/UPGBUILDER/template"
 
@@ -689,6 +693,7 @@ start_final_logging_if_possible() {
   echo "[$(ts)]   UPGBUILDER    : $UPGBUILDER_VERSION"
   echo "[$(ts)]   SERVICEGUARD  : $SERVICEGUARD_VERSION"
   echo "[$(ts)]   INVENTORY     : $INVENTORY_VERSION"
+  echo "[$(ts)]   P1CERT        : $P1CERT_VERSION"
 
   if [[ -f "$TMP_LOG" ]]; then
     echo "[$(ts)] --- pre-log (from $TMP_LOG) ---"
@@ -738,6 +743,14 @@ read_inventory_version_file() {
   printf "%s\n" "$version"
 }
 
+read_p1cert_version_file() {
+  local version_file="${1:?}" version=""
+  if [[ -f "$version_file" ]]; then
+    version="$(sed -n 's/^P1CERT_VERSION="\([^"]*\)"$/\1/p' "$version_file" 2>/dev/null | head -n1 | tr -d '\r')"
+  fi
+  printf "%s\n" "$version"
+}
+
 version_file_for_module() {
   local module="${1:?}"
 
@@ -751,6 +764,7 @@ version_file_for_module() {
     UPGBUILDER)     printf "%s\n" "$ITGO_HOME/UTILITY/UPGbuilder/.upgbuilder_version" ;;
     SERVICEGUARD)   printf "%s\n" "$ITGO_HOME/UTILITY/SERVICEGUARD/.serviceguard_version" ;;
     INVENTORY)      printf "%s\n" "$ITGO_HOME/UTILITY/INVENTORY/inventory.version" ;;
+    P1CERT)         printf "%s\n" "$ITGO_HOME/UTILITY/P1CERT/p1cert.version" ;;
     *) return 1 ;;
   esac
 }
@@ -766,6 +780,7 @@ target_version_for_module() {
     UPGBUILDER)     printf "%s\n" "$UPGBUILDER_VERSION" ;;
     SERVICEGUARD)   printf "%s\n" "$SERVICEGUARD_VERSION" ;;
     INVENTORY)      printf "%s\n" "$INVENTORY_VERSION" ;;
+    P1CERT)         printf "%s\n" "$P1CERT_VERSION" ;;
     *) return 1 ;;
   esac
 }
@@ -775,6 +790,10 @@ installed_version_for_module() {
   version_file="$(version_file_for_module "$module")" || return 1
   if [[ "$module" == "INVENTORY" ]]; then
     read_inventory_version_file "$version_file"
+    return 0
+  fi
+  if [[ "$module" == "P1CERT" ]]; then
+    read_p1cert_version_file "$version_file"
     return 0
   fi
   read_version_file "$version_file"
@@ -838,6 +857,13 @@ module_health_for_module() {
         && -d "$ITGO_HOME/UTILITY/INVENTORY/logs" \
         && -L /usr/local/bin/itgo-inv ]] && echo "OK" || echo "BROKEN"
       ;;
+    P1CERT)
+      [[ -d "$ITGO_HOME/UTILITY/P1CERT" \
+        && -f "$version_file" \
+        && -x "$ITGO_HOME/UTILITY/P1CERT/bin/p1cert" \
+        && -x "$ITGO_HOME/UTILITY/P1CERT/bin/p1cert_audit.sh" \
+        && -L /usr/local/bin/p1cert ]] && echo "OK" || echo "BROKEN"
+      ;;
     *)
       echo "UNKNOWN"
       ;;
@@ -863,7 +889,7 @@ compare_versions() {
 }
 
 detect_installed_modules() {
-  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER SERVICEGUARD INVENTORY)
+  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER SERVICEGUARD INVENTORY P1CERT)
   local module installed_version target_version health
 
   for module in "${modules[@]}"; do
@@ -877,7 +903,7 @@ detect_installed_modules() {
 }
 
 any_itgo_module_installed() {
-  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER SERVICEGUARD INVENTORY)
+  local modules=(STATUS CLEANUP TSEQ DOWNLOADER_APP UPGBUILDER SERVICEGUARD INVENTORY P1CERT)
   local module
 
   for module in "${modules[@]}"; do
@@ -1693,6 +1719,57 @@ download_inventory_payload() {
   chown -R "$TARGET_USER:$TARGET_USER" "$out_dir" 2>/dev/null || true
 }
 
+download_p1cert_payload() {
+  local out_dir="${1:?}"
+  local item source_path out_path url payload_file item_dir
+
+  [[ -d "$TMP_DIR" ]] || { echo "[$(ts)] ERROR: missing $TMP_DIR"; return 1; }
+
+  rm -rf "$out_dir"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$out_dir"
+
+  payload_file="$out_dir/p1cert.payload"
+  if [[ "$OFFLINE_MODE" == "1" ]]; then
+    source_path="$P1CERT_LOCAL_DIR/p1cert.payload"
+    [[ -f "$source_path" ]] || { echo "[$(ts)] ERROR: local P1CERT payload manifest missing: $source_path"; return 1; }
+    echo "[$(ts)] COPY(local): $source_path -> $payload_file"
+    cp "$source_path" "$payload_file"
+  else
+    url="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/p1cert-${P1CERT_VERSION}/P1CERT/p1cert.payload"
+    echo "[$(ts)] DOWNLOAD: $url -> $payload_file"
+    wget -qO "$payload_file" "$url"
+  fi
+
+  while IFS= read -r item || [[ -n "$item" ]]; do
+    item="${item%$'\r'}"
+    if [[ -z "$item" || "$item" == /* || "$item" == *..* || "$item" == *\\* || "$item" == */ || ! "$item" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+      echo "[$(ts)] ERROR: unsafe P1CERT payload path: ${item:-<empty>}"
+      return 1
+    fi
+    out_path="$out_dir/$item"
+    item_dir="$(dirname "$out_path")"
+    install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$item_dir"
+    if [[ "$OFFLINE_MODE" == "1" ]]; then
+      source_path="$P1CERT_LOCAL_DIR/$item"
+      [[ -f "$source_path" ]] || { echo "[$(ts)] ERROR: local source missing: $source_path"; return 1; }
+      echo "[$(ts)] COPY(local): $source_path -> $out_path"
+      cp "$source_path" "$out_path"
+    else
+      if [[ "$item" == "p1cert_installer_public.sh" ]]; then
+        url="$P1CERT_URL"
+      else
+        url="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/p1cert-${P1CERT_VERSION}/P1CERT/${item}"
+      fi
+      echo "[$(ts)] DOWNLOAD: $url -> $out_path"
+      wget -qO "$out_path" "$url"
+    fi
+  done < "$payload_file"
+
+  chmod 0755 "$out_dir/p1cert_installer_public.sh" "$out_dir/p1cert" "$out_dir/p1cert_audit.sh"
+  chmod 0644 "$payload_file" "$out_dir/p1cert.version" "$out_dir/README.md" "$out_dir/CHANGELOG.md"
+  chown -R "$TARGET_USER:$TARGET_USER" "$out_dir" 2>/dev/null || true
+}
+
 run_module_root() {
   local script="${1:?}"
   shift || true
@@ -2266,9 +2343,10 @@ EOF_UPGBUILDER_LAUNCHER
 cleanup_downloaded_installers() {
   if [[ -d "$TMP_DIR" ]]; then
     if prompt_yn "Usunąć pobrane instalery (*.sh) z $TMP_DIR?" "Y"; then
-      echo "[$(ts)] ACTION: rm -f $TMP_DIR/*.sh; rm -rf $TMP_DIR/INVENTORY"
+      echo "[$(ts)] ACTION: rm -f $TMP_DIR/*.sh; rm -rf $TMP_DIR/INVENTORY $TMP_DIR/P1CERT"
       rm -f -- "$TMP_DIR"/*.sh 2>/dev/null || true
       rm -rf -- "$TMP_DIR/INVENTORY" 2>/dev/null || true
+      rm -rf -- "$TMP_DIR/P1CERT" 2>/dev/null || true
       echo "[$(ts)] OK: installers removed."
     else
       echo "[$(ts)] SKIP: keeping downloaded installers."
@@ -2280,7 +2358,8 @@ cleanup_tmp_installers_after_uninstall() {
   if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
     rm -f -- "$TMP_DIR"/*.sh 2>/dev/null || true
     rm -rf -- "$TMP_DIR/INVENTORY" 2>/dev/null || true
-    add_summary "TMP cleanup po uninstall: wykonane ($TMP_DIR/*.sh, $TMP_DIR/INVENTORY)"
+    rm -rf -- "$TMP_DIR/P1CERT" 2>/dev/null || true
+    add_summary "TMP cleanup po uninstall: wykonane ($TMP_DIR/*.sh, $TMP_DIR/INVENTORY, $TMP_DIR/P1CERT)"
   else
     add_summary "TMP cleanup po uninstall: SKIP (TMP_DIR unavailable)"
   fi
@@ -2290,7 +2369,8 @@ cleanup_tmp_installers_no_prompt() {
   if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
     rm -f -- "$TMP_DIR"/*.sh 2>/dev/null || true
     rm -rf -- "$TMP_DIR/INVENTORY" 2>/dev/null || true
-    add_summary "TMP cleanup: wykonane ($TMP_DIR/*.sh, $TMP_DIR/INVENTORY)"
+    rm -rf -- "$TMP_DIR/P1CERT" 2>/dev/null || true
+    add_summary "TMP cleanup: wykonane ($TMP_DIR/*.sh, $TMP_DIR/INVENTORY, $TMP_DIR/P1CERT)"
   else
     add_summary "TMP cleanup: SKIP (TMP_DIR unavailable)"
   fi
@@ -2908,6 +2988,43 @@ install_inventory_step() {
   fi
 }
 
+install_p1cert_step() {
+  local p1cert_dir="${1:?}"
+  local p1cert_sh="$p1cert_dir/p1cert_installer_public.sh"
+
+  if should_install_or_update_module "P1CERT"; then
+    if [[ "$MODULE_DECISION" == "install" ]]; then
+      if prompt_yn "KROK: zainstalować P1CERT (read-only audit certyfikatów P1)?" "Y"; then
+        ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+        have_user || { echo "[$(ts)] ERROR: user '$TARGET_USER' missing."; exit 1; }
+        ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+        [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+        UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+        TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+        [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+        [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+        download_p1cert_payload "$p1cert_dir"
+        run_module_root "$p1cert_sh" "$TARGET_USER"
+        echo "[$(ts)] OK: P1CERT done."
+      else
+        echo "[$(ts)] SKIP: P1CERT."
+      fi
+    else
+      ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
+      have_user || { echo "[$(ts)] ERROR: user '$TARGET_USER' missing."; exit 1; }
+      ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+      [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+      UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+      TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+      [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+      [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+      download_p1cert_payload "$p1cert_dir"
+      run_module_root "$p1cert_sh" "$TARGET_USER"
+      echo "[$(ts)] OK: P1CERT done."
+    fi
+  fi
+}
+
 bootstrap_block() {
   ensure_user_and_password_if_missing
   ensure_home_dirs
@@ -2984,10 +3101,11 @@ prompt_uninstall_module_choice() {
   echo "5) UPGBUILDER" >&2
   echo "6) SERVICEGUARD" >&2
   echo "7) INVENTORY" >&2
+  echo "8) P1CERT" >&2
   echo "q) Anuluj uninstall" >&2
 
   while true; do
-    printf "%s" "Wybierz [1-7/q]: " >&2
+    printf "%s" "Wybierz [1-8/q]: " >&2
     read -r ans || true
     case "$ans" in
       1) echo "STATUS"; return 0 ;;
@@ -2997,8 +3115,9 @@ prompt_uninstall_module_choice() {
       5) echo "UPGBUILDER"; return 0 ;;
       6) echo "SERVICEGUARD"; return 0 ;;
       7) echo "INVENTORY"; return 0 ;;
+      8) echo "P1CERT"; return 0 ;;
       q|Q) echo "cancel"; return 0 ;;
-      *) echo "Wpisz liczbę od 1 do 7 albo q." >&2 ;;
+      *) echo "Wpisz liczbę od 1 do 8 albo q." >&2 ;;
     esac
   done
 }
@@ -3106,6 +3225,26 @@ uninstall_inventory_step() {
   add_summary "Uninstall: INVENTORY"
 }
 
+uninstall_p1cert_step() {
+  local app_dir legacy_link
+
+  if ! have_user; then
+    echo "[$(ts)] WARN: user '$TARGET_USER' missing. Pomijam P1CERT uninstall."
+    return 0
+  fi
+
+  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+  [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] WARN: cannot resolve home for '$TARGET_USER'. Pomijam P1CERT uninstall."; return 0; }
+
+  app_dir="$ITGO_HOME/UTILITY/P1CERT"
+  legacy_link="/usr/local/bin/p1cert"
+  rm -f "$legacy_link" "${legacy_link}.bak" "${legacy_link}.bak."* 2>/dev/null || true
+  rm -rf "$app_dir" 2>/dev/null || true
+
+  echo "[$(ts)] OK: P1CERT uninstall done."
+  add_summary "Uninstall: P1CERT"
+}
+
 run_single_module_uninstall() {
   local module="${1:?}" status_sh="${2:?}" cleanup_sh="${3:?}" tseq_sh="${4:?}" serviceguard_sh="${5:?}"
 
@@ -3117,6 +3256,7 @@ run_single_module_uninstall() {
     UPGBUILDER)     uninstall_upgbuilder_step ;;
     SERVICEGUARD)   uninstall_serviceguard_step "$serviceguard_sh" ;;
     INVENTORY)      uninstall_inventory_step ;;
+    P1CERT)         uninstall_p1cert_step ;;
     *) echo "[$(ts)] ERROR: unknown module for uninstall: $module"; exit 1 ;;
   esac
 }
@@ -3131,6 +3271,7 @@ run_all_module_uninstalls() {
   uninstall_upgbuilder_step
   uninstall_serviceguard_step "$serviceguard_sh"
   uninstall_inventory_step
+  uninstall_p1cert_step
 }
 
 section() {
@@ -3142,7 +3283,7 @@ section() {
 
 main() {
   local detected_modules="" uninstall_scope="" uninstall_module=""
-  local status_sh cleanup_sh tseq_sh downloader_app_sh upgbuilder_sh serviceguard_sh inventory_dir
+  local status_sh cleanup_sh tseq_sh downloader_app_sh upgbuilder_sh serviceguard_sh inventory_dir p1cert_dir
 
   need_root
   prelog "BEGIN: ITGO Master Installer v$MASTER_VERSION user=$TARGET_USER"
@@ -3183,6 +3324,7 @@ main() {
     upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
     serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
     inventory_dir="$TMP_DIR/INVENTORY"
+    p1cert_dir="$TMP_DIR/P1CERT"
 
     section "UPDATE-ONLY - MODUŁY"
     install_status_step "$status_sh"
@@ -3192,6 +3334,7 @@ main() {
     install_upgbuilder_step "$upgbuilder_sh"
     install_serviceguard_step "$serviceguard_sh"
     install_inventory_step "$inventory_dir"
+    install_p1cert_step "$p1cert_dir"
     install_amcs_step
 
     cleanup_tmp_installers_no_prompt
@@ -3216,6 +3359,7 @@ main() {
       upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
       serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
       inventory_dir="$TMP_DIR/INVENTORY"
+      p1cert_dir="$TMP_DIR/P1CERT"
 
       uninstall_scope="$(prompt_uninstall_scope)"
       if [[ "$uninstall_scope" == "all" ]]; then
@@ -3305,6 +3449,7 @@ main() {
   upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
   serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
   inventory_dir="$TMP_DIR/INVENTORY"
+  p1cert_dir="$TMP_DIR/P1CERT"
 
   section "SEKCJA 4/8 - MODUŁY CORE"
   install_status_step "$status_sh"
@@ -3335,6 +3480,7 @@ main() {
   install_upgbuilder_step "$upgbuilder_sh"
   install_serviceguard_step "$serviceguard_sh"
   install_inventory_step "$inventory_dir"
+  install_p1cert_step "$p1cert_dir"
 
   section "SEKCJA 6/8 - TOOLS"
   if prompt_yn "MODUŁ: TOOLS/cp-upg (lokalny helper kopiowania produkcji do ~/UPG/EDM, ZM, MPI, P1ADAPTER)?" "Y"; then
