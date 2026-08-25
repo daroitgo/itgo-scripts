@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec /usr/bin/env bash "$0" "$@"
+fi
+
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -r "$SCRIPT_DIR/p1cert.version" ]; then
+  MODULE_DIR="$SCRIPT_DIR"
+else
+  MODULE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+VERSION_FILE="$MODULE_DIR/p1cert.version"
+
+version() {
+  # shellcheck disable=SC1090
+  [ -r "$VERSION_FILE" ] && . "$VERSION_FILE"
+  printf '%s\n' "${P1CERT_VERSION:-UNKNOWN}"
+}
+
+usage() {
+  cat <<'EOF'
+Użycie: p1cert <polecenie>
+
+Polecenia:
+  audit     bezpieczny audyt konfiguracji i certyfikatów P1
+  verify    alias polecenia audit
+  status    pokaż wynik ostatniego audytu
+  version   pokaż wersję modułu
+  help      pokaż tę pomoc
+EOF
+}
+
+case "${1:-help}" in
+  audit|verify)
+    exec "$SCRIPT_DIR/p1cert_audit.sh"
+    ;;
+  status)
+    if [ -r "$MODULE_DIR/state/p1cert-state" ]; then
+      cat "$MODULE_DIR/state/p1cert-state"
+    else
+      printf '%s\n' 'Brak wyniku audytu. Uruchom: p1cert audit'
+    fi
+    ;;
+  version)
+    version
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    printf 'Nieznane polecenie: %s\n' "$1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
