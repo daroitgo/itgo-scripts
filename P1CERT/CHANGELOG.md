@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.2 - 2026-09-02
+
+- Fixed manifest.env line endings in p1-production-certs.zip from CRLF to LF so Linux validation works correctly.
 ## 0.1.1 - 2026-08-26
 
 - Made AUDIT/VERIFY payload-driven: fingerprints are calculated from the
@@ -14,3 +17,4 @@
 - Initial P1CERT module.
 - Added read-only AUDIT/VERIFY for P1ADAPTER and P1CER certificate sources.
 - UPDATE and SCHEDULE are not implemented.
+
