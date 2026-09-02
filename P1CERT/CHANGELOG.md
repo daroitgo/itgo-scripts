@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3 - 2026-09-02
+
+- Fixed certificate payload parsing compatibility across RHEL-family OpenSSL
+  versions (including Oracle Linux 7.x/OpenSSL 1.0.x and Rocky Linux 9.x): the
+  SHA-256 fingerprint field name is now matched case-insensitively.
+- Made target certificate reading format-agnostic by trying PEM first and DER
+  second, independently of the filename extension.
+
 ## 0.1.2 - 2026-09-02
 
 - Fixed manifest.env line endings in p1-production-certs.zip from CRLF to LF so Linux validation works correctly.

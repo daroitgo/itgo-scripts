@@ -142,8 +142,9 @@ extract_file() {
 }
 read_certificate() {
   local file="$1" type="$2" data fingerprint subject issuer not_before not_after
-  data="$(openssl x509 -in "$file" -noout -fingerprint -sha256 -subject -issuer -startdate -enddate 2>/dev/null)" || return 1
-  fingerprint="$(printf '%s\n' "$data" | awk -F= '/^sha256 Fingerprint=/{ print toupper($2); exit }')"
+  data="$(openssl x509 -in "$file" -noout -fingerprint -sha256 -subject -issuer -startdate -enddate 2>/dev/null)" || \
+    data="$(openssl x509 -inform DER -in "$file" -noout -fingerprint -sha256 -subject -issuer -startdate -enddate 2>/dev/null)" || return 1
+  fingerprint="$(printf '%s\n' "$data" | awk -F= '{ field=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", field); if (tolower(field) == "sha256 fingerprint") { print toupper($2); exit } }')"
   subject="$(printf '%s\n' "$data" | sed -n 's/^subject=//p')"; issuer="$(printf '%s\n' "$data" | sed -n 's/^issuer=//p')"
   not_before="$(printf '%s\n' "$data" | sed -n 's/^notBefore=//p')"; not_after="$(printf '%s\n' "$data" | sed -n 's/^notAfter=//p')"
   [ -n "$fingerprint" ] && [ -n "$subject" ] && [ -n "$issuer" ] && [ -n "$not_before" ] && [ -n "$not_after" ] || return 1
