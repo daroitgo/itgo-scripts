@@ -7,7 +7,18 @@ fi
 
 set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve a symlink one hop at a time.  This avoids depending on GNU readlink -f
+# while also handling relative link targets on older RHEL-family systems.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  LINK_TARGET="$(readlink "$SOURCE")" || break
+  case "$LINK_TARGET" in
+    /*) SOURCE="$LINK_TARGET" ;;
+    *) SOURCE="$SOURCE_DIR/$LINK_TARGET" ;;
+  esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 if [ -r "$SCRIPT_DIR/p1cert.version" ]; then
   MODULE_DIR="$SCRIPT_DIR"
 else
