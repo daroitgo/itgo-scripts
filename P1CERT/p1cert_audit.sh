@@ -21,6 +21,16 @@ STATE_FILE="$STATE_DIR/p1cert-state"
 P1CERT_VERSION="${P1CERT_VERSION:-UNKNOWN}"
 
 P1_USED=no
+PROFILE=UNKNOWN
+ENDPOINT=""
+SERVER_TRUST_PATH=""
+SERVER_TRUST_TYPE=UNKNOWN
+SERVER_TRUST_PASSWORD=""
+SERVER_TRUST_CONTAINER=""
+CLIENT_TLS_PATH=""
+CLIENT_TLS_TYPE=UNKNOWN
+CLIENT_WSS_PATH=""
+CLIENT_WSS_TYPE=UNKNOWN
 SOURCE_TYPE=UNKNOWN
 SOURCE_PATH=""
 SOURCE_PASSWORD=""
@@ -45,6 +55,15 @@ JAVA_CACERTS=""
 JAVA_TARGET_ROOT_PRESENT=unknown
 JAVA_TARGET_TLS_PRESENT=unknown
 AUDIT_RESULT=OK
+
+# Tests can mirror /srv below an isolated directory.  Production keeps paths
+# unchanged; displayed and persisted paths are always the logical paths.
+fs_path() {
+  case "${P1CERT_FS_ROOT:-}" in
+    '') printf '%s\n' "$1" ;;
+    *) printf '%s%s\n' "${P1CERT_FS_ROOT%/}" "$1" ;;
+  esac
+}
 
 log() {
   printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"
@@ -71,7 +90,7 @@ yesno() {
 config_value() {
   local file="$1" key="$2" value
   [ -r "$file" ] || return 0
-  value="$(awk -v wanted="$key" '$0 ~ "^[[:space:]]*(-[[:space:]]+)?(export[[:space:]]+)?" wanted "[[:space:]]*=" { sub("^[[:space:]]*(-[[:space:]]+)?(export[[:space:]]+)?" wanted "[[:space:]]*=[[:space:]]*", ""); print; exit }' "$file")"
+  value="$(awk -v wanted="$key" '$0 ~ "^[[:space:]]*(-[[:space:]]+)?(export[[:space:]]+)?" wanted "[[:space:]]*=" { sub("^[[:space:]]*(-[[:space:]]+)?(export[[:space:]]+)?" wanted "[[:space:]]*=[[:space:]]*", ""); sub(/[[:space:]]+$/, ""); print; exit }' "$file")"
   case "$value" in
     \"*\") value="${value#\"}"; value="${value%\"}" ;;
     \'*\') value="${value#\'}"; value="${value%\'}" ;;
@@ -187,10 +206,99 @@ path_from_p1adapter() {
     esac
   fi
 }
+
+sync_legacy_source() {
+  SOURCE_PATH="$SERVER_TRUST_PATH"
+  SOURCE_TYPE="$SERVER_TRUST_TYPE"
+  SOURCE_PASSWORD="$SERVER_TRUST_PASSWORD"
+}
+
+compose_file() {
+  local app_dir="$1" file
+  for file in docker-compose.yml compose.yml compose.yaml; do
+    [ -r "$(fs_path "$app_dir/$file")" ] && { printf '%s\n' "$app_dir/$file"; return 0; }
+  done
+  return 1
+}
+
+detect_p1adapter() {
+  local logical=/srv/P1ADAPTER file value
+  [ -d "$(fs_path "$logical")" ] || return 1
+  APP_DIR="$logical"; PROFILE=P1ADAPTER
+  path_from_p1adapter "$(fs_path "$logical/.env")"
+  if [ -n "$SOURCE_PATH" ]; then
+    P1_USED=yes; SERVER_TRUST_PATH="$SOURCE_PATH"; SERVER_TRUST_TYPE="$SOURCE_TYPE"; SERVER_TRUST_PASSWORD="$SOURCE_PASSWORD"; return 0
+  fi
+  for file in "$logical/docker-compose.yml" "$logical/compose.yml" "$logical/compose.yaml"; do
+    [ -r "$(fs_path "$file")" ] || continue
+    value="$(config_value "$(fs_path "$file")" KEYSTORE_FILE)"
+    if [ -n "$value" ]; then
+      SERVER_TRUST_PATH="$(resolve_config_path "$APP_DIR" "$value")"; SERVER_TRUST_TYPE="$(config_value "$(fs_path "$file")" KEYSTORE_TYPE)"; [ -n "$SERVER_TRUST_TYPE" ] || SERVER_TRUST_TYPE=JKS; P1_USED=yes; sync_legacy_source; return 0
+    fi
+  done
+  P1_USED=unknown; AUDIT_RESULT=UNKNOWN; return 0
+}
+
+detect_p1cer() {
+  local logical=/srv/P1CER file value
+  [ -d "$(fs_path "$logical")" ] || return 1
+  APP_DIR="$logical"; PROFILE=P1CER
+  for file in "$logical/docker-compose.yml" "$logical/compose.yml" "$logical/compose.yaml"; do
+    [ -r "$(fs_path "$file")" ] || continue
+    SERVER_TRUST_PATH="$(config_value "$(fs_path "$file")" CSIOZ_EREJESTRACJA_TRUSTSTORE_PATH)"; SERVER_TRUST_PASSWORD="$(config_value "$(fs_path "$file")" CSIOZ_EREJESTRACJA_TRUSTSTORE_PASSWORD)"; SERVER_TRUST_TYPE="$(config_value "$(fs_path "$file")" CSIOZ_EREJESTRACJA_TRUSTSTORE_TYPE)"
+    if [ -n "$SERVER_TRUST_PATH" ]; then SERVER_TRUST_PATH="$(resolve_config_path "$APP_DIR" "$SERVER_TRUST_PATH")"; [ -n "$SERVER_TRUST_TYPE" ] || SERVER_TRUST_TYPE=PKCS12; P1_USED=yes; sync_legacy_source; return 0; fi
+    for value in CSIOZ_EREJESTRACJA_SSL_KEYSTORE_PATH CSIOZ_EREJESTRACJA_TLS_KEYSTORE_PATH CSIOZ_EREJESTRACJA_WSS_KEYSTORE_PATH; do
+      SERVER_TRUST_PATH="$(config_value "$(fs_path "$file")" "$value")"
+      case "$SERVER_TRUST_PATH" in *.pem|*.PEM|*.cer|*.CER|*.crt|*.CRT) SERVER_TRUST_PATH="$(resolve_config_path "$APP_DIR" "$SERVER_TRUST_PATH")"; SERVER_TRUST_TYPE=PEM; P1_USED=yes; sync_legacy_source; return 0 ;; esac
+    done
+  done
+  P1_USED=unknown; AUDIT_RESULT=UNKNOWN; return 0
+}
+
+detect_classic_pi() {
+  local app=/srv/IntegrationPlatform_ERECEPTY apache cfg sign
+  apache="$app/apache-tomcat/webapps/p1-war/WEB-INF"
+  cfg="$apache/appConfig.properties"; sign="$apache/classes/p1Sign.properties"
+  [ -r "$(fs_path "$cfg")" ] || return 1
+  APP_DIR="$app"; PROFILE=CLASSIC_PI; P1_USED=yes
+  ENDPOINT="$(config_value "$(fs_path "$cfg")" p1.host.url)"
+  SERVER_TRUST_PATH="$(config_value "$(fs_path "$cfg")" SSL.patch)"; SERVER_TRUST_TYPE=PEM
+  CLIENT_TLS_PATH="$(config_value "$(fs_path "$cfg")" TLS.patch)"; CLIENT_TLS_TYPE=PKCS12
+  CLIENT_WSS_PATH="$(config_value "$(fs_path "$sign")" org.apache.ws.security.crypto.merlin.keystore.file)"
+  CLIENT_WSS_TYPE="$(config_value "$(fs_path "$sign")" org.apache.ws.security.crypto.merlin.keystore.type)"; [ -n "$CLIENT_WSS_TYPE" ] || CLIENT_WSS_TYPE=UNKNOWN
+  sync_legacy_source
+}
+
+detect_medical_events() {
+  local app=/srv/zm_docker env compose folder server client medevt
+  env="$app/.env"; compose="$(compose_file "$app" || true)"
+  [ -r "$(fs_path "$env")" ] && [ -n "$compose" ] || return 1
+  APP_DIR="$app"; PROFILE=MEDICAL_EVENTS_DOCKER; P1_USED=yes
+  folder="$(config_value "$(fs_path "$env")" KEYSTORES_FOLDER)"; server="$(config_value "$(fs_path "$env")" FHIR_SSL_CERT_FILE)"; client="$(config_value "$(fs_path "$env")" ZDM_KEYSTORE_FILE)"
+  [ -n "$server" ] && SERVER_TRUST_PATH="$(resolve_config_path "$app" "${folder%/}/$server")"; SERVER_TRUST_TYPE=PEM
+  [ -n "$client" ] && CLIENT_TLS_PATH="$(resolve_config_path "$app" "${folder%/}/$client")"; CLIENT_TLS_TYPE=JKS
+  medevt="$app/medevt.env"; ENDPOINT="$(config_value "$(fs_path "$medevt")" FHIR_SERVER_URL)"; [ -n "$ENDPOINT" ] || ENDPOINT="$(config_value "$(fs_path "$medevt")" AUTHORIZATION_URL)"
+  sync_legacy_source
+}
+
+detect_ekrn() {
+  local app=/srv/EKRN compose
+  compose="$(compose_file "$app" || true)"; [ -n "$compose" ] || return 1
+  APP_DIR="$app"; PROFILE=EKRN; P1_USED=yes
+  ENDPOINT="$(config_value "$(fs_path "$compose")" EKRN_URL)"
+  SERVER_TRUST_PATH="$(config_value "$(fs_path "$compose")" EKRN_SSL_TRUSTSTORE_PATH)"; SERVER_TRUST_TYPE="$(config_value "$(fs_path "$compose")" EKRN_SSL_TRUSTSTORE_TYPE)"; SERVER_TRUST_PASSWORD="$(config_value "$(fs_path "$compose")" EKRN_SSL_TRUSTSTORE_PASSWORD)"
+  CLIENT_WSS_PATH="$(config_value "$(fs_path "$compose")" EKRN_SSL_KEYSTORE_PATH)"; CLIENT_WSS_TYPE="$(config_value "$(fs_path "$compose")" EKRN_SSL_KEYSTORE_TYPE)"
+  [ -n "$SERVER_TRUST_TYPE" ] || SERVER_TRUST_TYPE=UNKNOWN; [ -n "$CLIENT_WSS_TYPE" ] || CLIENT_WSS_TYPE=UNKNOWN
+  sync_legacy_source
+}
+
 detect_source() {
-  local file value
-  if [ -d /srv/P1ADAPTER ]; then APP_DIR=/srv/P1ADAPTER; path_from_p1adapter /srv/P1ADAPTER/.env; if [ -n "$SOURCE_PATH" ]; then P1_USED=yes; return 0; fi; for file in /srv/P1ADAPTER/docker-compose.yml /srv/P1ADAPTER/compose.yml /srv/P1ADAPTER/compose.yaml; do [ -r "$file" ] || continue; value="$(config_value "$file" KEYSTORE_FILE)"; if [ -n "$value" ]; then SOURCE_PATH="$(resolve_config_path "$APP_DIR" "$value")"; SOURCE_TYPE="$(config_value "$file" KEYSTORE_TYPE)"; [ -n "$SOURCE_TYPE" ] || SOURCE_TYPE=JKS; P1_USED=yes; return 0; fi; done; P1_USED=unknown; AUDIT_RESULT=UNKNOWN; return 0; fi
-  if [ -d /srv/P1CER ]; then APP_DIR=/srv/P1CER; for file in /srv/P1CER/docker-compose.yml /srv/P1CER/compose.yml /srv/P1CER/compose.yaml; do [ -r "$file" ] || continue; SOURCE_PATH="$(config_value "$file" CSIOZ_EREJESTRACJA_TRUSTSTORE_PATH)"; SOURCE_PASSWORD="$(config_value "$file" CSIOZ_EREJESTRACJA_TRUSTSTORE_PASSWORD)"; SOURCE_TYPE="$(config_value "$file" CSIOZ_EREJESTRACJA_TRUSTSTORE_TYPE)"; if [ -n "$SOURCE_PATH" ]; then SOURCE_PATH="$(resolve_config_path "$APP_DIR" "$SOURCE_PATH")"; [ -n "$SOURCE_TYPE" ] || SOURCE_TYPE=PKCS12; P1_USED=yes; return 0; fi; for value in CSIOZ_EREJESTRACJA_SSL_KEYSTORE_PATH CSIOZ_EREJESTRACJA_TLS_KEYSTORE_PATH CSIOZ_EREJESTRACJA_WSS_KEYSTORE_PATH; do SOURCE_PATH="$(config_value "$file" "$value")"; case "$SOURCE_PATH" in *.pem|*.PEM|*.cer|*.CER|*.crt|*.CRT) SOURCE_PATH="$(resolve_config_path "$APP_DIR" "$SOURCE_PATH")"; SOURCE_TYPE=PEM; P1_USED=yes; return 0 ;; esac; done; done; P1_USED=unknown; AUDIT_RESULT=UNKNOWN; fi
+  detect_p1adapter && return 0
+  detect_p1cer && return 0
+  detect_classic_pi && return 0
+  detect_medical_events && return 0
+  detect_ekrn && return 0
+  return 0
 }
 
 map_mounts_to_container_path() {
@@ -242,7 +350,7 @@ find_container() {
       fi
     done
   fi
-  docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | awk '/p1adapter|p1cer|P1ADAPTER|P1CER/ {print $1; exit}'
+  docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | awk '/p1adapter|p1cer|medicalEventsP1|medicaleventsp1|ekrn|P1ADAPTER|P1CER|EKRN/ {print $1; exit}'
 }
 
 mark_targets() {
@@ -252,18 +360,30 @@ mark_targets() {
 }
 
 audit_pem() {
-  local output
-  command -v openssl >/dev/null 2>&1 && [ -r "$SOURCE_PATH" ] || return 1
-  output="$(openssl x509 -in "$SOURCE_PATH" -noout -fingerprint -sha256 2>/dev/null || true)"
+  local output pem_file cert_dir cert
+  pem_file="$(fs_path "$SERVER_TRUST_PATH")"
+  command -v openssl >/dev/null 2>&1 && [ -r "$pem_file" ] || return 1
+  cert_dir="$(mktemp -d "${TMPDIR:-/tmp}/p1cert-pem.XXXXXX")" || return 1
+  # openssl x509 reads only the first certificate in a PEM bundle.  Split it
+  # with POSIX awk so every certificate is checked on OL7 as well.
+  awk -v prefix="$cert_dir/cert-" '/-----BEGIN CERTIFICATE-----/ { n++; in_cert=1 } in_cert { print > (prefix n ".pem") } /-----END CERTIFICATE-----/ { close(prefix n ".pem"); in_cert=0 }' "$pem_file"
+  output=""
+  for cert in "$cert_dir"/cert-*.pem; do
+    [ -r "$cert" ] || continue
+    output="$output$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null || true)
+"
+  done
+  rm -rf "$cert_dir"
   [ -n "$output" ] || return 1
   mark_targets "$output"
 }
 audit_store() {
   local keytool_bin=""
-  local store_path="$SOURCE_PATH"
+  local store_path
   local output
+  store_path="$(fs_path "$SERVER_TRUST_PATH")"
 
-  if command -v keytool >/dev/null 2>&1 && [ -r "$SOURCE_PATH" ]; then
+  if command -v keytool >/dev/null 2>&1 && [ -r "$store_path" ]; then
     keytool_bin=keytool
   else
     SOURCE_CONTAINER="$(find_container)"
@@ -271,13 +391,13 @@ audit_store() {
       return 1
     fi
     store_path="$(container_path "$SOURCE_CONTAINER")"
-    output="$(printf '%s\n' "$SOURCE_PASSWORD" | docker exec -i "$SOURCE_CONTAINER" keytool -list -v -keystore "$store_path" -storetype "$SOURCE_TYPE" 2>/dev/null || true)"
+    output="$(printf '%s\n' "$SERVER_TRUST_PASSWORD" | docker exec -i "$SOURCE_CONTAINER" keytool -list -v -keystore "$store_path" -storetype "$SERVER_TRUST_TYPE" 2>/dev/null || true)"
     [ -n "$output" ] || return 1
     mark_targets "$output"
     return 0
   fi
 
-  output="$(printf '%s\n' "$SOURCE_PASSWORD" | "$keytool_bin" -list -v -keystore "$store_path" -storetype "$SOURCE_TYPE" 2>/dev/null || true)"
+  output="$(printf '%s\n' "$SERVER_TRUST_PASSWORD" | "$keytool_bin" -list -v -keystore "$store_path" -storetype "$SERVER_TRUST_TYPE" 2>/dev/null || true)"
   [ -n "$output" ] || return 1
   mark_targets "$output"
 }
@@ -291,7 +411,7 @@ detect_java() {
     settings="$(docker exec "$container" java -XshowSettings:properties -version 2>&1 || true)"
     SOURCE_CONTAINER="$container"
   else
-    java_bin="$(ps -eo pid=,args= 2>/dev/null | awk '/[j]ava/ && /\/srv\/P1(ADAPTER|CER)/ {print $1; exit}')"
+    java_bin="$(ps -eo pid=,args= 2>/dev/null | awk '/[j]ava/ && /\/srv\/(P1ADAPTER|P1CER|IntegrationPlatform_ERECEPTY|zm_docker|EKRN)/ {print $1; exit}')"
     if [ -n "$java_bin" ] && [ -r "/proc/$java_bin/exe" ]; then
       java_bin="$(readlink -f "/proc/$java_bin/exe" 2>/dev/null || true)"
     elif [ -z "$container" ] && command -v java >/dev/null 2>&1; then
@@ -340,6 +460,11 @@ write_state() {
   umask 077
   {
     printf 'P1_USED=%s\n' "$P1_USED"
+    printf 'PROFILE=%s\n' "$PROFILE"
+    [ -n "$ENDPOINT" ] && printf 'ENDPOINT=%s\n' "$ENDPOINT"
+    [ -n "$SERVER_TRUST_PATH" ] && printf 'SERVER_TRUST_TYPE=%s\nSERVER_TRUST_PATH=%s\n' "$SERVER_TRUST_TYPE" "$SERVER_TRUST_PATH"
+    [ -n "$CLIENT_TLS_PATH" ] && printf 'CLIENT_TLS_TYPE=%s\nCLIENT_TLS_PATH=%s\n' "$CLIENT_TLS_TYPE" "$CLIENT_TLS_PATH"
+    [ -n "$CLIENT_WSS_PATH" ] && printf 'CLIENT_WSS_TYPE=%s\nCLIENT_WSS_PATH=%s\n' "$CLIENT_WSS_TYPE" "$CLIENT_WSS_PATH"
     [ -n "$SOURCE_PATH" ] && printf 'SOURCE_TYPE=%s\nSOURCE_PATH=%s\n' "$SOURCE_TYPE" "$SOURCE_PATH"
     [ -n "$PAYLOAD_ID" ] && printf 'PAYLOAD_ID=%s\nPAYLOAD_CHANGE_AT=%s\n' "$PAYLOAD_ID" "$PAYLOAD_CHANGE_AT"
     printf 'TARGET_ROOT_PRESENT=%s\nTARGET_TLS_PRESENT=%s\nSERVER_CERT_MODE=%s\nSERVER_CERT_TARGET_PRESENT=%s\nPRESERVE_WSS=%s\nJAVA_DETECTED=%s\n' "$TARGET_ROOT_PRESENT" "$TARGET_TLS_PRESENT" "${SERVER_CERT_MODE:-unknown}" "$SERVER_CERT_TARGET_PRESENT" "${PRESERVE_WSS:-unknown}" "$JAVA_DETECTED"
@@ -352,11 +477,12 @@ write_state() {
 
 if [ "${P1CERT_LIB_ONLY:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
 mkdir -p "$LOG_DIR" "$STATE_DIR"; LOG_FILE="$LOG_DIR/p1cert-audit-$(date '+%Y%m%d_%H%M%S').log"; log 'audit started'; log "docker_backend=$(docker_backend)"; load_payload; detect_source
-if [ "$P1_USED" = yes ] && [ "$AUDIT_RESULT" != UNKNOWN ]; then SOURCE_CONTAINER="$(find_container)"; case "$SOURCE_TYPE" in PEM|pem|CER|cer|CRT|crt) audit_pem || { AUDIT_RESULT=UNKNOWN; log 'active PEM source could not be inspected'; } ;; *) audit_store || { AUDIT_RESULT=UNKNOWN; log 'active keystore could not be inspected'; } ;; esac; fi
+if [ "$P1_USED" = yes ] && [ "$AUDIT_RESULT" != UNKNOWN ]; then SOURCE_CONTAINER="$(find_container)"; case "$SERVER_TRUST_TYPE" in PEM|pem|CER|cer|CRT|crt) audit_pem || { AUDIT_RESULT=UNKNOWN; log 'server trust PEM could not be inspected'; } ;; *) audit_store || { AUDIT_RESULT=UNKNOWN; log 'server trust store could not be inspected'; } ;; esac; fi
 detect_java; [ "$AUDIT_RESULT" = UNKNOWN ] || audit_java_cacerts; write_state; log "audit finished result=$AUDIT_RESULT p1_used=$P1_USED"
-printf 'P1CERT %s\nHost: %s\nP1: %s\n' "$P1CERT_VERSION" "$(hostname 2>/dev/null || printf UNKNOWN)" "$(yesno "$P1_USED")"; [ -z "$SOURCE_PATH" ] || printf 'Typ: %s\nŹródło: %s\n' "$SOURCE_TYPE" "$SOURCE_PATH"
+printf 'P1CERT %s\nHost: %s\nP1: %s\nProfil: %s\nEndpoint: %s\n' "$P1CERT_VERSION" "$(hostname 2>/dev/null || printf UNKNOWN)" "$(yesno "$P1_USED")" "$PROFILE" "${ENDPOINT:-NIE WYKRYTO}"
+printf 'Zaufanie serwera:\n  Typ: %s\n  Źródło: %s\n  Docelowy RootCA: %s\n  Docelowy SubCA TLS: %s\n' "$SERVER_TRUST_TYPE" "${SERVER_TRUST_PATH:-NIE WYKRYTO}" "$(yesno "$TARGET_ROOT_PRESENT")" "$(yesno "$TARGET_TLS_PRESENT")"
+printf 'TLS klienta:\n  %s\nWSS klienta:\n  %s\n' "${CLIENT_TLS_PATH:-NIE WYKRYTO}" "${CLIENT_WSS_PATH:-NIE WYKRYTO}"
 if [ -n "$PAYLOAD_ID" ]; then printf 'Payload: %s\nZmiana: %s\n' "$PAYLOAD_ID" "$PAYLOAD_CHANGE_AT"; else printf 'Payload: NIEZNANY (%s)\n' "${PAYLOAD_ERROR:-nie wykryto}"; fi
-printf 'Docelowy RootCA: %s\nDocelowy SubCA TLS: %s\n' "$(yesno "$TARGET_ROOT_PRESENT")" "$(yesno "$TARGET_TLS_PRESENT")"
 case "$SERVER_CERT_MODE" in preserve) printf 'Certyfikat serwera: ZACHOWAJ\n' ;; replace) printf 'Certyfikat serwera: target NIEZNANE\n' ;; *) printf 'Certyfikat serwera: NIEZNANE\n' ;; esac
 if [ "$PRESERVE_WSS" = true ]; then printf 'WSS: ZACHOWAJ\n'; elif [ -n "$PRESERVE_WSS" ]; then printf 'WSS: polityka payloadu=%s\n' "$PRESERVE_WSS"; else printf 'WSS: NIEZNANE\n'; fi
 printf 'Java: %s\nJava cacerts: %s\nDocelowy RootCA w Java cacerts: %s\nDocelowy SubCA TLS w Java cacerts: %s\nWynik audytu: %s\n' "$JAVA_LABEL" "${JAVA_CACERTS:-NIE WYKRYTO}" "$(yesno "$JAVA_TARGET_ROOT_PRESENT")" "$(yesno "$JAVA_TARGET_TLS_PRESENT")" "$AUDIT_RESULT"

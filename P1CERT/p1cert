@@ -39,6 +39,7 @@ Użycie: p1cert <polecenie>
 Polecenia:
   audit     bezpieczny audyt konfiguracji i certyfikatów P1
   verify    alias polecenia audit
+  update    dodaj docelowe CA dla obsługiwanych profili P1
   status    pokaż wynik ostatniego audytu
   version   pokaż wersję modułu
   help      pokaż tę pomoc
@@ -48,6 +49,9 @@ EOF
 case "${1:-help}" in
   audit|verify)
     exec "$SCRIPT_DIR/p1cert_audit.sh"
+    ;;
+  update)
+    exec "$SCRIPT_DIR/p1cert_update.sh"
     ;;
   status)
     if [ -r "$MODULE_DIR/state/p1cert-state" ]; then

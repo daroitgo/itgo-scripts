@@ -30,6 +30,7 @@ CERTS_DIR="${INSTALL_DIR}/certs"
 install -d -m 0755 "$INSTALL_DIR" "$BIN_DIR" "$LOGS_DIR" "$STATE_DIR" "$CERTS_DIR"
 install -m 0755 "${SCRIPT_DIR}/p1cert" "${BIN_DIR}/p1cert"
 install -m 0755 "${SCRIPT_DIR}/p1cert_audit.sh" "${BIN_DIR}/p1cert_audit.sh"
+install -m 0755 "${SCRIPT_DIR}/p1cert_update.sh" "${BIN_DIR}/p1cert_update.sh"
 install -m 0644 "${SCRIPT_DIR}/p1cert.version" "${INSTALL_DIR}/p1cert.version"
 if [ -f "${SCRIPT_DIR}/certs/p1-production-certs.zip" ]; then
   install -m 0644 "${SCRIPT_DIR}/certs/p1-production-certs.zip" "${CERTS_DIR}/p1-production-certs.zip"
@@ -40,7 +41,7 @@ if id "$TARGET_USER" >/dev/null 2>&1; then
   chown -R "${TARGET_USER}:${TARGET_GROUP}" "$INSTALL_DIR"
 fi
 
-chmod 0755 "$INSTALL_DIR" "$BIN_DIR" "$LOGS_DIR" "$STATE_DIR" "$CERTS_DIR" "${BIN_DIR}/p1cert" "${BIN_DIR}/p1cert_audit.sh"
+chmod 0755 "$INSTALL_DIR" "$BIN_DIR" "$LOGS_DIR" "$STATE_DIR" "$CERTS_DIR" "${BIN_DIR}/p1cert" "${BIN_DIR}/p1cert_audit.sh" "${BIN_DIR}/p1cert_update.sh"
 chmod 0644 "${INSTALL_DIR}/p1cert.version"
 ln -sfn "${BIN_DIR}/p1cert" /usr/local/bin/p1cert
 
