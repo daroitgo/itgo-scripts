@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.87"
+MASTER_VERSION="1.2.88"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.20"
@@ -51,10 +51,15 @@ P1CERT_VERSION="0.1.4"
 
 MODE="install"
 UPDATE_ONLY_MODE="0"
+MODULES_ONLY_MODE="0"
 
 if [[ "${1:-}" == "--update-only" ]]; then
   MODE="update-only"
   UPDATE_ONLY_MODE="1"
+  TARGET_USER="${2:-itgo}"
+elif [[ "${1:-}" == "--modules-only" ]]; then
+  MODE="modules-only"
+  MODULES_ONLY_MODE="1"
   TARGET_USER="${2:-itgo}"
 else
   TARGET_USER="${1:-itgo}"
@@ -509,7 +514,7 @@ ensure_amcs_java_runtime() {
 }
 
 install_master_launcher() {
-  local launcher_dir install_launcher update_launcher bp
+  local launcher_dir install_launcher modules_launcher update_launcher bp
   local legacy_install_launcher="/usr/local/bin/master-install"
   local legacy_update_launcher="/usr/local/bin/master-update"
   local legacy_path_start="# >>> ITGO MASTER PATH (auto) >>>"
@@ -527,6 +532,7 @@ install_master_launcher() {
 
   launcher_dir="$ITGO_HOME/UTILITY/MASTER"
   install_launcher="$launcher_dir/master-install"
+  modules_launcher="$launcher_dir/master-modules"
   update_launcher="$launcher_dir/master-update"
   bp="$ITGO_HOME/.bash_profile"
 
@@ -594,6 +600,54 @@ else
 fi
 EOF_MASTER_INSTALL_LAUNCHER
 
+  cat > "$modules_launcher" <<'EOF_MASTER_MODULES_LAUNCHER'
+#!/usr/bin/env bash
+set -eu
+set -o pipefail 2>/dev/null || true
+
+target_user="${1:-itgo}"
+repo_api="https://api.github.com/repos/daroitgo/itgo-scripts/git/matching-refs/tags/master-"
+tmp_script="$(mktemp)"
+
+cleanup() {
+  rm -f "$tmp_script" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+if ! command -v wget >/dev/null 2>&1; then
+  echo "ERROR: wget is required for master-modules" >&2
+  exit 1
+fi
+
+latest_tag="$(
+  wget -qO- "$repo_api" \
+    | grep -o '"ref":[[:space:]]*"refs/tags/master-[^"]*"' \
+    | sed 's#.*"ref":[[:space:]]*"refs/tags/\(master-[^"]*\)".*#\1#' \
+    | sort -V \
+    | tail -n1
+)"
+
+if [[ -z "${latest_tag:-}" ]]; then
+  echo "ERROR: cannot determine latest master-* tag from daroitgo/itgo-scripts" >&2
+  exit 1
+fi
+
+script_url="https://raw.githubusercontent.com/daroitgo/itgo-scripts/${latest_tag}/MASTER/master_installer.sh"
+
+if ! wget -qO "$tmp_script" "$script_url"; then
+  echo "ERROR: cannot download MASTER/master_installer.sh from tag ${latest_tag}" >&2
+  exit 1
+fi
+
+chmod 0755 "$tmp_script" 2>/dev/null || true
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  bash "$tmp_script" --modules-only "$target_user"
+else
+  sudo bash "$tmp_script" --modules-only "$target_user"
+fi
+EOF_MASTER_MODULES_LAUNCHER
+
   cat > "$update_launcher" <<'EOF_MASTER_UPDATE_LAUNCHER'
 #!/usr/bin/env bash
 set -eu
@@ -642,8 +696,8 @@ else
 fi
 EOF_MASTER_UPDATE_LAUNCHER
 
-  chown "$TARGET_USER:$TARGET_USER" "$install_launcher" "$update_launcher" 2>/dev/null || true
-  chmod 0755 "$install_launcher" "$update_launcher"
+  chown "$TARGET_USER:$TARGET_USER" "$install_launcher" "$modules_launcher" "$update_launcher" 2>/dev/null || true
+  chmod 0755 "$install_launcher" "$modules_launcher" "$update_launcher"
 
   touch "$bp"
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
@@ -656,6 +710,7 @@ EOF_MASTER_UPDATE_LAUNCHER
   chmod 0644 "$bp" 2>/dev/null || true
 
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-install"
+  add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-modules"
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-update"
   add_summary "User-local PATH updated for MASTER, STATUS, TSEQ, DOWNLOADER_APP, UPGbuilder, INVENTORY, AMCS, TOOLS"
 }
@@ -946,6 +1001,13 @@ should_install_or_update_module() {
     fi
     add_summary "$module: install (brak instalacji)"
     return 0
+  fi
+
+  if [[ "$MODULES_ONLY_MODE" == "1" ]]; then
+    MODULE_DECISION="skip"
+    add_summary "$module: skip (already installed in modules-only mode)"
+    echo "[$(ts)] SKIP: $module już zainstalowany (modules-only mode)."
+    return 1
   fi
 
   installed_version="$(installed_version_for_module "$module")"
@@ -1575,7 +1637,7 @@ docker_login_amms_registry() {
 }
 
 ensure_basic_tools_step() {
-  local wanted=(nano mc rsync dos2unix jq wget)
+  local wanted=(nano mc rsync dos2unix jq wget unzip)
   local missing=()
   local p=""
 
@@ -2425,7 +2487,7 @@ BEOF
 }
 
 restore_master_shell_settings() {
-  local bp br bl launcher_dir install_launcher update_launcher
+  local bp br bl launcher_dir install_launcher modules_launcher update_launcher
   local legacy_install_launcher="/usr/local/bin/master-install"
   local legacy_update_launcher="/usr/local/bin/master-update"
   local bp_start="# >>> ITGO SSH HISTORY PROMPT (auto) >>>"
@@ -2455,6 +2517,7 @@ restore_master_shell_settings() {
   bl="$ITGO_HOME/.bash_logout"
   launcher_dir="$ITGO_HOME/UTILITY/MASTER"
   install_launcher="$launcher_dir/master-install"
+  modules_launcher="$launcher_dir/master-modules"
   update_launcher="$launcher_dir/master-update"
 
   if [[ -f "$bp" ]]; then
@@ -2485,6 +2548,13 @@ restore_master_shell_settings() {
     add_summary "MASTER launcher removed: master-install"
   else
     add_summary "MASTER launcher removed: SKIP (master-install not present)"
+  fi
+
+  if [[ -f "$modules_launcher" ]]; then
+    rm -f "$modules_launcher" 2>/dev/null || true
+    add_summary "MASTER launcher removed: master-modules"
+  else
+    add_summary "MASTER launcher removed: SKIP (master-modules not present)"
   fi
 
   if [[ -f "$update_launcher" ]]; then
@@ -3343,6 +3413,58 @@ main() {
     exit 0
   fi
 
+  if [[ "$MODULES_ONLY_MODE" == "1" ]]; then
+    add_summary "MODE: modules-only"
+    if ! have_user; then
+      echo "[$(ts)] WARN: user '$TARGET_USER' nie istnieje. Pomijam modules-only."
+      add_summary "Modules-only: SKIP (user missing: $TARGET_USER)"
+      print_summary
+      exit 0
+    fi
+
+    prepare_user_paths_if_possible
+    if [[ -z "${ITGO_HOME:-}" ]]; then
+      echo "[$(ts)] WARN: nie udało się ustalić HOME dla '$TARGET_USER'. Pomijam modules-only."
+      add_summary "Modules-only: SKIP (cannot resolve home)"
+      print_summary
+      exit 0
+    fi
+
+    detected_modules="$(detect_installed_modules)"
+    print_detected_modules_summary "$detected_modules"
+
+    if ! ensure_tmp_dir_for_module_actions; then
+      echo "[$(ts)] WARN: nie udało się przygotować TMP_DIR dla modules-only. Pomijam modules-only."
+      add_summary "Modules-only: SKIP (cannot prepare TMP_DIR)"
+      print_summary
+      exit 0
+    fi
+
+    status_sh="$TMP_DIR/status_installer_public.sh"
+    cleanup_sh="$TMP_DIR/cleanup_installer_public.sh"
+    tseq_sh="$TMP_DIR/tseq_installer_public.sh"
+    downloader_app_sh="$TMP_DIR/upg_installer.sh"
+    upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
+    serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
+    inventory_dir="$TMP_DIR/INVENTORY"
+    p1cert_dir="$TMP_DIR/P1CERT"
+
+    section "MODULES-ONLY - BRAKUJĄCE MODUŁY"
+    install_status_step "$status_sh"
+    install_tseq_step "$tseq_sh"
+    install_cleanup_step "$cleanup_sh"
+    install_downloader_app_step "$downloader_app_sh"
+    install_upgbuilder_step "$upgbuilder_sh"
+    install_serviceguard_step "$serviceguard_sh"
+    install_inventory_step "$inventory_dir"
+    install_p1cert_step "$p1cert_dir"
+
+    cleanup_tmp_installers_no_prompt
+    echo "[$(ts)] DONE."
+    print_summary
+    exit 0
+  fi
+
   prepare_user_paths_if_possible
 
   detected_modules="$(detect_installed_modules)"
@@ -3406,7 +3528,7 @@ main() {
   install_master_launcher
 
   section "SEKCJA 2/8 - NARZĘDZIA SYSTEMOWE"
-  if prompt_yn "KROK: sprawdzić nano, mc, rsync, dos2unix, jq, wget i doinstalować brakujące?" "Y"; then
+  if prompt_yn "KROK: sprawdzić nano, mc, rsync, dos2unix, jq, wget, unzip i doinstalować brakujące?" "Y"; then
     ensure_basic_tools_step
   else
     echo "[$(ts)] SKIP: pakiety bazowe."
