@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.88"
+MASTER_VERSION="1.2.89"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.20"
@@ -3374,6 +3374,8 @@ main() {
       print_summary
       exit 0
     fi
+
+    install_master_launcher
 
     detected_modules="$(detect_installed_modules)"
     print_detected_modules_summary "$detected_modules"
