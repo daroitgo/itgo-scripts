@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.90"
+MASTER_VERSION="1.2.91"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.20"
@@ -288,6 +288,13 @@ module_runtime_packages() {
     P1CERT)         printf '%s\n' unzip openssl ;;
     UPGBUILDER)     printf '%s\n' rsync ;;
     *) return 0 ;;
+  esac
+}
+
+module_has_runtime_dependencies() {
+  case "${1:?}" in
+    DOWNLOADER_APP|UPGBUILDER|INVENTORY|P1CERT) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -1117,6 +1124,17 @@ should_install_or_update_module() {
     add_summary "$module: skip (already installed in modules-only mode)"
     echo "[$(ts)] SKIP: $module już zainstalowany (modules-only mode)."
     return 1
+  fi
+
+  # In update-only mode runtime health is repaired for every installed module
+  # that has a central dependency mapping, before version/health decisions.
+  if [[ "$UPDATE_ONLY_MODE" == "1" ]] && module_has_runtime_dependencies "$module"; then
+    echo "[$(ts)] INFO: update-only runtime preflight for installed module $module."
+    if ! ensure_module_runtime_dependencies "$module"; then
+      echo "[$(ts)] ERROR: runtime dependency repair failed for installed module $module; stopping update-only."
+      add_summary "$module: ERROR (runtime dependency repair failed in update-only mode)"
+      exit 1
+    fi
   fi
 
   installed_version="$(installed_version_for_module "$module")"
@@ -2974,7 +2992,9 @@ install_downloader_app_step() {
         echo "[$(ts)] SKIP: DOWNLOADER_APP."
       fi
     else
-      ensure_module_runtime_dependencies DOWNLOADER_APP || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
+      if [[ "$UPDATE_ONLY_MODE" != "1" ]]; then
+        ensure_module_runtime_dependencies DOWNLOADER_APP || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
+      fi
       ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
 
       if ! have_user; then
@@ -3038,7 +3058,9 @@ install_upgbuilder_step() {
         echo "[$(ts)] SKIP: UPGbuilder."
       fi
     else
-      ensure_module_runtime_dependencies UPGBUILDER || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
+      if [[ "$UPDATE_ONLY_MODE" != "1" ]]; then
+        ensure_module_runtime_dependencies UPGBUILDER || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
+      fi
       ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
 
       if ! have_user; then
@@ -3154,7 +3176,9 @@ install_inventory_step() {
         echo "[$(ts)] SKIP: INVENTORY."
       fi
     else
-      ensure_module_runtime_dependencies INVENTORY || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
+      if [[ "$UPDATE_ONLY_MODE" != "1" ]]; then
+        ensure_module_runtime_dependencies INVENTORY || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
+      fi
       ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
 
       if ! have_user; then
@@ -3201,7 +3225,9 @@ install_p1cert_step() {
         echo "[$(ts)] SKIP: P1CERT."
       fi
     else
-      ensure_module_runtime_dependencies P1CERT || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
+      if [[ "$UPDATE_ONLY_MODE" != "1" ]]; then
+        ensure_module_runtime_dependencies P1CERT || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
+      fi
       ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
       have_user || { echo "[$(ts)] ERROR: user '$TARGET_USER' missing."; exit 1; }
       ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
