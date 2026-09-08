@@ -27,7 +27,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - downloader app installer deploy (downloaded via wget)
 #
 # Extra steps:
-# - optional install/check of nano, mc, rsync, dos2unix, jq, wget
+# - optional install/check of baseline runtime packages
 # - optional ~/.bash_logout history cleanup block
 # - optional add user to docker group
 #
@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.89"
+MASTER_VERSION="1.2.90"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.20"
@@ -277,6 +277,115 @@ ensure_package_installed() {
 
   echo "[$(ts)] INFO: missing package: $pkg"
   install_packages "$pkg"
+}
+
+# Runtime dependencies are intentionally kept per module.  This lets
+# --modules-only and --update-only prepare only the module being handled,
+# without applying the full master-install baseline.
+module_runtime_packages() {
+  case "${1:?}" in
+    DOWNLOADER_APP) printf '%s\n' curl jq wget ;;
+    P1CERT)         printf '%s\n' unzip openssl ;;
+    UPGBUILDER)     printf '%s\n' rsync ;;
+    *) return 0 ;;
+  esac
+}
+
+inventory_python_command() {
+  local candidate
+
+  # Keep this order aligned with INVENTORY/itgo-inv.
+  for candidate in python3 python3.11 python3.9 python3.8 python3.7 python3.6 python python2 python2.7; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+      && "$candidate" -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+runtime_command_works() {
+  local command_name="${1:?}"
+
+  command -v "$command_name" >/dev/null 2>&1 || return 1
+  case "$command_name" in
+    unzip) "$command_name" -v >/dev/null 2>&1 ;;
+    openssl) "$command_name" version >/dev/null 2>&1 ;;
+    *) "$command_name" --version >/dev/null 2>&1 ;;
+  esac
+}
+
+verify_module_runtime_dependencies() {
+  local module="${1:?}" pkg
+
+  if [[ "$module" == "INVENTORY" ]] && ! inventory_python_command >/dev/null; then
+    echo "[$(ts)] ERROR: INVENTORY requires a working supported Python interpreter."
+    return 1
+  fi
+
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    if ! runtime_command_works "$pkg"; then
+      echo "[$(ts)] ERROR: runtime command '$pkg' is unavailable or not working for $module."
+      return 1
+    fi
+  done < <(module_runtime_packages "$module")
+
+  if [[ "$module" == "UPGBUILDER" ]] \
+    && ! runtime_command_works curl \
+    && ! runtime_command_works wget; then
+    echo "[$(ts)] ERROR: UPGbuilder requires a working curl or wget command."
+    return 1
+  fi
+}
+
+ensure_module_runtime_dependencies() {
+  local module="${1:?}" pkg inventory_python_missing="0"
+  local missing=()
+
+  if [[ "$module" == "INVENTORY" ]] && ! inventory_python_command >/dev/null; then
+    inventory_python_missing="1"
+    missing+=(python3)
+  fi
+
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    runtime_command_works "$pkg" || missing+=("$pkg")
+  done < <(module_runtime_packages "$module")
+
+  # UPGbuilder can download through either curl or wget.  Do not turn that
+  # alternative into a requirement for both tools; install curl only when
+  # neither downloader is available.
+  if [[ "$module" == "UPGBUILDER" ]] \
+    && ! runtime_command_works curl \
+    && ! runtime_command_works wget; then
+    missing+=(curl)
+  fi
+
+  [[ "${#missing[@]}" -gt 0 ]] || {
+    verify_module_runtime_dependencies "$module"
+    echo "[$(ts)] OK: runtime dependencies for $module are present and working."
+    return 0
+  }
+
+  echo "[$(ts)] INFO: missing runtime dependencies for $module: ${missing[*]}"
+  echo "[$(ts)] ACTION: installing runtime dependencies for $module: ${missing[*]}"
+  if ! install_packages "${missing[@]}"; then
+    echo "[$(ts)] ERROR: failed to install runtime dependencies for $module."
+    return 1
+  fi
+
+  if [[ "$inventory_python_missing" == "1" ]]; then
+    if ! command -v python3 >/dev/null 2>&1 \
+      || ! python3 -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then
+      echo "[$(ts)] ERROR: package python3 was installed for INVENTORY, but python3 is not working."
+      return 1
+    fi
+  fi
+
+  verify_module_runtime_dependencies "$module" || return 1
+  echo "[$(ts)] OK: runtime dependencies for $module are installed and working."
 }
 
 remove_packages() {
@@ -1637,11 +1746,16 @@ docker_login_amms_registry() {
 }
 
 ensure_basic_tools_step() {
-  local wanted=(nano mc rsync dos2unix jq wget unzip)
+  local wanted=(nano mc rsync dos2unix jq wget curl unzip openssl python3)
   local missing=()
   local p=""
 
   for p in "${wanted[@]}"; do
+    if [[ "$p" == "python3" ]] && inventory_python_command >/dev/null; then
+      echo "[$(ts)] OK: supported Python runtime already available for INVENTORY."
+      continue
+    fi
+
     if pkg_installed "$p"; then
       echo "[$(ts)] OK: pakiet '$p' już zainstalowany."
     else
@@ -2836,6 +2950,7 @@ install_downloader_app_step() {
   if should_install_or_update_module "DOWNLOADER_APP"; then
     if [[ "$MODULE_DECISION" == "install" ]]; then
       if prompt_yn "MODUŁ: DOWNLOADER_APP (lokalnie: ~/UTILITY/DOWNLOADER_APP/upg_installer.sh + ~/UTILITY/DOWNLOADER_APP/bin/dwupg)?" "Y"; then
+        ensure_module_runtime_dependencies DOWNLOADER_APP || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
         ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
 
         if ! have_user; then
@@ -2859,6 +2974,7 @@ install_downloader_app_step() {
         echo "[$(ts)] SKIP: DOWNLOADER_APP."
       fi
     else
+      ensure_module_runtime_dependencies DOWNLOADER_APP || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
       ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
 
       if ! have_user; then
@@ -2889,6 +3005,7 @@ install_upgbuilder_step() {
   if should_install_or_update_module "UPGBUILDER"; then
     if [[ "$MODULE_DECISION" == "install" ]]; then
       if prompt_yn "MODUŁ: UPGbuilder (lokalnie: ~/UTILITY/UPGbuilder/upgbuilder.sh + ~/UTILITY/UPGbuilder/bin/upgbuilder)?" "Y"; then
+        ensure_module_runtime_dependencies UPGBUILDER || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
         ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
 
         if ! have_user; then
@@ -2921,6 +3038,7 @@ install_upgbuilder_step() {
         echo "[$(ts)] SKIP: UPGbuilder."
       fi
     else
+      ensure_module_runtime_dependencies UPGBUILDER || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
       ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
 
       if ! have_user; then
@@ -3012,6 +3130,7 @@ install_inventory_step() {
   if should_install_or_update_module "INVENTORY"; then
     if [[ "$MODULE_DECISION" == "install" ]]; then
       if prompt_yn "KROK: zainstalować Inventory Collector (itgo-inv)?" "Y"; then
+        ensure_module_runtime_dependencies INVENTORY || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
         ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
 
         if ! have_user; then
@@ -3035,6 +3154,7 @@ install_inventory_step() {
         echo "[$(ts)] SKIP: INVENTORY."
       fi
     else
+      ensure_module_runtime_dependencies INVENTORY || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
       ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
 
       if ! have_user; then
@@ -3065,6 +3185,7 @@ install_p1cert_step() {
   if should_install_or_update_module "P1CERT"; then
     if [[ "$MODULE_DECISION" == "install" ]]; then
       if prompt_yn "KROK: zainstalować P1CERT (read-only audit certyfikatów P1)?" "Y"; then
+        ensure_module_runtime_dependencies P1CERT || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
         ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
         have_user || { echo "[$(ts)] ERROR: user '$TARGET_USER' missing."; exit 1; }
         ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
@@ -3080,6 +3201,7 @@ install_p1cert_step() {
         echo "[$(ts)] SKIP: P1CERT."
       fi
     else
+      ensure_module_runtime_dependencies P1CERT || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
       ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
       have_user || { echo "[$(ts)] ERROR: user '$TARGET_USER' missing."; exit 1; }
       ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
@@ -3530,7 +3652,7 @@ main() {
   install_master_launcher
 
   section "SEKCJA 2/8 - NARZĘDZIA SYSTEMOWE"
-  if prompt_yn "KROK: sprawdzić nano, mc, rsync, dos2unix, jq, wget, unzip i doinstalować brakujące?" "Y"; then
+  if prompt_yn "KROK: sprawdzić nano, mc, rsync, dos2unix, jq, wget, curl, unzip, openssl, python3 i doinstalować brakujące?" "Y"; then
     ensure_basic_tools_step
   else
     echo "[$(ts)] SKIP: pakiety bazowe."
