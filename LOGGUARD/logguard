@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+VERSION_FILE="${INSTALL_DIR}/logguard.version"
+MAX_PLATFORM_DEPTH=5
+MAX_LOG_DEPTH=10
+
+PLATFORMS=()
+CANDIDATE_PLATFORMS=()
+CANDIDATE_PATHS=()
+CANDIDATE_SIZES=()
+CANDIDATE_OWNERS=()
+CANDIDATE_STRATEGIES=()
+
+logguard_version() {
+  local version
+  version="$(sed -n 's/^LOGGUARD_VERSION="\([^"]*\)"$/\1/p' "$VERSION_FILE" 2>/dev/null | head -n 1 || true)"
+  printf '%s\n' "${version:-UNKNOWN}"
+}
+
+path_has_technical_component() {
+  local path="${1:?}" component lower
+  local -a components=()
+
+  IFS='/' read -r -a components <<< "$path"
+  for component in "${components[@]}"; do
+    lower="${component,,}"
+    case "$lower" in
+      *_new|*_old) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+path_is_within_base() {
+  local path="${1:?}" base="${2:?}"
+  [[ "$path" == "$base" || "$path" == "${base}/"* ]]
+}
+
+find_platforms() {
+  local base path
+  local -a sorted_platforms=()
+
+  PLATFORMS=()
+  for base in /srv /opt; do
+    [[ -d "$base" && -r "$base" ]] || continue
+    while IFS= read -r -d '' path; do
+      path_is_within_base "$path" "$base" || continue
+      path_has_technical_component "$path" && continue
+      PLATFORMS+=("$path")
+    done < <(
+      find -P "$base" -xdev -maxdepth "$MAX_PLATFORM_DEPTH" -type d \
+        \( -iname 'integrationplatform' -o -iname 'integrationplatform_*' \) -print0 2>/dev/null || true
+    )
+  done
+
+  if [[ "${#PLATFORMS[@]}" -gt 0 ]]; then
+    while IFS= read -r -d '' path; do
+      sorted_platforms+=("$path")
+    done < <(printf '%s\0' "${PLATFORMS[@]}" | sort -z -u)
+    PLATFORMS=("${sorted_platforms[@]}")
+  fi
+}
+
+file_size_or_unknown() {
+  local path="${1:?}" size
+  size="$(stat -c '%s' -- "$path" 2>/dev/null || true)"
+  printf '%s\n' "${size:-UNKNOWN}"
+}
+
+file_owner_or_unknown() {
+  local path="${1:?}" owner
+  owner="$(stat -c '%U:%G' -- "$path" 2>/dev/null || true)"
+  printf '%s\n' "${owner:-UNKNOWN}"
+}
+
+log_strategy() {
+  local path="${1:?}" name
+  name="${path##*/}"
+  if [[ "${name,,}" == "catalina.out" ]]; then
+    printf '%s\n' COPYTRUNCATE
+  elif [[ "${name,,}" == *.log ]]; then
+    printf '%s\n' ROTATE_CANDIDATE
+  else
+    printf '%s\n' IGNORE
+  fi
+}
+
+find_candidates() {
+  local platform path strategy key
+  local -A seen=()
+
+  CANDIDATE_PLATFORMS=()
+  CANDIDATE_PATHS=()
+  CANDIDATE_SIZES=()
+  CANDIDATE_OWNERS=()
+  CANDIDATE_STRATEGIES=()
+
+  for platform in "${PLATFORMS[@]}"; do
+    [[ -d "$platform" && -r "$platform" ]] || continue
+    while IFS= read -r -d '' path; do
+      [[ -f "$path" ]] || continue
+      path_is_within_base "$path" "$platform" || continue
+      path_has_technical_component "$path" && continue
+      strategy="$(log_strategy "$path")"
+      [[ "$strategy" != IGNORE ]] || continue
+      key="${platform}"$'\034'"${path}"
+      [[ -n "${seen[$key]:-}" ]] && continue
+      seen["$key"]=1
+      CANDIDATE_PLATFORMS+=("$platform")
+      CANDIDATE_PATHS+=("$path")
+      CANDIDATE_SIZES+=("$(file_size_or_unknown "$path")")
+      CANDIDATE_OWNERS+=("$(file_owner_or_unknown "$path")")
+      CANDIDATE_STRATEGIES+=("$strategy")
+    done < <(
+      find -P "$platform" -xdev -maxdepth "$MAX_LOG_DEPTH" \
+        -type f \( -iname catalina.out -o -iname '*.log' \) -print0 2>/dev/null \
+        | sort -z || true
+    )
+  done
+}
+
+refresh_discovery() {
+  find_platforms
+  find_candidates
+}
+
+print_candidate_table() {
+  local limit="${1:-0}" index printed=0
+
+  if [[ "${#CANDIDATE_PATHS[@]}" -eq 0 ]]; then
+    printf 'No log candidates detected.\n'
+    return 0
+  fi
+
+  printf '%-32s %-70s %-12s %-20s %s\n' PLATFORM PATH SIZE_BYTES OWNER STRATEGY
+  for index in "${!CANDIDATE_PATHS[@]}"; do
+    if (( limit > 0 && printed >= limit )); then
+      printf '... %s additional candidate(s) omitted from status output.\n' "$(( ${#CANDIDATE_PATHS[@]} - printed ))"
+      break
+    fi
+    printf '%-32s %-70s %-12s %-20s %s\n' \
+      "${CANDIDATE_PLATFORMS[$index]}" \
+      "${CANDIDATE_PATHS[$index]}" \
+      "${CANDIDATE_SIZES[$index]}" \
+      "${CANDIDATE_OWNERS[$index]}" \
+      "${CANDIDATE_STRATEGIES[$index]}"
+    ((printed += 1))
+  done
+}
+
+command_scan() {
+  refresh_discovery
+  if [[ "${#PLATFORMS[@]}" -eq 0 ]]; then
+    printf 'No IntegrationPlatform installations detected.\n'
+    return 0
+  fi
+  print_candidate_table
+}
+
+command_status() {
+  local directory
+
+  refresh_discovery
+  printf 'LOGGUARD_VERSION: %s\n' "$(logguard_version)"
+  printf 'INSTALL_DIR: %s\n' "$INSTALL_DIR"
+  for directory in config state logs archive; do
+    if [[ -d "${INSTALL_DIR}/${directory}" ]]; then
+      printf 'DIR_%s: present\n' "${directory^^}"
+    else
+      printf 'DIR_%s: missing\n' "${directory^^}"
+    fi
+  done
+  printf 'INTEGRATION_PLATFORMS: %s\n' "${#PLATFORMS[@]}"
+  printf 'LOG_CANDIDATES: %s\n' "${#CANDIDATE_PATHS[@]}"
+  if [[ "${#PLATFORMS[@]}" -eq 0 ]]; then
+    printf 'No IntegrationPlatform installations detected.\n'
+    return 0
+  fi
+  print_candidate_table 20
+}
+
+command_help() {
+  cat <<'EOF_HELP'
+Usage: logguard [status|scan|version|help]
+
+LOGGUARD 0.1.0 is discovery-only and read-only. It reports proposed log
+handling strategies; it does not rotate, truncate, archive or modify logs.
+EOF_HELP
+}
+
+case "${1:-status}" in
+  status) command_status ;;
+  scan) command_scan ;;
+  version) printf '%s\n' "$(logguard_version)" ;;
+  help|-h|--help) command_help ;;
+  *)
+    printf 'ERROR: unknown command: %s\n' "$1" >&2
+    command_help >&2
+    exit 2
+    ;;
+esac
