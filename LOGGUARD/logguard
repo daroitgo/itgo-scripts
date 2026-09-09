@@ -1,204 +1,443 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# LOGGUARD -- Bash 4.2 / Oracle Linux 7 compatible.
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-VERSION_FILE="${INSTALL_DIR}/logguard.version"
+INSTALL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+VERSION_FILE="$INSTALL_DIR/logguard.version"
+CONFIG_FILE="$INSTALL_DIR/config/logguard.conf"
 MAX_PLATFORM_DEPTH=5
 MAX_LOG_DEPTH=10
 
+ARCHIVE_ROOT=/srv/BackupLog
+CATALINA_THRESHOLD_MIB=512
+CATALINA_RETENTION_DAYS=14
+ACCESS_RETENTION_DAYS=7
+DATED_LOG_RETENTION_DAYS=7
+COMPRESSED_RETENTION_DAYS=14
+ARCHIVE_MAX_SIZE_GIB=5
+RUN_LOG_RETENTION_DAYS=30
+DEFAULT_MODE=dry-run
+
+ERRORS=0
+MODE=""
+RUN_LOG=""
 PLATFORMS=()
 CANDIDATE_PLATFORMS=()
-CANDIDATE_PATHS=()
+CANDIDATE_TYPES=()
+CANDIDATE_FILES=()
 CANDIDATE_SIZES=()
 CANDIDATE_OWNERS=()
 CANDIDATE_STRATEGIES=()
 
-logguard_version() {
-  local version
-  version="$(sed -n 's/^LOGGUARD_VERSION="\([^"]*\)"$/\1/p' "$VERSION_FILE" 2>/dev/null | head -n 1 || true)"
-  printf '%s\n' "${version:-UNKNOWN}"
+version() {
+  sed -n 's/^LOGGUARD_VERSION="\([^"]*\)"$/\1/p' "$VERSION_FILE" 2>/dev/null | head -n 1
 }
 
-path_has_technical_component() {
-  local path="${1:?}" component lower
-  local -a components=()
+write_log() {
+  local level="$1"
+  shift
+  local line="$(date '+%F %T') $level $*"
+  [[ -n "$RUN_LOG" ]] && printf '%s\n' "$line" >> "$RUN_LOG" 2>/dev/null || true
+  printf '%s\n' "$line" >> "$INSTALL_DIR/logs/logguard.log" 2>/dev/null || true
+  printf '%s\n' "$line"
+}
 
-  IFS='/' read -r -a components <<< "$path"
+fail() {
+  ERRORS=$((ERRORS + 1))
+  write_log ERROR "$@" >&2
+}
+
+number() { [[ "$1" =~ ^[0-9]+$ ]]; }
+sudo_present() { command -v sudo >/dev/null 2>&1; }
+sudo_noninteractive() { sudo_present && sudo -n true >/dev/null 2>&1; }
+priv() { sudo "$@"; }
+
+load_config() {
+  local line key value
+  [[ -f "$CONFIG_FILE" ]] || { fail "mode=${MODE:-STATUS} action=CONFIG_FAILED reason=missing_config"; return 1; }
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#${line%%[![:space:]]*}}"
+    line="${line%${line##*[![:space:]]}}"
+    [[ -z "$line" || "${line:0:1}" == '#' ]] && continue
+    [[ "$line" =~ ^([A-Z_]+)\=\"([^\"]*)\"$ ]] || { fail "mode=$MODE action=CONFIG_FAILED reason=syntax"; return 1; }
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    case "$key" in
+      ARCHIVE_ROOT)
+        [[ "$value" == /srv/BackupLog ]] || { fail "mode=$MODE action=CONFIG_FAILED key=$key reason=unsupported_archive_root"; return 1; }
+        ARCHIVE_ROOT="$value"
+        ;;
+      CATALINA_THRESHOLD_MIB|CATALINA_RETENTION_DAYS|ACCESS_RETENTION_DAYS|DATED_LOG_RETENTION_DAYS|COMPRESSED_RETENTION_DAYS|ARCHIVE_MAX_SIZE_GIB|RUN_LOG_RETENTION_DAYS)
+        number "$value" || { fail "mode=$MODE action=CONFIG_FAILED key=$key reason=not_numeric"; return 1; }
+        printf -v "$key" %s "$value"
+        ;;
+      DEFAULT_MODE)
+        [[ "$value" == dry-run ]] || { fail "mode=$MODE action=CONFIG_FAILED key=$key reason=unsupported_value"; return 1; }
+        DEFAULT_MODE="$value"
+        ;;
+      *) fail "mode=$MODE action=CONFIG_FAILED key=$key reason=unknown_key"; return 1 ;;
+    esac
+  done < "$CONFIG_FILE"
+}
+
+technical_path() {
+  local component lower
+  local -a components=()
+  IFS=/ read -r -a components <<< "$1"
   for component in "${components[@]}"; do
     lower="${component,,}"
-    case "$lower" in
-      *_new|*_old) return 0 ;;
-    esac
+    [[ "$lower" == *_new || "$lower" == *_old ]] && return 0
   done
   return 1
 }
 
-path_is_within_base() {
-  local path="${1:?}" base="${2:?}"
-  [[ "$path" == "$base" || "$path" == "${base}/"* ]]
-}
-
 find_platforms() {
   local base path
-  local -a sorted_platforms=()
-
+  local -a sorted=()
   PLATFORMS=()
   for base in /srv /opt; do
-    [[ -d "$base" && -r "$base" ]] || continue
+    [[ -r "$base" && -d "$base" ]] || continue
     while IFS= read -r -d '' path; do
-      path_is_within_base "$path" "$base" || continue
-      path_has_technical_component "$path" && continue
-      PLATFORMS+=("$path")
-    done < <(
-      find -P "$base" -xdev -maxdepth "$MAX_PLATFORM_DEPTH" -type d \
-        \( -iname 'integrationplatform' -o -iname 'integrationplatform_*' \) -print0 2>/dev/null || true
-    )
+      technical_path "$path" || PLATFORMS+=("$path")
+    done < <(find -P "$base" -xdev -maxdepth "$MAX_PLATFORM_DEPTH" -type d \( -iname integrationplatform -o -iname 'integrationplatform_*' \) -print0 2>/dev/null || true)
   done
-
-  if [[ "${#PLATFORMS[@]}" -gt 0 ]]; then
-    while IFS= read -r -d '' path; do
-      sorted_platforms+=("$path")
-    done < <(printf '%s\0' "${PLATFORMS[@]}" | sort -z -u)
-    PLATFORMS=("${sorted_platforms[@]}")
+  if (( ${#PLATFORMS[@]} > 0 )); then
+    while IFS= read -r -d '' path; do sorted+=("$path"); done < <(printf '%s\0' "${PLATFORMS[@]}" | sort -z -u)
+    PLATFORMS=("${sorted[@]}")
   fi
 }
 
-file_size_or_unknown() {
-  local path="${1:?}" size
-  size="$(stat -c '%s' -- "$path" 2>/dev/null || true)"
-  printf '%s\n' "${size:-UNKNOWN}"
-}
-
-file_owner_or_unknown() {
-  local path="${1:?}" owner
-  owner="$(stat -c '%U:%G' -- "$path" 2>/dev/null || true)"
-  printf '%s\n' "${owner:-UNKNOWN}"
-}
-
-log_strategy() {
-  local path="${1:?}" name
-  name="${path##*/}"
-  if [[ "${name,,}" == "catalina.out" ]]; then
-    printf '%s\n' COPYTRUNCATE
-  elif [[ "${name,,}" == *.log ]]; then
-    printf '%s\n' ROTATE_CANDIDATE
-  else
-    printf '%s\n' IGNORE
+classify() {
+  local name="${1##*/}"
+  name="${name,,}"
+  if [[ "$name" == catalina.out ]]; then echo 'ACTIVE_CATALINA COPYTRUNCATE'
+  elif [[ "$name" == localhost_access_log.*.txt ]]; then echo 'ACCESS_LOG ARCHIVE_RETENTION'
+  elif [[ "$name" == *.zip || "$name" == *.gz ]]; then echo 'COMPRESSED RETENTION_ONLY'
+  elif [[ "$name" == *.log && "$name" =~ [0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then echo 'DATED_LOG ARCHIVE_RETENTION'
+  elif [[ "$name" == *.log ]]; then echo 'ACTIVE_LOG MONITOR_ONLY'
   fi
 }
 
 find_candidates() {
-  local platform path strategy key
-  local -A seen=()
-
-  CANDIDATE_PLATFORMS=()
-  CANDIDATE_PATHS=()
-  CANDIDATE_SIZES=()
-  CANDIDATE_OWNERS=()
-  CANDIDATE_STRATEGIES=()
-
+  local platform file result type strategy
+  CANDIDATE_PLATFORMS=(); CANDIDATE_TYPES=(); CANDIDATE_FILES=()
+  CANDIDATE_SIZES=(); CANDIDATE_OWNERS=(); CANDIDATE_STRATEGIES=()
   for platform in "${PLATFORMS[@]}"; do
-    [[ -d "$platform" && -r "$platform" ]] || continue
-    while IFS= read -r -d '' path; do
-      [[ -f "$path" ]] || continue
-      path_is_within_base "$path" "$platform" || continue
-      path_has_technical_component "$path" && continue
-      strategy="$(log_strategy "$path")"
-      [[ "$strategy" != IGNORE ]] || continue
-      key="${platform}"$'\034'"${path}"
-      [[ -n "${seen[$key]:-}" ]] && continue
-      seen["$key"]=1
-      CANDIDATE_PLATFORMS+=("$platform")
-      CANDIDATE_PATHS+=("$path")
-      CANDIDATE_SIZES+=("$(file_size_or_unknown "$path")")
-      CANDIDATE_OWNERS+=("$(file_owner_or_unknown "$path")")
+    while IFS= read -r -d '' file; do
+      technical_path "$file" && continue
+      result="$(classify "$file")"
+      [[ -n "$result" ]] || continue
+      read -r type strategy <<< "$result"
+      CANDIDATE_PLATFORMS+=("${platform##*/}")
+      CANDIDATE_TYPES+=("$type")
+      CANDIDATE_FILES+=("$file")
+      CANDIDATE_SIZES+=("$(stat -c %s -- "$file" 2>/dev/null || echo UNKNOWN)")
+      CANDIDATE_OWNERS+=("$(stat -c %U:%G -- "$file" 2>/dev/null || echo UNKNOWN)")
       CANDIDATE_STRATEGIES+=("$strategy")
-    done < <(
-      find -P "$platform" -xdev -maxdepth "$MAX_LOG_DEPTH" \
-        -type f \( -iname catalina.out -o -iname '*.log' \) -print0 2>/dev/null \
-        | sort -z || true
-    )
+    done < <(find -P "$platform" -xdev -maxdepth "$MAX_LOG_DEPTH" -type f \( -iname catalina.out -o -iname '*.log' -o -iname 'localhost_access_log.*.txt' -o -iname '*.zip' -o -iname '*.gz' \) -print0 2>/dev/null | sort -z || true)
   done
 }
 
-refresh_discovery() {
-  find_platforms
-  find_candidates
-}
+discover() { find_platforms; find_candidates; }
 
-print_candidate_table() {
-  local limit="${1:-0}" index printed=0
-
-  if [[ "${#CANDIDATE_PATHS[@]}" -eq 0 ]]; then
-    printf 'No log candidates detected.\n'
-    return 0
-  fi
-
-  printf '%-32s %-70s %-12s %-20s %s\n' PLATFORM PATH SIZE_BYTES OWNER STRATEGY
-  for index in "${!CANDIDATE_PATHS[@]}"; do
-    if (( limit > 0 && printed >= limit )); then
-      printf '... %s additional candidate(s) omitted from status output.\n' "$(( ${#CANDIDATE_PATHS[@]} - printed ))"
-      break
-    fi
-    printf '%-32s %-70s %-12s %-20s %s\n' \
-      "${CANDIDATE_PLATFORMS[$index]}" \
-      "${CANDIDATE_PATHS[$index]}" \
-      "${CANDIDATE_SIZES[$index]}" \
-      "${CANDIDATE_OWNERS[$index]}" \
-      "${CANDIDATE_STRATEGIES[$index]}"
-    ((printed += 1))
+table() {
+  local i
+  printf '%-30s %-17s %-60s %-12s %-20s %s\n' PLATFORM TYPE PATH SIZE_BYTES OWNER STRATEGY
+  for i in "${!CANDIDATE_FILES[@]}"; do
+    printf '%-30s %-17s %-60s %-12s %-20s %s\n' "${CANDIDATE_PLATFORMS[$i]}" "${CANDIDATE_TYPES[$i]}" "${CANDIDATE_FILES[$i]}" "${CANDIDATE_SIZES[$i]}" "${CANDIDATE_OWNERS[$i]}" "${CANDIDATE_STRATEGIES[$i]}"
   done
 }
 
-command_scan() {
-  refresh_discovery
-  if [[ "${#PLATFORMS[@]}" -eq 0 ]]; then
-    printf 'No IntegrationPlatform installations detected.\n'
-    return 0
-  fi
-  print_candidate_table
+today_file() { [[ "$1" == *"$(date +%F)"* ]]; }
+
+archive_dir() {
+  case "$2" in
+    ACTIVE_CATALINA) printf '%s/%s/catalina\n' "$ARCHIVE_ROOT" "$1" ;;
+    ACCESS_LOG) printf '%s/%s/access\n' "$ARCHIVE_ROOT" "$1" ;;
+    DATED_LOG) [[ "${3##*/}" == catalina.* ]] && printf '%s/%s/catalina\n' "$ARCHIVE_ROOT" "$1" || printf '%s/%s/application\n' "$ARCHIVE_ROOT" "$1" ;;
+  esac
 }
 
-command_status() {
-  local directory
+init_log() {
+  mkdir -p "$INSTALL_DIR/logs/runs" 2>/dev/null || true
+  RUN_LOG="$INSTALL_DIR/logs/runs/logguard-run-$(date +%Y%m%dT%H%M%S).log"
+  : > "$RUN_LOG" 2>/dev/null || true
+}
 
-  refresh_discovery
-  printf 'LOGGUARD_VERSION: %s\n' "$(logguard_version)"
-  printf 'INSTALL_DIR: %s\n' "$INSTALL_DIR"
-  for directory in config state logs archive; do
-    if [[ -d "${INSTALL_DIR}/${directory}" ]]; then
-      printf 'DIR_%s: present\n' "${directory^^}"
+runlog_retention() {
+  local file
+  while IFS= read -r -d '' file; do
+    if [[ "$MODE" == DRY_RUN ]]; then
+      write_log INFO "mode=DRY_RUN action=WOULD_RUNLOG_RETENTION_DELETE file=$file"
+    elif rm -f -- "$file"; then
+      write_log INFO "mode=RUN action=RUNLOG_RETENTION_DELETE file=$file"
     else
-      printf 'DIR_%s: missing\n' "${directory^^}"
+      fail "mode=RUN action=RUNLOG_RETENTION_FAILED file=$file"
     fi
-  done
-  printf 'INTEGRATION_PLATFORMS: %s\n' "${#PLATFORMS[@]}"
-  printf 'LOG_CANDIDATES: %s\n' "${#CANDIDATE_PATHS[@]}"
-  if [[ "${#PLATFORMS[@]}" -eq 0 ]]; then
-    printf 'No IntegrationPlatform installations detected.\n'
+  done < <(find "$INSTALL_DIR/logs/runs" -maxdepth 1 -type f -name 'logguard-run-*.log' ! -path "$RUN_LOG" -mtime +"$RUN_LOG_RETENTION_DAYS" -print0 2>/dev/null)
+}
+
+archive_root_preflight() {
+  local srv_canon root_canon
+  srv_canon="$(priv readlink -f -- /srv 2>/dev/null || true)"
+  [[ "$srv_canon" == /srv ]] || { fail 'mode=RUN action=ARCHIVE_ROOT_SAFETY_FAILED reason=unsafe_srv'; return 1; }
+
+  if priv test -e "$ARCHIVE_ROOT" || priv test -L "$ARCHIVE_ROOT"; then
+    priv test -L "$ARCHIVE_ROOT" && { fail 'mode=RUN action=ARCHIVE_ROOT_SAFETY_FAILED reason=symlink'; return 1; }
+    priv test -d "$ARCHIVE_ROOT" || { fail 'mode=RUN action=ARCHIVE_ROOT_SAFETY_FAILED reason=not_directory'; return 1; }
+  else
+    priv install -d -m 0700 "$ARCHIVE_ROOT" || { fail 'mode=RUN action=ARCHIVE_ROOT_SAFETY_FAILED reason=create_failed'; return 1; }
+  fi
+
+  root_canon="$(priv readlink -f -- "$ARCHIVE_ROOT" 2>/dev/null || true)"
+  [[ "$root_canon" == /srv/BackupLog ]] || { fail 'mode=RUN action=ARCHIVE_ROOT_SAFETY_FAILED reason=canonical_path'; return 1; }
+}
+
+safe_file() {
+  local candidate_canon root_canon
+  candidate_canon="$(priv readlink -f -- "$1" 2>/dev/null || true)"
+  root_canon="$(priv readlink -f -- "$ARCHIVE_ROOT" 2>/dev/null || true)"
+  [[ "$root_canon" == /srv/BackupLog && -n "$candidate_canon" && "$candidate_canon" == /srv/BackupLog/* ]] || return 1
+  priv test -f "$candidate_canon"
+}
+
+cleanup_temp() {
+  local platform="$1" temp_base="$2"
+  priv rm -f -- "$temp_base" "$temp_base.gz" || write_log WARN "mode=RUN platform=$platform action=TEMP_CLEANUP_FAILED file=$temp_base"
+}
+
+archive_one() {
+  local platform="$1" type="$2" source="$3" source_size_at_scan="$4"
+  local directory target temporary snapshot_size unpacked_size archive_size current_source_size
+  directory="$(archive_dir "$platform" "$type" "$source")"
+  target="$directory/${source##*/}.gz"
+  [[ "$type" == ACTIVE_CATALINA ]] && target="$directory/catalina.out-$(date +%Y%m%dT%H%M%S).log.gz"
+
+  if priv test -e "$target"; then
+    write_log WARN "mode=RUN platform=$platform action=ARCHIVE_SKIP file=$source target=$target reason=target_exists"
     return 0
   fi
-  print_candidate_table 20
+  temporary="$target.tmp.$$"
+  write_log INFO "mode=RUN platform=$platform action=ARCHIVE_START file=$source target=$target source_size_at_scan=$source_size_at_scan"
+
+  if ! priv install -d -m 0700 "$directory" || ! priv cp -- "$source" "$temporary"; then
+    fail "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=copy"
+    cleanup_temp "$platform" "$temporary"
+    return 1
+  fi
+  snapshot_size="$(priv stat -c %s -- "$temporary" 2>/dev/null || true)"
+  if ! number "${snapshot_size:-}" || ! priv gzip -f -- "$temporary"; then
+    fail "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=gzip"
+    cleanup_temp "$platform" "$temporary"
+    return 1
+  fi
+  temporary="$temporary.gz"
+  unpacked_size="$(priv gzip -cd -- "$temporary" 2>/dev/null | wc -c | tr -d ' ')"
+  if ! priv gzip -t -- "$temporary" || [[ "$unpacked_size" != "$snapshot_size" ]]; then
+    fail "mode=RUN platform=$platform action=VERIFY_FAILED file=$source target=$temporary snapshot_size=$snapshot_size"
+    write_log ERROR "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=verify"
+    cleanup_temp "$platform" "${temporary%.gz}"
+    return 1
+  fi
+  archive_size="$(priv stat -c %s -- "$temporary" 2>/dev/null || true)"
+  write_log INFO "mode=RUN platform=$platform action=VERIFY_OK file=$source target=$temporary snapshot_size=$snapshot_size archive_size=$archive_size"
+  if ! priv mv -n -- "$temporary" "$target"; then
+    fail "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=publish"
+    cleanup_temp "$platform" "${temporary%.gz}"
+    return 1
+  fi
+  if priv test -e "$temporary"; then
+    write_log WARN "mode=RUN platform=$platform action=ARCHIVE_SKIP file=$source target=$target reason=target_conflict"
+    cleanup_temp "$platform" "${temporary%.gz}"
+    return 0
+  fi
+
+  write_log INFO "mode=RUN platform=$platform action=ARCHIVE_OK file=$source target=$target snapshot_size=$snapshot_size archive_size=$archive_size"
+  if [[ "$type" == ACTIVE_CATALINA ]]; then
+    current_source_size="$(priv stat -c %s -- "$source" 2>/dev/null || true)"
+    if [[ "$current_source_size" != "$snapshot_size" ]]; then
+      write_log WARN "mode=RUN platform=$platform action=TRUNCATE_DEFERRED file=$source reason=source_changed_after_snapshot snapshot_size=$snapshot_size current_source_size=$current_source_size"
+      return 0
+    fi
+    if ! priv truncate -s 0 -- "$source" || [[ "$(priv stat -c %s -- "$source" 2>/dev/null || true)" != 0 ]]; then
+      fail "mode=RUN platform=$platform action=TRUNCATE_FAILED file=$source"
+      return 1
+    fi
+    write_log INFO "mode=RUN platform=$platform action=TRUNCATE_OK file=$source"
+  elif ! priv rm -f -- "$source"; then
+    fail "mode=RUN platform=$platform action=REMOVE_FAILED file=$source"
+    return 1
+  else
+    write_log INFO "mode=RUN platform=$platform action=REMOVE_OK file=$source"
+  fi
 }
 
-command_help() {
-  cat <<'EOF_HELP'
-Usage: logguard [status|scan|version|help]
-
-LOGGUARD 0.1.0 is discovery-only and read-only. It reports proposed log
-handling strategies; it does not rotate, truncate, archive or modify logs.
-EOF_HELP
+delete_retention_file() {
+  local file="$1" reason="$2"
+  if ! safe_file "$file"; then
+    write_log WARN "mode=RUN action=RETENTION_SKIP file=$file reason=safety_check"
+    return 1
+  fi
+  write_log INFO "mode=RUN action=RETENTION_DELETE_START file=$file reason=$reason"
+  if ! priv rm -f -- "$file"; then
+    fail "mode=RUN action=RETENTION_FAILED file=$file reason=$reason"
+    return 1
+  fi
+  write_log INFO "mode=RUN action=RETENTION_DELETE file=$file reason=$reason"
+  return 0
 }
+
+cleanup_age() {
+  local directory="$1" days="$2" file
+  while IFS= read -r -d '' file; do
+    delete_retention_file "$file" age || true
+  done < <(priv find -P "$directory" -type f -mtime +"$days" -print0 2>/dev/null)
+}
+
+cleanup_size() {
+  local platform_directory="$1" maximum total record file size
+  maximum=$((ARCHIVE_MAX_SIZE_GIB * 1024 * 1024 * 1024))
+  total="$(priv du -sb -- "$platform_directory" 2>/dev/null | awk '{print $1}')"
+  number "${total:-}" || return 0
+  while (( total > maximum )); do
+    record="$(priv find -P "$platform_directory" -type f -printf '%T@:%p\0' 2>/dev/null | sort -z | { IFS= read -r -d '' entry || true; printf '%s' "$entry"; })"
+    [[ -n "$record" ]] || break
+    file="${record#*:}"
+    size="$(priv stat -c %s -- "$file" 2>/dev/null || true)"
+    if ! number "${size:-}"; then
+      fail "mode=RUN action=RETENTION_FAILED file=$file reason=invalid_size"
+      return 1
+    fi
+    if ! delete_retention_file "$file" size_limit; then
+      return 1
+    fi
+    total=$((total - size))
+  done
+}
+
+cleanup() {
+  local platform_directory
+  while IFS= read -r -d '' platform_directory; do
+    cleanup_age "$platform_directory/catalina" "$CATALINA_RETENTION_DAYS"
+    cleanup_age "$platform_directory/access" "$ACCESS_RETENTION_DAYS"
+    cleanup_age "$platform_directory/application" "$DATED_LOG_RETENTION_DAYS"
+    cleanup_size "$platform_directory"
+  done < <(priv find -P "$ARCHIVE_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+}
+
+plan_retention_directory() {
+  local directory="$1" days="$2" file
+  while IFS= read -r -d '' file; do
+    write_log INFO "mode=DRY_RUN action=WOULD_RETENTION_DELETE file=$file reason=age"
+  done < <(sudo -n find -P "$directory" -type f -mtime +"$days" -print0 2>/dev/null)
+}
+
+plan_size_retention() {
+  local platform_directory="$1" maximum total record file size
+  maximum=$((ARCHIVE_MAX_SIZE_GIB * 1024 * 1024 * 1024))
+  total="$(sudo -n du -sb -- "$platform_directory" 2>/dev/null | awk '{print $1}')"
+  number "${total:-}" || return 0
+  while IFS= read -r -d '' record; do
+    (( total > maximum )) || break
+    file="${record#*:}"
+    size="$(sudo -n stat -c %s -- "$file" 2>/dev/null || true)"
+    if ! number "${size:-}"; then
+      write_log WARN "mode=DRY_RUN action=RETENTION_SKIP file=$file reason=invalid_size"
+      continue
+    fi
+    write_log INFO "mode=DRY_RUN action=WOULD_RETENTION_DELETE file=$file reason=size_limit"
+    total=$((total - size))
+  done < <(sudo -n find -P "$platform_directory" -type f -printf '%T@:%p\0' 2>/dev/null | sort -z)
+}
+
+plan_retention() {
+  local platform_directory
+  if ! sudo_noninteractive; then
+    write_log WARN 'mode=DRY_RUN action=RETENTION_UNAVAILABLE reason=sudo_noninteractive_unavailable'
+    return 0
+  fi
+  while IFS= read -r -d '' platform_directory; do
+    plan_retention_directory "$platform_directory/catalina" "$CATALINA_RETENTION_DAYS"
+    plan_retention_directory "$platform_directory/access" "$ACCESS_RETENTION_DAYS"
+    plan_retention_directory "$platform_directory/application" "$DATED_LOG_RETENTION_DAYS"
+    plan_size_retention "$platform_directory"
+  done < <(sudo -n find -P "$ARCHIVE_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+}
+
+plan_one() {
+  local i="$1" platform="${CANDIDATE_PLATFORMS[$1]}" type="${CANDIDATE_TYPES[$1]}" file="${CANDIDATE_FILES[$1]}" size="${CANDIDATE_SIZES[$1]}" target
+  case "$type" in
+    ACTIVE_CATALINA)
+      if [[ "$size" != UNKNOWN ]] && (( size >= CATALINA_THRESHOLD_MIB * 1024 * 1024 )); then
+        target="$(archive_dir "$platform" "$type" "$file")/catalina.out-$(date +%Y%m%dT%H%M%S).log.gz"
+        write_log INFO "mode=DRY_RUN platform=$platform action=WOULD_ARCHIVE file=$file target=$target"
+        write_log INFO "mode=DRY_RUN platform=$platform action=WOULD_VERIFY file=$file target=$target"
+        write_log INFO "mode=DRY_RUN platform=$platform action=WOULD_TRUNCATE file=$file"
+      fi
+      ;;
+    ACCESS_LOG|DATED_LOG)
+      today_file "$file" || { target="$(archive_dir "$platform" "$type" "$file")/${file##*/}.gz"; write_log INFO "mode=DRY_RUN platform=$platform action=WOULD_ARCHIVE file=$file target=$target"; }
+      ;;
+    ACTIVE_LOG) write_log INFO "mode=DRY_RUN platform=$platform action=MONITOR_ONLY file=$file size=$size" ;;
+    COMPRESSED) write_log INFO "mode=DRY_RUN platform=$platform action=RETENTION_ONLY file=$file" ;;
+  esac
+}
+
+status() {
+  MODE=STATUS; load_config || return 1; discover
+  printf 'LOGGUARD_VERSION: %s\nARCHIVE_ROOT: %s\nCATALINA_THRESHOLD_MIB: %s\nSUDO_PRESENT: %s\nSUDO_NONINTERACTIVE: %s\nINTEGRATION_PLATFORMS: %s\n' "$(version)" "$ARCHIVE_ROOT" "$CATALINA_THRESHOLD_MIB" "$(sudo_present && echo yes || echo no)" "$(sudo_noninteractive && echo yes || echo no)" "${#PLATFORMS[@]}"
+}
+
+scan() { MODE=SCAN; load_config || return 1; discover; table; }
+
+plan() {
+  local i
+  MODE=DRY_RUN; load_config || return 1; init_log; discover
+  for i in "${!CANDIDATE_FILES[@]}"; do plan_one "$i"; done
+  runlog_retention
+  plan_retention
+}
+
+run() {
+  local i
+  MODE=RUN; load_config || return 1; init_log
+  if ! sudo_present || ! sudo -v; then
+    fail 'mode=RUN action=SUDO_PREFLIGHT_FAILED'
+    write_log ERROR "mode=RUN action=RUN_END result=ERROR errors=$ERRORS"
+    return 1
+  fi
+  write_log INFO 'mode=RUN action=RUN_START'
+  if ! archive_root_preflight; then
+    write_log ERROR "mode=RUN action=RUN_END result=ERROR errors=$ERRORS"
+    return 1
+  fi
+  runlog_retention
+  discover
+  for i in "${!CANDIDATE_FILES[@]}"; do
+    case "${CANDIDATE_TYPES[$i]}" in
+      ACTIVE_CATALINA)
+        [[ "${CANDIDATE_SIZES[$i]}" != UNKNOWN ]] && (( CANDIDATE_SIZES[$i] >= CATALINA_THRESHOLD_MIB * 1024 * 1024 )) && archive_one "${CANDIDATE_PLATFORMS[$i]}" ACTIVE_CATALINA "${CANDIDATE_FILES[$i]}" "${CANDIDATE_SIZES[$i]}" || true
+        ;;
+      ACCESS_LOG|DATED_LOG)
+        today_file "${CANDIDATE_FILES[$i]}" || archive_one "${CANDIDATE_PLATFORMS[$i]}" "${CANDIDATE_TYPES[$i]}" "${CANDIDATE_FILES[$i]}" "${CANDIDATE_SIZES[$i]}" || true
+        ;;
+      ACTIVE_LOG) write_log INFO "mode=RUN platform=${CANDIDATE_PLATFORMS[$i]} action=MONITOR_ONLY file=${CANDIDATE_FILES[$i]}" ;;
+    esac
+  done
+  cleanup
+  (( ERRORS == 0 )) && write_log INFO 'mode=RUN action=RUN_END result=OK' || { write_log ERROR "mode=RUN action=RUN_END result=ERROR errors=$ERRORS"; return 1; }
+}
+
+help() { printf '%s\n' 'Usage: logguard [status|scan|plan|run|version|help]' 'status and scan are read-only; plan is dry-run; run performs explicit verified operations.'; }
 
 case "${1:-status}" in
-  status) command_status ;;
-  scan) command_scan ;;
-  version) printf '%s\n' "$(logguard_version)" ;;
-  help|-h|--help) command_help ;;
-  *)
-    printf 'ERROR: unknown command: %s\n' "$1" >&2
-    command_help >&2
-    exit 2
-    ;;
+  status) status ;;
+  scan) scan ;;
+  plan) plan ;;
+  run) run ;;
+  version) version ;;
+  help|-h|--help) help ;;
+  *) printf 'ERROR: unknown command: %s\n' "$1" >&2; exit 2 ;;
 esac

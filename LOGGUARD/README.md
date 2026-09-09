@@ -1,53 +1,30 @@
 # LOGGUARD
 
-LOGGUARD 0.1.0 is a discovery-only, read-only module for auditing log-growth candidates inside detected IntegrationPlatform installations.
+LOGGUARD 0.1.0 provides controlled log discovery, dry-run planning, and explicit archive handling for detected IntegrationPlatform installations. Discovery scans only `/srv` and `/opt`, uses `find -P`, does not follow symlinks, and ignores any `_NEW` or `_OLD` path component.
 
-## Scope of 0.1.0
+## Installation and layout
 
-The module scans only `/srv` and `/opt`, finds directories named `IntegrationPlatform` or `IntegrationPlatform_*` (case-insensitively), and ignores paths with a component ending in `_NEW` or `_OLD`.
+The installer creates the private `$HOME/UTILITY/LOGGUARD` layout: `bin`, `config`, `state`, `logs/runs`, and the technical `archive` directory. It installs the default `config/logguard.conf` only when it does not already exist, so updates preserve local configuration. It does not create `/srv/BackupLog`; that root is created only by an explicit `run` when needed.
 
-Only inside a detected platform root it discovers `catalina.out`, `*.log`, and `logs` directories. Candidate files are reported deterministically with platform, path, size, owner and a proposed strategy:
-
-- `catalina.out` → `COPYTRUNCATE`
-- `*.log` → `ROTATE_CANDIDATE`
-
-These are proposals only. Version 0.1.0 does not truncate, move, remove, gzip, archive, compress, change permissions, alter logrotate, interact with Docker, or stop/restart services.
-
-## Installation
-
-Run as a user allowed to create and own files for `itgo` (normally root):
-
-```bash
-sudo bash logguard_installer_public.sh
-```
-
-The installer creates only this private layout:
-
-```text
-/home/itgo/UTILITY/LOGGUARD/
-├── archive/
-├── bin/logguard
-├── config/
-├── logs/
-├── state/
-└── logguard.version
-```
-
-Directories and implementation are owned by `itgo` and private to that user. No systemd unit, cron job, logrotate configuration, `/etc` file, sudoers entry, or `/usr/local/bin` wrapper is created.
+No service unit, scheduled task, operating-system rotation configuration, privilege-policy change, system configuration file, or global wrapper is created.
 
 ## Commands
-
-Run the installed private launcher as `itgo`:
 
 ```bash
 ~/UTILITY/LOGGUARD/bin/logguard status
 ~/UTILITY/LOGGUARD/bin/logguard scan
-~/UTILITY/LOGGUARD/bin/logguard version
-~/UTILITY/LOGGUARD/bin/logguard help
+~/UTILITY/LOGGUARD/bin/logguard plan
+~/UTILITY/LOGGUARD/bin/logguard run
 ```
 
-The default command is `status`. Absence of IntegrationPlatform installations is reported as normal discovery output, not as an error.
+`status` reports version, configuration, sudo availability, and discovered-platform count. `scan` is entirely read-only and prints platform, type, path, size, owner, and strategy. `plan` is dry-run: it changes nothing and records `WOULD_*` actions. Only the explicitly invoked `run` can modify files.
 
-## Future direction
+## Handling and safety
 
-The intended later stages are controlled log-growth handling, archival, compression, retention, and safe COPYTRUNCATE only for explicitly approved `catalina.out` files. They are intentionally inactive in 0.1.0: discovery and validation on real servers must precede any active rotation.
+`catalina.out` is `ACTIVE_CATALINA` and uses COPYTRUNCATE only after its configured threshold. LOGGUARD copies to a temporary archive under `/srv/BackupLog/<platform>/catalina`, gzips it, runs `gzip -t`, verifies uncompressed snapshot size, publishes the archive, and only then truncates the source. A copy, gzip, or verification failure never truncates the source.
+
+Older `localhost_access_log.*.txt` files are archived under `access`; dated `*.log` files go under `application` (or `catalina` for `catalina.*.log`). Current-day files are skipped. Ordinary active `*.log` files are `MONITOR_ONLY`: they are never truncated, moved, compressed, or removed. Existing `.zip` and `.gz` files are `RETENTION_ONLY` and are not repacked or removed from platform directories.
+
+Archive retention applies only inside `ARCHIVE_ROOT`, with configured age limits and a per-platform size limit. Deletes are restricted to canonical, verified regular files below `ARCHIVE_ROOT`; the root and platform directories are never deleted. The default configuration documents thresholds, retention, archive root, and dry-run mode, and is parsed as data rather than sourced as code.
+
+Operational metadata is logged to `logs/logguard.log`; every plan/run has `logs/runs/logguard-run-YYYYMMDDTHHMMSS.log`, retained for the configured number of days. Sudo is detected and used only for individual operations that need it; LOGGUARD is not launched wholesale through sudo.
