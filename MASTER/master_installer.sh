@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.94"
+MASTER_VERSION="1.2.95"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.21"
@@ -1994,7 +1994,7 @@ download_p1cert_payload() {
 
 download_logguard_payload() {
   local out_dir="${1:?}" item source_path out_path url
-  local items=("logguard_installer_public.sh" "logguard" "logguard.version")
+  local items=("logguard_installer_public.sh" "logguard" "logguard.conf" "logguard.version")
 
   [[ -d "$TMP_DIR" ]] || { echo "[$(ts)] ERROR: missing $TMP_DIR"; return 1; }
   rm -rf -- "$out_dir"
@@ -2019,7 +2019,7 @@ download_logguard_payload() {
   done
 
   chmod 0755 "$out_dir/logguard_installer_public.sh" "$out_dir/logguard"
-  chmod 0644 "$out_dir/logguard.version"
+  chmod 0644 "$out_dir/logguard.conf" "$out_dir/logguard.version"
   chown -R "$TARGET_USER:$TARGET_USER" "$out_dir" 2>/dev/null || true
 }
 
