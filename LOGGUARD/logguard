@@ -110,9 +110,18 @@ find_platforms() {
 }
 
 classify() {
-  local name="${1##*/}"
-  name="${name,,}"
-  if [[ "$name" == catalina.out ]]; then echo 'ACTIVE_CATALINA COPYTRUNCATE'
+  local file="${1:?}" lower name
+  lower="${file,,}"
+  name="${lower##*/}"
+
+  if [[ "$lower" != */apache-tomcat/logs/* \
+     && "$lower" != */apache-tomcat/logs-*/* \
+     && "$lower" != */apache-tomcat/logs.prev-*/* ]]; then
+    return 0
+  fi
+
+  if [[ "$lower" == */apache-tomcat/logs/catalina.out ]]; then echo 'ACTIVE_CATALINA COPYTRUNCATE'
+  elif [[ "$name" == catalina.out ]]; then echo 'ACTIVE_LOG MONITOR_ONLY'
   elif [[ "$name" == localhost_access_log.*.txt ]]; then echo 'ACCESS_LOG ARCHIVE_RETENTION'
   elif [[ "$name" == *.zip || "$name" == *.gz ]]; then echo 'COMPRESSED RETENTION_ONLY'
   elif [[ "$name" == *.log && "$name" =~ [0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then echo 'DATED_LOG ARCHIVE_RETENTION'

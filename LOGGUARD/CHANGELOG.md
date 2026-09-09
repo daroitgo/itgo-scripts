@@ -4,6 +4,7 @@
 
 - Prepared the 0.2.0 LOGGUARD functionality: typed discovery, safe dry-run plans, explicit archive handling, private run logs, configuration validation, and archive-root retention safeguards.
 - Added protected COPYTRUNCATE for threshold-qualified `catalina.out`, archival of eligible access and dated logs, and monitor-only handling for active ordinary logs.
+- Restricted active `catalina.out` handling to the current `apache-tomcat/logs` directory and excluded non-log archives such as Tomcat binaries from discovery.
 
 ## 0.1.0
 
