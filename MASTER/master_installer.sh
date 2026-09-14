@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.99"
+MASTER_VERSION="1.2.100"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.23"
@@ -53,6 +53,7 @@ LOGGUARD_VERSION="0.2.1"
 MODE="install"
 UPDATE_ONLY_MODE="0"
 MODULES_ONLY_MODE="0"
+TOOLS_ONLY_MODE="0"
 
 if [[ "${1:-}" == "--update-only" ]]; then
   MODE="update-only"
@@ -61,6 +62,10 @@ if [[ "${1:-}" == "--update-only" ]]; then
 elif [[ "${1:-}" == "--modules-only" ]]; then
   MODE="modules-only"
   MODULES_ONLY_MODE="1"
+  TARGET_USER="${2:-itgo}"
+elif [[ "${1:-}" == "--tools-only" ]]; then
+  MODE="tools-only"
+  TOOLS_ONLY_MODE="1"
   TARGET_USER="${2:-itgo}"
 else
   TARGET_USER="${1:-itgo}"
@@ -634,7 +639,7 @@ ensure_amcs_java_runtime() {
 }
 
 install_master_launcher() {
-  local launcher_dir install_launcher modules_launcher update_launcher bp
+  local launcher_dir install_launcher modules_launcher tools_launcher update_launcher bp
   local legacy_install_launcher="/usr/local/bin/master-install"
   local legacy_update_launcher="/usr/local/bin/master-update"
   local legacy_path_start="# >>> ITGO MASTER PATH (auto) >>>"
@@ -653,6 +658,7 @@ install_master_launcher() {
   launcher_dir="$ITGO_HOME/UTILITY/MASTER"
   install_launcher="$launcher_dir/master-install"
   modules_launcher="$launcher_dir/master-modules"
+  tools_launcher="$launcher_dir/master-tools"
   update_launcher="$launcher_dir/master-update"
   bp="$ITGO_HOME/.bash_profile"
 
@@ -768,6 +774,54 @@ else
 fi
 EOF_MASTER_MODULES_LAUNCHER
 
+  cat > "$tools_launcher" <<'EOF_MASTER_TOOLS_LAUNCHER'
+#!/usr/bin/env bash
+set -eu
+set -o pipefail 2>/dev/null || true
+
+target_user="${1:-itgo}"
+repo_api="https://api.github.com/repos/daroitgo/itgo-scripts/git/matching-refs/tags/master-"
+tmp_script="$(mktemp)"
+
+cleanup() {
+  rm -f "$tmp_script" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+if ! command -v wget >/dev/null 2>&1; then
+  echo "ERROR: wget is required for master-tools" >&2
+  exit 1
+fi
+
+latest_tag="$(
+  wget -qO- "$repo_api" \
+    | grep -o '"ref":[[:space:]]*"refs/tags/master-[^"]*"' \
+    | sed 's#.*"ref":[[:space:]]*"refs/tags/\(master-[^"]*\)".*#\1#' \
+    | sort -V \
+    | tail -n1
+)"
+
+if [[ -z "${latest_tag:-}" ]]; then
+  echo "ERROR: cannot determine latest master-* tag from daroitgo/itgo-scripts for master-tools" >&2
+  exit 1
+fi
+
+script_url="https://raw.githubusercontent.com/daroitgo/itgo-scripts/${latest_tag}/MASTER/master_installer.sh"
+
+if ! wget -qO "$tmp_script" "$script_url"; then
+  echo "ERROR: master-tools cannot download MASTER/master_installer.sh from tag ${latest_tag}" >&2
+  exit 1
+fi
+
+chmod 0755 "$tmp_script" 2>/dev/null || true
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  bash "$tmp_script" --tools-only "$target_user"
+else
+  sudo bash "$tmp_script" --tools-only "$target_user"
+fi
+EOF_MASTER_TOOLS_LAUNCHER
+
   cat > "$update_launcher" <<'EOF_MASTER_UPDATE_LAUNCHER'
 #!/usr/bin/env bash
 set -eu
@@ -816,8 +870,8 @@ else
 fi
 EOF_MASTER_UPDATE_LAUNCHER
 
-  chown "$TARGET_USER:$TARGET_USER" "$install_launcher" "$modules_launcher" "$update_launcher" 2>/dev/null || true
-  chmod 0755 "$install_launcher" "$modules_launcher" "$update_launcher"
+  chown "$TARGET_USER:$TARGET_USER" "$install_launcher" "$modules_launcher" "$tools_launcher" "$update_launcher" 2>/dev/null || true
+  chmod 0755 "$install_launcher" "$modules_launcher" "$tools_launcher" "$update_launcher"
 
   touch "$bp"
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
@@ -831,6 +885,7 @@ EOF_MASTER_UPDATE_LAUNCHER
 
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-install"
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-modules"
+  add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-tools"
   add_summary "MASTER launcher installed: ~/UTILITY/MASTER/master-update"
   add_summary "User-local PATH updated for MASTER, STATUS, TSEQ, DOWNLOADER_APP, UPGbuilder, INVENTORY, LOGGUARD, AMCS, TOOLS"
 }
@@ -1578,25 +1633,82 @@ EOF_SUD
 ensure_acls_block() {
   if ! command -v setfacl >/dev/null 2>&1; then
     echo "[$(ts)] WARN: setfacl not found. Skipping ACL."
-    return 0
-  fi
-
-  if prompt_yn "Ustawić ACL-e dla /srv (rwx+default) oraz /etc/amms.conf (rw)?" "Y"; then
-    echo "[$(ts)] ACTION: setfacl on /srv"
-    setfacl -R -m "u:${TARGET_USER}:rwx" /srv
-    setfacl -R -d -m "u:${TARGET_USER}:rwx" /srv
-
-    if [[ -f /etc/amms.conf ]]; then
-      echo "[$(ts)] ACTION: setfacl on /etc/amms.conf"
-      setfacl -m "u:${TARGET_USER}:rw" /etc/amms.conf
-    else
-      echo "[$(ts)] WARN: /etc/amms.conf not found; skipped."
-    fi
-
-    echo "[$(ts)] OK: ACL block done."
   else
-    echo "[$(ts)] SKIP: ACL block."
+    if prompt_yn "Ustawić ACL-e dla /srv (rwx+default) oraz /etc/amms.conf (rw)?" "Y"; then
+      echo "[$(ts)] ACTION: setfacl on /srv"
+      setfacl -R -m "u:${TARGET_USER}:rwx" /srv
+      setfacl -R -d -m "u:${TARGET_USER}:rwx" /srv
+
+      if [[ -f /etc/amms.conf ]]; then
+        echo "[$(ts)] ACTION: setfacl on /etc/amms.conf"
+        setfacl -m "u:${TARGET_USER}:rw" /etc/amms.conf
+      else
+        echo "[$(ts)] WARN: /etc/amms.conf not found; skipped."
+      fi
+
+      echo "[$(ts)] OK: ACL block done."
+    else
+      echo "[$(ts)] SKIP: ACL block."
+    fi
   fi
+
+  install_acl_refresh_mechanism
+}
+
+install_acl_refresh_mechanism() {
+  local helper="/usr/local/sbin/itgo-refresh-acl"
+  local sudoers_file="/etc/sudoers.d/itgo-refresh-acl"
+  local sudoers_tmp=""
+  local bp="$ITGO_HOME/.bash_profile"
+  local block_start="# >>> ITGO ACL REFRESH (auto) >>>"
+  local block_end="# <<< ITGO ACL REFRESH (auto) <<<"
+
+  install -d -m 0755 -o root -g root /usr/local/sbin
+  cat > "$helper" <<EOF_ITGO_ACL_REFRESH_HELPER
+#!/usr/bin/env bash
+set -euo pipefail 2>/dev/null || set -eu
+
+if [[ "\$#" -ne 0 ]]; then
+  exit 2
+fi
+
+if ! command -v setfacl >/dev/null 2>&1; then
+  exit 0
+fi
+
+setfacl -R -m u:${TARGET_USER}:rwx /srv
+setfacl -R -d -m u:${TARGET_USER}:rwx /srv
+if [[ -f /etc/amms.conf ]]; then
+  setfacl -m u:${TARGET_USER}:rw /etc/amms.conf
+fi
+EOF_ITGO_ACL_REFRESH_HELPER
+  chown root:root "$helper"
+  chmod 0755 "$helper"
+
+  sudoers_tmp="$(mktemp /etc/sudoers.d/itgo-refresh-acl.XXXXXX)"
+  cat > "$sudoers_tmp" <<EOF_ITGO_ACL_REFRESH_SUDOERS
+${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/sbin/itgo-refresh-acl
+EOF_ITGO_ACL_REFRESH_SUDOERS
+  chmod 0440 "$sudoers_tmp"
+  if ! visudo -cf "$sudoers_tmp" >/dev/null; then
+    echo "[$(ts)] ERROR: ACL refresh sudoers validation failed."
+    rm -f "$sudoers_tmp"
+    return 1
+  fi
+  mv -f "$sudoers_tmp" "$sudoers_file"
+  chown root:root "$sudoers_file"
+  chmod 0440 "$sudoers_file"
+
+  touch "$bp"
+  safe_backup "$bp"
+  remove_block_from_file "$bp" "$block_start" "$block_end"
+  printf "\n%s\nif [[ \$- == *i* ]]; then\n  sudo -n /usr/local/sbin/itgo-refresh-acl >/dev/null 2>&1 || true\nfi\n%s\n" "$block_start" "$block_end" >> "$bp"
+  chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
+  chmod 0644 "$bp" 2>/dev/null || true
+
+  add_summary "ACL refresh installed: /usr/local/sbin/itgo-refresh-acl"
+  add_summary "ACL refresh sudoers installed: /etc/sudoers.d/itgo-refresh-acl"
+  add_summary "ACL refresh enabled in ~/.bash_profile"
 }
 
 ensure_docker_group_membership() {
@@ -3101,11 +3213,15 @@ BEOF
 }
 
 restore_master_shell_settings() {
-  local bp br bl launcher_dir install_launcher modules_launcher update_launcher
+  local bp br bl launcher_dir install_launcher modules_launcher tools_launcher update_launcher
   local legacy_install_launcher="/usr/local/bin/master-install"
   local legacy_update_launcher="/usr/local/bin/master-update"
+  local acl_refresh_helper="/usr/local/sbin/itgo-refresh-acl"
+  local acl_refresh_sudoers="/etc/sudoers.d/itgo-refresh-acl"
   local bp_start="# >>> ITGO SSH HISTORY PROMPT (auto) >>>"
   local bp_end="# <<< ITGO SSH HISTORY PROMPT (auto) <<<"
+  local acl_refresh_start="# >>> ITGO ACL REFRESH (auto) >>>"
+  local acl_refresh_end="# <<< ITGO ACL REFRESH (auto) <<<"
   local legacy_path_start="# >>> ITGO MASTER PATH (auto) >>>"
   local legacy_path_end="# <<< ITGO MASTER PATH (auto) <<<"
   local path_start="# >>> ITGO LOCAL MODULE PATHS (auto) >>>"
@@ -3117,6 +3233,14 @@ restore_master_shell_settings() {
 
   if ! have_user; then
     add_summary "Restore shell settings MASTER: SKIP (user missing)"
+    if [[ -e "$acl_refresh_helper" || -L "$acl_refresh_helper" ]]; then
+      rm -f "$acl_refresh_helper" 2>/dev/null || true
+      add_summary "ACL refresh helper removed: $acl_refresh_helper"
+    fi
+    if [[ -e "$acl_refresh_sudoers" || -L "$acl_refresh_sudoers" ]]; then
+      rm -f "$acl_refresh_sudoers" 2>/dev/null || true
+      add_summary "ACL refresh sudoers removed: $acl_refresh_sudoers"
+    fi
     return 0
   fi
 
@@ -3132,11 +3256,13 @@ restore_master_shell_settings() {
   launcher_dir="$ITGO_HOME/UTILITY/MASTER"
   install_launcher="$launcher_dir/master-install"
   modules_launcher="$launcher_dir/master-modules"
+  tools_launcher="$launcher_dir/master-tools"
   update_launcher="$launcher_dir/master-update"
 
   if [[ -f "$bp" ]]; then
     safe_backup "$bp"
     remove_block_from_file "$bp" "$bp_start" "$bp_end"
+    remove_block_from_file "$bp" "$acl_refresh_start" "$acl_refresh_end"
     remove_block_from_file "$bp" "$legacy_path_start" "$legacy_path_end"
     remove_block_from_file "$bp" "$path_start" "$path_end"
     chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
@@ -3171,11 +3297,32 @@ restore_master_shell_settings() {
     add_summary "MASTER launcher removed: SKIP (master-modules not present)"
   fi
 
+  if [[ -f "$tools_launcher" ]]; then
+    rm -f "$tools_launcher" 2>/dev/null || true
+    add_summary "MASTER launcher removed: master-tools"
+  else
+    add_summary "MASTER launcher removed: SKIP (master-tools not present)"
+  fi
+
   if [[ -f "$update_launcher" ]]; then
     rm -f "$update_launcher" 2>/dev/null || true
     add_summary "MASTER launcher removed: master-update"
   else
     add_summary "MASTER launcher removed: SKIP (master-update not present)"
+  fi
+
+  if [[ -e "$acl_refresh_helper" || -L "$acl_refresh_helper" ]]; then
+    rm -f "$acl_refresh_helper" 2>/dev/null || true
+    add_summary "ACL refresh helper removed: $acl_refresh_helper"
+  else
+    add_summary "ACL refresh helper removed: SKIP ($acl_refresh_helper not present)"
+  fi
+
+  if [[ -e "$acl_refresh_sudoers" || -L "$acl_refresh_sudoers" ]]; then
+    rm -f "$acl_refresh_sudoers" 2>/dev/null || true
+    add_summary "ACL refresh sudoers removed: $acl_refresh_sudoers"
+  else
+    add_summary "ACL refresh sudoers removed: SKIP ($acl_refresh_sudoers not present)"
   fi
 
   if [[ -d "$launcher_dir" ]]; then
@@ -4031,6 +4178,38 @@ main() {
 
   need_root
   prelog "BEGIN: ITGO Master Installer v$MASTER_VERSION user=$TARGET_USER"
+
+  if [[ "$TOOLS_ONLY_MODE" == "1" ]]; then
+    add_summary "MODE: tools-only"
+    if ! have_user; then
+      echo "[$(ts)] ERROR: user '$TARGET_USER' nie istnieje. tools-only wymaga istniejącego użytkownika."
+      add_summary "Tools-only: ERROR (user missing: $TARGET_USER)"
+      print_summary
+      exit 1
+    fi
+
+    prepare_user_paths_if_possible
+    if [[ -z "${ITGO_HOME:-}" || -z "${UTILITY_DIR:-}" ]]; then
+      echo "[$(ts)] ERROR: nie udało się ustalić HOME/UTILITY dla '$TARGET_USER'."
+      add_summary "Tools-only: ERROR (cannot resolve home)"
+      print_summary
+      exit 1
+    fi
+
+    section "TOOLS-ONLY - TOOLS, AMCS, AISM"
+    if prompt_yn "MODUŁ: TOOLS/cp-upg (lokalny helper kopiowania produkcji do ~/UPG/EDM, ZM, MPI, P1ADAPTER)?" "Y"; then
+      install_cp_upg_step
+    else
+      echo "[$(ts)] SKIP: TOOLS/cp-upg."
+      add_summary "TOOLS/cp-upg: skipped by user"
+    fi
+    install_amcs_step
+    install_aism_step
+
+    echo "[$(ts)] DONE."
+    print_summary
+    exit 0
+  fi
 
   if [[ "$UPDATE_ONLY_MODE" == "1" ]]; then
     add_summary "MODE: update-only"
