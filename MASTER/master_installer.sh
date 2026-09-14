@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.101"
+MASTER_VERSION="1.2.102"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.23"
@@ -2656,32 +2656,34 @@ install_aism_master_config() {
   local override_password=""
   local keystore_password=""
   local encryption_key_password=""
+  local env_tmp=""
 
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
     "$master_dir" \
     "$resources_dir" \
     "$resources_dir/resources"
 
+  while true; do
+    printf "AISM master: podaj APPLICATION_INSTALLER_OVERRIDE_PASSWORD: " >&2
+    read -r -s override_password || true
+    printf "\n" >&2
+    if [[ -z "$override_password" ]]; then
+      echo "[$(ts)] WARN: hasło nie może być puste." >&2
+      continue
+    fi
+
+    if [[ "$override_password" == *"'"* || "$override_password" == *\\* ]]; then
+      echo "[$(ts)] WARN: hasło nie może zawierać apostrofu ani backslasha." >&2
+      override_password=""
+      continue
+    fi
+
+    break
+  done
+
   if [[ ! -f "$env_file" ]]; then
-    override_password="$(generate_aism_secret)" || exit 1
     keystore_password="$(generate_aism_secret)" || exit 1
-    while true; do
-      printf "AISM master: podaj INSTALLER_ENCRYPTION_KEY_PASSWORD: " >&2
-      read -r -s encryption_key_password || true
-      printf "\n" >&2
-      if [[ -z "$encryption_key_password" ]]; then
-        echo "[$(ts)] WARN: hasło nie może być puste." >&2
-        continue
-      fi
-
-      if [[ "$encryption_key_password" == *$'\n'* || "$encryption_key_password" == *"'"* || "$encryption_key_password" == *\\* ]]; then
-        echo "[$(ts)] WARN: hasło nie może zawierać nowej linii, apostrofu ani backslasha." >&2
-        encryption_key_password=""
-        continue
-      fi
-
-      break
-    done
+    encryption_key_password="$(generate_aism_secret)" || exit 1
 
     cat > "$env_file" <<EOF_AISM_MASTER_ENV
 SERVER_PORT='8089'
@@ -2698,7 +2700,23 @@ SSO_JWT_SECRET=''
 EOF_AISM_MASTER_ENV
     add_summary "AISM master config created: ~/UTILITY/AISM/master/.env"
   else
-    add_summary "AISM master config preserved: ~/UTILITY/AISM/master/.env"
+    env_tmp="$(mktemp)"
+    awk -v override_password="$override_password" '
+      $0 ~ /^APPLICATION_INSTALLER_OVERRIDE_PASSWORD=/ {
+        print "APPLICATION_INSTALLER_OVERRIDE_PASSWORD='\''" override_password "'\''"
+        updated=1
+        next
+      }
+      { print }
+      END {
+        if (!updated) {
+          print "APPLICATION_INSTALLER_OVERRIDE_PASSWORD='\''" override_password "'\''"
+        }
+      }
+    ' "$env_file" > "$env_tmp"
+    cat "$env_tmp" > "$env_file"
+    rm -f "$env_tmp"
+    add_summary "AISM master config preserved; override password updated: ~/UTILITY/AISM/master/.env"
   fi
 
   chown "$TARGET_USER:$TARGET_USER" "$env_file" 2>/dev/null || true
@@ -2948,8 +2966,10 @@ EOF_AISM_SLAVE_UNIT
 
 configure_aism_master_firewall() {
   local firewall_cmd=""
-  local port="5701/tcp"
+  local port changed=0 port_error=0
+  local ports=("8089/tcp" "5701/tcp")
   local query_rc=0
+  local add_rc=0
 
   if ! command -v firewall-cmd >/dev/null 2>&1; then
     echo "[$(ts)] SKIP: firewall-cmd not found."
@@ -2965,39 +2985,52 @@ configure_aism_master_firewall() {
 
   firewall_cmd="$(command -v firewall-cmd)"
 
-  if "$firewall_cmd" --permanent --zone=public --query-port="$port" >/dev/null 2>&1; then
-    query_rc=0
+  for port in "${ports[@]}"; do
+    if "$firewall_cmd" --permanent --zone=public --query-port="$port" >/dev/null 2>&1; then
+      query_rc=0
+    else
+      query_rc=$?
+    fi
+
+    if [[ "$query_rc" -eq 0 ]]; then
+      echo "[$(ts)] OK: firewalld public already allows $port"
+    elif [[ "$query_rc" -eq 1 ]]; then
+      echo "[$(ts)] ACTION: firewall-cmd --permanent --zone=public --add-port=$port"
+      if "$firewall_cmd" --permanent --zone=public --add-port="$port" >/dev/null 2>&1; then
+        add_rc=0
+      else
+        add_rc=$?
+      fi
+      if [[ "$add_rc" -ne 0 ]]; then
+        echo "[$(ts)] SKIP: firewalld add-port failed for $port."
+        add_summary "AISM firewall: SKIP (add-port failed; 8089/tcp + 5701/tcp)"
+        port_error=1
+        break
+      fi
+      changed=1
+    else
+      echo "[$(ts)] SKIP: firewalld query failed for $port."
+      add_summary "AISM firewall: SKIP (query failed; 8089/tcp + 5701/tcp)"
+      port_error=1
+      break
+    fi
+  done
+
+  if [[ "$changed" == "1" ]]; then
+    echo "[$(ts)] ACTION: firewall-cmd --reload"
+    if ! "$firewall_cmd" --reload >/dev/null 2>&1; then
+      echo "[$(ts)] SKIP: firewalld reload failed."
+      add_summary "AISM firewall: SKIP (reload failed; 8089/tcp + 5701/tcp)"
+      return 0
+    fi
+    if [[ "$port_error" == "0" ]]; then
+      add_summary "AISM firewall public: ports added successfully (8089/tcp + 5701/tcp)"
+    fi
+  elif [[ "$port_error" == "1" ]]; then
+    return 0
   else
-    query_rc=$?
+    add_summary "AISM firewall public: ports already set (8089/tcp + 5701/tcp)"
   fi
-
-  if [[ "$query_rc" -eq 0 ]]; then
-    echo "[$(ts)] OK: firewalld public already allows $port"
-    add_summary "AISM firewall public: port already set (5701/tcp)"
-    return 0
-  fi
-
-  if [[ "$query_rc" -ne 1 ]]; then
-    echo "[$(ts)] SKIP: firewalld query failed for $port."
-    add_summary "AISM firewall: SKIP (query failed)"
-    return 0
-  fi
-
-  echo "[$(ts)] ACTION: firewall-cmd --permanent --zone=public --add-port=$port"
-  if ! "$firewall_cmd" --permanent --zone=public --add-port="$port" >/dev/null 2>&1; then
-    echo "[$(ts)] SKIP: firewalld add-port failed for $port."
-    add_summary "AISM firewall: SKIP (add-port failed)"
-    return 0
-  fi
-
-  echo "[$(ts)] ACTION: firewall-cmd --reload"
-  if ! "$firewall_cmd" --reload >/dev/null 2>&1; then
-    echo "[$(ts)] SKIP: firewalld reload failed."
-    add_summary "AISM firewall: SKIP (reload failed)"
-    return 0
-  fi
-
-  add_summary "AISM firewall public: port added successfully (5701/tcp)"
 }
 
 install_aism_runtime_dirs() {
