@@ -37,13 +37,13 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.100"
+MASTER_VERSION="1.2.101"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.23"
 CLEANUP_VERSION="1.0.3"
 TSEQ_VERSION="3.12.9"
-DOWNLOADER_APP_VERSION="1.0.6"
+DOWNLOADER_APP_VERSION="1.0.7"
 UPGBUILDER_VERSION="0.1.14"
 SERVICEGUARD_VERSION="0.1.6"
 INVENTORY_VERSION="0.1.14"
@@ -2655,6 +2655,7 @@ install_aism_master_config() {
   local env_file="$master_dir/.env"
   local override_password=""
   local keystore_password=""
+  local encryption_key_password=""
 
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
     "$master_dir" \
@@ -2664,12 +2665,29 @@ install_aism_master_config() {
   if [[ ! -f "$env_file" ]]; then
     override_password="$(generate_aism_secret)" || exit 1
     keystore_password="$(generate_aism_secret)" || exit 1
+    while true; do
+      printf "AISM master: podaj INSTALLER_ENCRYPTION_KEY_PASSWORD: " >&2
+      read -r -s encryption_key_password || true
+      printf "\n" >&2
+      if [[ -z "$encryption_key_password" ]]; then
+        echo "[$(ts)] WARN: hasło nie może być puste." >&2
+        continue
+      fi
+
+      if [[ "$encryption_key_password" == *$'\n'* || "$encryption_key_password" == *"'"* || "$encryption_key_password" == *\\* ]]; then
+        echo "[$(ts)] WARN: hasło nie może zawierać nowej linii, apostrofu ani backslasha." >&2
+        encryption_key_password=""
+        continue
+      fi
+
+      break
+    done
 
     cat > "$env_file" <<EOF_AISM_MASTER_ENV
 SERVER_PORT='8089'
 APPLICATION_INSTALLER_OVERRIDE_PASSWORD='$override_password'
 INSTALLER_KEYSTORE_PASSWORD='$keystore_password'
-INSTALLER_ENCRYPTION_KEY_PASSWORD='Proste123!'
+INSTALLER_ENCRYPTION_KEY_PASSWORD='$encryption_key_password'
 APPLICATION_INSTALLER_MASTER_CLUSTER_PORT='5701'
 APPLICATION_INSTALLER_RESOURCES_DIR='$resources_dir'
 SECURITY_AUTO_GENERATE_KEYSTORE='true'
@@ -2982,6 +3000,18 @@ configure_aism_master_firewall() {
   add_summary "AISM firewall public: port added successfully (5701/tcp)"
 }
 
+install_aism_runtime_dirs() {
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
+    /srv/si-installer \
+    /srv/keystores \
+    /srv/si-serwer \
+    /srv/si-komponenty \
+    /var/log/asseco \
+    /var/lib/si
+
+  add_summary "AISM runtime directories prepared: /srv/si-installer, /srv/keystores, /srv/si-serwer, /srv/si-komponenty, /var/log/asseco, /var/lib/si"
+}
+
 install_aism_step() {
   local master_enabled=0
   local slave_enabled=0
@@ -3008,6 +3038,7 @@ install_aism_step() {
     return 0
   fi
 
+  install_aism_runtime_dirs
   ensure_amcs_java_runtime
   install_aism_launcher
 
