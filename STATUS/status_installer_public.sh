@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.22"
+VERSION="3.12.23"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -1337,8 +1337,6 @@ firewall_body="${firewall_body%$'\n'}"
 echo
 render_two_boxes "SERVER ${collected:-UNKNOWN}" "$server_body" "FIREWALL" "$firewall_body" "$cols"
 
-modules_w="$dashboard_w"
-((modules_w > 76)) && modules_w=76
 modules_body=""
 modules_body+="$(printf "%-11s %-4s %-8s %-8s %s" "MODULE" "INST" "LOCAL" "GITHUB" "STATE")"$'\n'
 modules_body+="$(printf "%-11s %-4s %-8s %-8s %s" "-----------" "----" "--------" "--------" "----------------")"$'\n'
@@ -1352,9 +1350,6 @@ modules_body+="$(module_row "Inventory" "${inventory_installed:-NO}" "${inventor
 modules_body+="$(module_row "LogGuard" "${logguard_installed:-NO}" "${logguard_ver:-UNKNOWN}" "${logguard_github_ver:-UNKNOWN}" "$logguard_mod_state")"$'\n'
 modules_body+="$(module_row "P1CERT" "${p1cert_installed:-NO}" "${p1cert_ver:-UNKNOWN}" "${p1cert_github_ver:-UNKNOWN}" "$p1cert_mod_state")"$'\n'
 modules_body+="${DIM}UPGclean hook: bashrc:${upg_cleanup_hook}${RESET}"
-
-echo
-render_box "MODULES" "$modules_w" "$modules_body"
 
 amcs_component="NO"
 amcs_details="-"
@@ -1397,8 +1392,6 @@ if [[ -x "$aism_launcher" ]]; then
   fi
 fi
 
-tools_w="$dashboard_w"
-((tools_w > 58)) && tools_w=58
 tools_body=""
 tools_body+="$(printf "%-12s %-6s %s" "COMPONENT" "INST" "DETAILS")"$'\n'
 tools_body+="$(printf "%-12s %-6s %s" "------------" "------" "----------------")"$'\n'
@@ -1407,7 +1400,7 @@ tools_body+="$(component_row "AISM" "$aism_component" "$aism_details")"$'\n'
 tools_body+="$(component_row "cp-upg" "$cp_upg_component" "$cp_upg_details")"
 
 echo
-render_box "TOOLS / COMPONENTS" "$tools_w" "$tools_body"
+render_two_boxes "MODULES" "$modules_body" "TOOLS / COMPONENTS" "$tools_body" "$cols"
 
 echo
 apps_w="$dashboard_w"
