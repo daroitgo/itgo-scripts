@@ -37,10 +37,10 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.97"
+MASTER_VERSION="1.2.98"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
-STATUS_VERSION="3.12.21"
+STATUS_VERSION="3.12.22"
 CLEANUP_VERSION="1.0.3"
 TSEQ_VERSION="3.12.9"
 DOWNLOADER_APP_VERSION="1.0.6"
@@ -825,7 +825,7 @@ EOF_MASTER_UPDATE_LAUNCHER
   safe_backup "$bp"
   remove_block_from_file "$bp" "$legacy_path_start" "$legacy_path_end"
   remove_block_from_file "$bp" "$path_start" "$path_end"
-  printf "\n%s\nexport PATH=\"\$HOME/UTILITY/MASTER:\$HOME/UTILITY/STATUS/bin:\$HOME/UTILITY/TSEQ/bin:\$HOME/UTILITY/DOWNLOADER_APP/bin:\$HOME/UTILITY/UPGbuilder/bin:\$HOME/UTILITY/INVENTORY/bin:\$HOME/UTILITY/LOGGUARD/bin:\$HOME/UTILITY/AMCS:\$HOME/UTILITY/TOOLS:\$PATH\"\n%s\n" "$path_start" "$path_end" >> "$bp"
+  printf "\n%s\nexport PATH=\"\$HOME/UTILITY/MASTER:\$HOME/UTILITY/STATUS/bin:\$HOME/UTILITY/TSEQ/bin:\$HOME/UTILITY/DOWNLOADER_APP/bin:\$HOME/UTILITY/UPGbuilder/bin:\$HOME/UTILITY/INVENTORY/bin:\$HOME/UTILITY/LOGGUARD/bin:\$HOME/UTILITY/AMCS:\$HOME/UTILITY/AISM/bin:\$HOME/UTILITY/TOOLS:\$PATH\"\n%s\n" "$path_start" "$path_end" >> "$bp"
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
   chmod 0644 "$bp" 2>/dev/null || true
 
@@ -2502,6 +2502,426 @@ install_amcs_step() {
   fi
 }
 
+prompt_aism_slave_master_host() {
+  local ans=""
+
+  while true; do
+    printf "AISM slave: podaj IPv4 serwera MASTER: " >&2
+    read -r ans || true
+    ans="${ans//$'\r'/}"
+    ans="${ans#"${ans%%[![:space:]]*}"}"
+    ans="${ans%"${ans##*[![:space:]]}"}"
+
+    if is_valid_amcs_ipv4 "$ans"; then
+      printf "%s\n" "$ans"
+      return 0
+    fi
+
+    echo "[$(ts)] WARN: podaj poprawny adres IPv4, np. 10.10.10.150." >&2
+  done
+}
+
+generate_aism_secret() {
+  local secret=""
+
+  if [[ -r /dev/urandom ]] && command -v od >/dev/null 2>&1 && command -v tr >/dev/null 2>&1; then
+    secret="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]')"
+  fi
+
+  if [[ ${#secret} -ne 32 ]]; then
+    echo "[$(ts)] ERROR: nie udało się wygenerować bezpiecznego sekretu AISM." >&2
+    return 1
+  fi
+
+  printf "%s\n" "$secret"
+}
+
+install_aism_master_config() {
+  local app_dir="$UTILITY_DIR/AISM"
+  local master_dir="$app_dir/master"
+  local resources_dir="$master_dir/installer-resources"
+  local env_file="$master_dir/.env"
+  local override_password=""
+  local keystore_password=""
+
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
+    "$master_dir" \
+    "$resources_dir" \
+    "$resources_dir/resources"
+
+  if [[ ! -f "$env_file" ]]; then
+    override_password="$(generate_aism_secret)" || exit 1
+    keystore_password="$(generate_aism_secret)" || exit 1
+
+    cat > "$env_file" <<EOF_AISM_MASTER_ENV
+SERVER_PORT='8089'
+APPLICATION_INSTALLER_OVERRIDE_PASSWORD='$override_password'
+INSTALLER_KEYSTORE_PASSWORD='$keystore_password'
+INSTALLER_ENCRYPTION_KEY_PASSWORD='Proste123!'
+APPLICATION_INSTALLER_MASTER_CLUSTER_PORT='5701'
+APPLICATION_INSTALLER_RESOURCES_DIR='$resources_dir'
+SECURITY_AUTO_GENERATE_KEYSTORE='true'
+INSTALLER_KEYSTORE_PATH='configs/installerkeystore.jceks'
+INSTALLER_ENCRYPTION_KEY_ALIAS='encryption-key-v1'
+SSO_JWT_SECRET=''
+# APP_CONTEXT_PATH='/amcs_installer'
+EOF_AISM_MASTER_ENV
+    add_summary "AISM master config created: ~/UTILITY/AISM/master/.env"
+  else
+    add_summary "AISM master config preserved: ~/UTILITY/AISM/master/.env"
+  fi
+
+  chown "$TARGET_USER:$TARGET_USER" "$env_file" 2>/dev/null || true
+  chmod 0600 "$env_file" 2>/dev/null || true
+}
+
+install_aism_slave_config() {
+  local master_host="${1:?}"
+  local app_dir="$UTILITY_DIR/AISM"
+  local slave_dir="$app_dir/slave"
+  local resources_dir="$slave_dir/installer-resources"
+  local env_file="$slave_dir/.env"
+
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
+    "$slave_dir" \
+    "$resources_dir" \
+    "$resources_dir/resources"
+
+  if [[ ! -f "$env_file" ]]; then
+    cat > "$env_file" <<EOF_AISM_SLAVE_ENV
+APPLICATION_INSTALLER_MASTER_HOST='$master_host'
+APPLICATION_INSTALLER_MASTER_CLUSTER_PORT='5701'
+APPLICATION_INSTALLER_MASTER_RESOURCES_PORT='8089'
+APPLICATION_INSTALLER_RESOURCES_DIR='$resources_dir'
+EOF_AISM_SLAVE_ENV
+    add_summary "AISM slave config created: ~/UTILITY/AISM/slave/.env"
+  else
+    if grep -q '^APPLICATION_INSTALLER_MASTER_HOST=' "$env_file"; then
+      sed -i "s/^APPLICATION_INSTALLER_MASTER_HOST=.*/APPLICATION_INSTALLER_MASTER_HOST='$master_host'/" "$env_file"
+    else
+      printf "APPLICATION_INSTALLER_MASTER_HOST='%s'\n" "$master_host" >> "$env_file"
+    fi
+
+    echo "[$(ts)] INFO: existing AISM slave .env preserved; MASTER host updated to $master_host."
+    add_summary "AISM slave config preserved; MASTER host updated: $master_host"
+  fi
+
+  chown "$TARGET_USER:$TARGET_USER" "$env_file" 2>/dev/null || true
+  chmod 0600 "$env_file" 2>/dev/null || true
+}
+
+install_aism_launcher() {
+  local app_dir="$UTILITY_DIR/AISM"
+  local bin_dir="$app_dir/bin"
+  local launcher="$bin_dir/aism"
+
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$app_dir" "$bin_dir"
+
+  cat > "$launcher" <<'EOF_AISM_LAUNCHER'
+#!/usr/bin/env bash
+set -euo pipefail 2>/dev/null || set -eu
+
+USER_HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
+USER_HOME="${USER_HOME:-${HOME:-/home/itgo}}"
+
+APP_DIR="${USER_HOME}/UTILITY/AISM"
+JAR="${APP_DIR}/amcs-installer.jar"
+MASTER_ENV="${APP_DIR}/master/.env"
+SLAVE_ENV="${APP_DIR}/slave/.env"
+
+usage() {
+  cat <<'EOF_USAGE'
+Usage:
+  aism status
+  aism master start|stop|restart|status|logs
+  aism slave  start|stop|restart|status|logs
+
+Internal service commands:
+  aism run-master
+  aism run-slave
+EOF_USAGE
+}
+
+require_jar() {
+  if [[ ! -f "$JAR" ]]; then
+    echo "[ERROR] Brak pliku: $JAR" >&2
+    echo "[INFO] Pobierz instalator AISM przez: dwupg" >&2
+    exit 1
+  fi
+}
+
+load_env() {
+  local env_file="${1:?}"
+
+  if [[ ! -f "$env_file" ]]; then
+    echo "[ERROR] Brak konfiguracji: $env_file" >&2
+    exit 1
+  fi
+
+  set -a
+  # shellcheck disable=SC1090
+  . "$env_file"
+  set +a
+}
+
+service_action() {
+  local role="${1:?}"
+  local action="${2:?}"
+  local service="aism-${role}.service"
+
+  case "$action" in
+    start|stop|restart)
+      if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        systemctl "$action" "$service"
+      else
+        sudo systemctl "$action" "$service"
+      fi
+      ;;
+    status)
+      systemctl status "$service" --no-pager
+      ;;
+    logs)
+      journalctl -u "$service" -n 100 --no-pager
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+case "${1:-}" in
+  run-master)
+    require_jar
+    load_env "$MASTER_ENV"
+    cd "$APP_DIR"
+
+    exec java \
+      -Dspring.profiles.active=master,is \
+      -Dapplication.installer.resources.dir="${APPLICATION_INSTALLER_RESOURCES_DIR:-$APP_DIR/master/installer-resources}" \
+      -Dapplication.installer.master.cluster-port="${APPLICATION_INSTALLER_MASTER_CLUSTER_PORT:-5701}" \
+      -Dserver.port="${SERVER_PORT:-8089}" \
+      -jar "$JAR"
+    ;;
+
+  run-slave)
+    require_jar
+    load_env "$SLAVE_ENV"
+
+    if [[ -z "${APPLICATION_INSTALLER_MASTER_HOST:-}" ]]; then
+      echo "[ERROR] APPLICATION_INSTALLER_MASTER_HOST nie jest ustawiony w $SLAVE_ENV" >&2
+      exit 1
+    fi
+
+    cd "$APP_DIR"
+
+    exec java \
+      -Dspring.profiles.active=slave,is \
+      -Dapplication.installer.resources.dir="${APPLICATION_INSTALLER_RESOURCES_DIR:-$APP_DIR/slave/installer-resources}" \
+      -Dapplication.installer.master.host="$APPLICATION_INSTALLER_MASTER_HOST" \
+      -Dapplication.installer.master.cluster-port="${APPLICATION_INSTALLER_MASTER_CLUSTER_PORT:-5701}" \
+      -Dapplication.installer.master.resources-port="${APPLICATION_INSTALLER_MASTER_RESOURCES_PORT:-8089}" \
+      -jar "$JAR"
+    ;;
+
+  master|slave)
+    role="$1"
+    action="${2:-status}"
+    service_action "$role" "$action"
+    ;;
+
+  status)
+    echo "===== AISM MASTER ====="
+    systemctl status aism-master.service --no-pager 2>/dev/null || true
+    echo
+    echo "===== AISM SLAVE ====="
+    systemctl status aism-slave.service --no-pager 2>/dev/null || true
+    ;;
+
+  -h|--help|help|"")
+    usage
+    ;;
+
+  *)
+    usage
+    exit 1
+    ;;
+esac
+EOF_AISM_LAUNCHER
+
+  chown "$TARGET_USER:$TARGET_USER" "$launcher" 2>/dev/null || true
+  chmod 0700 "$launcher" 2>/dev/null || true
+
+  add_summary "AISM launcher installed: ~/UTILITY/AISM/bin/aism"
+}
+
+install_aism_systemd_units() {
+  local master_enabled="${1:-0}"
+  local slave_enabled="${2:-0}"
+  local app_dir="$UTILITY_DIR/AISM"
+  local launcher="$app_dir/bin/aism"
+  local master_unit="/etc/systemd/system/aism-master.service"
+  local slave_unit="/etc/systemd/system/aism-slave.service"
+
+  if [[ "$master_enabled" == "1" ]]; then
+    cat > "$master_unit" <<EOF_AISM_MASTER_UNIT
+[Unit]
+Description=AISM Installer Master
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$TARGET_USER
+Group=$TARGET_USER
+WorkingDirectory=$app_dir
+EnvironmentFile=$app_dir/master/.env
+ExecStart=$launcher run-master
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF_AISM_MASTER_UNIT
+
+    chmod 0644 "$master_unit"
+    add_summary "AISM systemd unit installed: aism-master.service"
+  fi
+
+  if [[ "$slave_enabled" == "1" ]]; then
+    cat > "$slave_unit" <<EOF_AISM_SLAVE_UNIT
+[Unit]
+Description=AISM Installer Slave
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$TARGET_USER
+Group=$TARGET_USER
+WorkingDirectory=$app_dir
+EnvironmentFile=$app_dir/slave/.env
+ExecStart=$launcher run-slave
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF_AISM_SLAVE_UNIT
+
+    chmod 0644 "$slave_unit"
+    add_summary "AISM systemd unit installed: aism-slave.service"
+  fi
+
+  systemctl daemon-reload
+}
+
+configure_aism_master_firewall() {
+  local firewall_cmd=""
+  local port="5701/tcp"
+  local query_rc=0
+
+  if ! command -v firewall-cmd >/dev/null 2>&1; then
+    echo "[$(ts)] SKIP: firewall-cmd not found."
+    add_summary "AISM firewall: SKIP (firewall-cmd missing)"
+    return 0
+  fi
+
+  if ! systemctl is-active --quiet firewalld 2>/dev/null; then
+    echo "[$(ts)] SKIP: firewalld inactive or unavailable."
+    add_summary "AISM firewall: SKIP (firewalld inactive/unavailable)"
+    return 0
+  fi
+
+  firewall_cmd="$(command -v firewall-cmd)"
+
+  if "$firewall_cmd" --permanent --zone=public --query-port="$port" >/dev/null 2>&1; then
+    query_rc=0
+  else
+    query_rc=$?
+  fi
+
+  if [[ "$query_rc" -eq 0 ]]; then
+    echo "[$(ts)] OK: firewalld public already allows $port"
+    add_summary "AISM firewall public: port already set (5701/tcp)"
+    return 0
+  fi
+
+  if [[ "$query_rc" -ne 1 ]]; then
+    echo "[$(ts)] SKIP: firewalld query failed for $port."
+    add_summary "AISM firewall: SKIP (query failed)"
+    return 0
+  fi
+
+  echo "[$(ts)] ACTION: firewall-cmd --permanent --zone=public --add-port=$port"
+  if ! "$firewall_cmd" --permanent --zone=public --add-port="$port" >/dev/null 2>&1; then
+    echo "[$(ts)] SKIP: firewalld add-port failed for $port."
+    add_summary "AISM firewall: SKIP (add-port failed)"
+    return 0
+  fi
+
+  echo "[$(ts)] ACTION: firewall-cmd --reload"
+  if ! "$firewall_cmd" --reload >/dev/null 2>&1; then
+    echo "[$(ts)] SKIP: firewalld reload failed."
+    add_summary "AISM firewall: SKIP (reload failed)"
+    return 0
+  fi
+
+  add_summary "AISM firewall public: port added successfully (5701/tcp)"
+}
+
+install_aism_step() {
+  local master_enabled=0
+  local slave_enabled=0
+  local slave_master_host=""
+
+  if [[ "$UPDATE_ONLY_MODE" == "1" ]]; then
+    add_summary "AISM: skip (update-only mode)"
+    return 0
+  fi
+
+  if ! have_user; then
+    echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+    exit 1
+  fi
+
+  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+  [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+  UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+
+  if ! prompt_yn "MODUŁ: AISM (~/UTILITY/AISM + master/slave + systemd)?" "Y"; then
+    echo "[$(ts)] SKIP: AISM."
+    add_summary "AISM: skipped by user"
+    return 0
+  fi
+
+  ensure_amcs_java_runtime
+  install_aism_launcher
+
+  if prompt_yn "AISM: skonfigurować rolę MASTER?" "Y"; then
+    master_enabled=1
+    install_aism_master_config
+    configure_aism_master_firewall
+  fi
+
+  if prompt_yn "AISM: skonfigurować rolę SLAVE?" "N"; then
+    slave_enabled=1
+    slave_master_host="$(prompt_aism_slave_master_host)"
+    install_aism_slave_config "$slave_master_host"
+  fi
+
+  if [[ "$master_enabled" == "0" && "$slave_enabled" == "0" ]]; then
+    echo "[$(ts)] WARN: AISM wybrany, ale nie skonfigurowano żadnej roli."
+    add_summary "AISM: no role configured"
+    return 0
+  fi
+
+  install_aism_systemd_units "$master_enabled" "$slave_enabled"
+
+  echo "[$(ts)] OK: AISM done."
+  add_summary "AISM roles: master=$master_enabled slave=$slave_enabled"
+}
 install_downloader_app_script() {
   local src="${1:?}"
   local app_dir="$UTILITY_DIR/DOWNLOADER_APP"
@@ -3664,6 +4084,7 @@ main() {
     install_p1cert_step "$p1cert_dir"
     install_logguard_step "$logguard_dir"
     install_amcs_step
+    install_aism_step
 
     cleanup_tmp_installers_no_prompt
     echo "[$(ts)] DONE."
@@ -3778,7 +4199,7 @@ main() {
     fi
   fi
 
-  section "SEKCJA 1/8 - BOOTSTRAP"
+  section "SEKCJA 1/9 - BOOTSTRAP"
   if prompt_yn "BOOTSTRAP: user '$TARGET_USER' + katalogi HOME + (opcjonalnie) sudoers + ACL + docker group?" "Y"; then
     bootstrap_block
   else
@@ -3788,7 +4209,7 @@ main() {
 
   install_master_launcher
 
-  section "SEKCJA 2/8 - NARZĘDZIA SYSTEMOWE"
+  section "SEKCJA 2/9 - NARZĘDZIA SYSTEMOWE"
   if prompt_yn "KROK: sprawdzić nano, mc, rsync, dos2unix, jq, wget, curl, unzip, openssl, python3 i doinstalować brakujące?" "Y"; then
     ensure_basic_tools_step
   else
@@ -3797,7 +4218,7 @@ main() {
 
   ensure_client_identity_file
 
-  section "SEKCJA 3/8 - ZACHOWANIE SHELLA"
+  section "SEKCJA 3/9 - ZACHOWANIE SHELLA"
   if prompt_yn "KROK: ustawić w ~/.bash_logout: history -c && history -w ?" "Y"; then
     if ! have_user; then
       echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
@@ -3835,11 +4256,11 @@ main() {
   p1cert_dir="$TMP_DIR/P1CERT"
   logguard_dir="$TMP_DIR/LOGGUARD"
 
-  section "SEKCJA 4/8 - MODUŁY CORE"
+  section "SEKCJA 4/9 - MODUŁY CORE"
   install_status_step "$status_sh"
   install_tseq_step "$tseq_sh"
 
-  section "SEKCJA 5/8 - HOOKI I NARZĘDZIA UŻYTKOWE"
+  section "SEKCJA 5/9 - HOOKI I NARZĘDZIA UŻYTKOWE"
   if [[ "$HISTORY_CLEAR_ON_LOGOUT_ENABLED" == "1" ]]; then
     echo "[$(ts)] SKIP: SSH history prompt pominięty, bo włączono czyszczenie historii przy wylogowaniu."
     add_summary "Shell: SSH history prompt skipped because history clear on logout is enabled"
@@ -3867,7 +4288,7 @@ main() {
   install_p1cert_step "$p1cert_dir"
   install_logguard_step "$logguard_dir"
 
-  section "SEKCJA 6/8 - TOOLS"
+  section "SEKCJA 6/9 - TOOLS"
   if prompt_yn "MODUŁ: TOOLS/cp-upg (lokalny helper kopiowania produkcji do ~/UPG/EDM, ZM, MPI, P1ADAPTER)?" "Y"; then
     install_cp_upg_step
   else
@@ -3875,10 +4296,13 @@ main() {
     add_summary "TOOLS/cp-upg: skipped by user"
   fi
 
-  section "SEKCJA 7/8 - AMCS"
+  section "SEKCJA 7/9 - AMCS"
   install_amcs_step
 
-  section "SEKCJA 8/8 - PORZĄDKI KOŃCOWE"
+  section "SEKCJA 8/9 - AISM"
+  install_aism_step
+
+  section "SEKCJA 9/9 - PORZĄDKI KOŃCOWE"
   cleanup_downloaded_installers
 
   echo "[$(ts)] DONE."
