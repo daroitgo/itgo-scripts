@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - wget
 # ==========================================================
 
-VERSION="1.0.6"
+VERSION="1.0.7"
 MANIFEST_URL="https://helpdesk.itgo.com.pl/nextcloud/index.php/s/s2778Z6z4rEibLp/download"
 
 TARGET_DIR="${HOME}/UPG"
@@ -135,8 +135,16 @@ cleanup_old_artifacts() {
     bk)
       find "$TARGET_DIR" -maxdepth 1 -type f -name "*.war" -print -delete 2>/dev/null || true
       ;;
-    amcs|aism|wildfly)
+    amcs|wildfly)
       for target_file in "$@"; do
+        if [ -f "$target_file" ]; then
+          printf '%s\n' "$target_file"
+          rm -f "$target_file"
+        fi
+      done
+      ;;
+    aism)
+      for target_file in "$AISM_TARGET_DIR/amcs-installer.jar" "$AISM_TARGET_DIR"/amcs-installer-*.jar; do
         if [ -f "$target_file" ]; then
           printf '%s\n' "$target_file"
           rm -f "$target_file"
@@ -355,7 +363,11 @@ main() {
   fi
 
   for url in "${urls[@]}"; do
-    filename="$(resolve_filename_from_header "$url")"
+    if [ "$app_type" = "aism" ]; then
+      filename="amcs-installer.jar"
+    else
+      filename="$(resolve_filename_from_header "$url")"
+    fi
     target_file="${download_dir}/${filename}"
     filenames+=("$filename")
     target_files+=("$target_file")
