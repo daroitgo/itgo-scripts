@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.102"
+MASTER_VERSION="1.2.103"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.23"
@@ -2614,22 +2614,45 @@ install_amcs_step() {
   fi
 }
 
+is_valid_aism_master_host() {
+  local host="${1:-}"
+  local label
+  local labels=()
+
+  [[ -n "$host" && ${#host} -le 253 ]] || return 1
+
+  if is_valid_amcs_ipv4 "$host"; then
+    return 0
+  fi
+
+  [[ ! "$host" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
+  [[ "$host" != .* && "$host" != *. && "$host" != *..* ]] || return 1
+
+  IFS='.' read -r -a labels <<< "$host"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+  done
+
+  return 0
+}
+
 prompt_aism_slave_master_host() {
   local ans=""
 
   while true; do
-    printf "AISM slave: podaj IPv4 serwera MASTER: " >&2
+    printf "AISM slave: podaj IPv4 lub nazwę DNS/FQDN serwera MASTER: " >&2
     read -r ans || true
     ans="${ans//$'\r'/}"
     ans="${ans#"${ans%%[![:space:]]*}"}"
     ans="${ans%"${ans##*[![:space:]]}"}"
 
-    if is_valid_amcs_ipv4 "$ans"; then
+    if is_valid_aism_master_host "$ans"; then
       printf "%s\n" "$ans"
       return 0
     fi
 
-    echo "[$(ts)] WARN: podaj poprawny adres IPv4, np. 10.10.10.150." >&2
+    echo "[$(ts)] WARN: podaj poprawny IPv4 lub nazwę DNS/FQDN, np. 10.10.10.150 albo si-master.example.local." >&2
   done
 }
 
