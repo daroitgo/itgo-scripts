@@ -37,11 +37,12 @@ set -euo pipefail 2>/dev/null || set -eu
 # - wget
 # ==========================================================
 
-VERSION="1.0.5"
+VERSION="1.0.6"
 MANIFEST_URL="https://helpdesk.itgo.com.pl/nextcloud/index.php/s/s2778Z6z4rEibLp/download"
 
 TARGET_DIR="${HOME}/UPG"
 AMCS_TARGET_DIR="${HOME}/UTILITY/AMCS"
+AISM_TARGET_DIR="${HOME}/UTILITY/AISM"
 
 UTILITY_DIR="${HOME}/UTILITY"
 DOWNLOADER_DIR="${UTILITY_DIR}/DOWNLOADER_APP"
@@ -134,7 +135,7 @@ cleanup_old_artifacts() {
     bk)
       find "$TARGET_DIR" -maxdepth 1 -type f -name "*.war" -print -delete 2>/dev/null || true
       ;;
-    amcs|wildfly)
+    amcs|aism|wildfly)
       for target_file in "$@"; do
         if [ -f "$target_file" ]; then
           printf '%s\n' "$target_file"
@@ -171,6 +172,7 @@ resolve_download_urls() {
     amms) channel="core"; key="amms" ;;
     pi) channel="core"; key="pi" ;;
     amcs) channel="amcs"; key="amcs_updater" ;;
+    aism) channel="aism"; key="aism_installer" ;;
     wildfly) channel="wildfly"; key="wildfly_installer" ;;
     bk)
       printf '%s\n' "$manifest" | jq -r --argjson n "$choice" '
@@ -198,6 +200,7 @@ resolve_channel() {
     amms|pi) printf '%s\n' "core" ;;
     bk) printf '%s\n' "bk" ;;
     amcs) printf '%s\n' "amcs" ;;
+    aism) printf '%s\n' "aism" ;;
     wildfly) printf '%s\n' "wildfly" ;;
     *)
       echo "ERROR: Nieznany typ aplikacji: ${app_type}" >&2
@@ -210,6 +213,7 @@ resolve_target_dir() {
   local app_type="$1"
   case "$app_type" in
     amcs) printf '%s\n' "$AMCS_TARGET_DIR" ;;
+    aism) printf '%s\n' "$AISM_TARGET_DIR" ;;
     *) printf '%s\n' "$TARGET_DIR" ;;
   esac
 }
@@ -290,15 +294,17 @@ main() {
   echo "2) PI"
   echo "3) BK"
   echo "4) AMCS"
-  echo "5) WILDFLY"
-  read -r -p "Wybierz [1-5]: " app_choice
+  echo "5) AISM"
+  echo "6) WILDFLY"
+  read -r -p "Wybierz [1-6]: " app_choice
 
   case "$app_choice" in
     1) app_type="amms" ;;
     2) app_type="pi" ;;
     3) app_type="bk" ;;
     4) app_type="amcs" ;;
-    5) app_type="wildfly" ;;
+    5) app_type="aism" ;;
+    6) app_type="wildfly" ;;
     *)
       echo "ERROR: Błędny wybór."
       exit 1
