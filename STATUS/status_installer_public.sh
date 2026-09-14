@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.21"
+VERSION="3.12.22"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -937,6 +937,12 @@ logguard_vf="$logguard_dir/logguard.version"
 p1cert_vf="$HOME/UTILITY/P1CERT/p1cert.version"
 p1cert_state="$HOME/UTILITY/P1CERT/state/p1cert-state"
 
+amcs_launcher="$HOME/UTILITY/AMCS/AMCS"
+aism_launcher="$HOME/UTILITY/AISM/bin/aism"
+aism_master_env="$HOME/UTILITY/AISM/master/.env"
+aism_slave_env="$HOME/UTILITY/AISM/slave/.env"
+cp_upg_launcher="$HOME/UTILITY/TOOLS/cp-upg"
+
 status_installed="$(module_state "$status_vf")"
 tseq_installed="$(module_state "$tseq_vf")"
 downloader_installed="$(module_state "$downloader_vf")"
@@ -1248,6 +1254,21 @@ module_row() {
     "$name" "$inst" "$(module_local_display "$inst" "$local_ver")" "$github_ver" "$(module_state_color "$state")"
 }
 
+component_state_color() {
+  local state="$1"
+  case "$state" in
+    YES) printf "%s" "${GREEN}${state}${RESET}" ;;
+    NO) printf "%s" "${YELLOW}${state}${RESET}" ;;
+    *) printf "%s" "$state" ;;
+  esac
+}
+
+component_row() {
+  local name="$1" inst="$2" details="$3"
+  printf "%-12s %-6s %s" \
+    "$name" "$(component_state_color "$inst")" "$details"
+}
+
 runtime_state_color() {
   local state="$1"
   case "$state" in
@@ -1334,6 +1355,59 @@ modules_body+="${DIM}UPGclean hook: bashrc:${upg_cleanup_hook}${RESET}"
 
 echo
 render_box "MODULES" "$modules_w" "$modules_body"
+
+amcs_component="NO"
+amcs_details="-"
+if [[ -x "$amcs_launcher" ]]; then
+  amcs_component="YES"
+  amcs_details="launcher"
+fi
+
+cp_upg_component="NO"
+cp_upg_details="-"
+if [[ -x "$cp_upg_launcher" ]]; then
+  cp_upg_component="YES"
+  cp_upg_details="launcher"
+fi
+
+aism_component="NO"
+aism_details="-"
+aism_master_present=0
+aism_slave_present=0
+
+if [[ -x "$aism_launcher" ]]; then
+  aism_component="YES"
+
+  if [[ -f "$aism_master_env" || -f /etc/systemd/system/aism-master.service ]]; then
+    aism_master_present=1
+  fi
+
+  if [[ -f "$aism_slave_env" || -f /etc/systemd/system/aism-slave.service ]]; then
+    aism_slave_present=1
+  fi
+
+  if [[ "$aism_master_present" == "1" && "$aism_slave_present" == "1" ]]; then
+    aism_details="master+slave"
+  elif [[ "$aism_master_present" == "1" ]]; then
+    aism_details="master"
+  elif [[ "$aism_slave_present" == "1" ]]; then
+    aism_details="slave"
+  else
+    aism_details="launcher only"
+  fi
+fi
+
+tools_w="$dashboard_w"
+((tools_w > 58)) && tools_w=58
+tools_body=""
+tools_body+="$(printf "%-12s %-6s %s" "COMPONENT" "INST" "DETAILS")"$'\n'
+tools_body+="$(printf "%-12s %-6s %s" "------------" "------" "----------------")"$'\n'
+tools_body+="$(component_row "AMCS" "$amcs_component" "$amcs_details")"$'\n'
+tools_body+="$(component_row "AISM" "$aism_component" "$aism_details")"$'\n'
+tools_body+="$(component_row "cp-upg" "$cp_upg_component" "$cp_upg_details")"
+
+echo
+render_box "TOOLS / COMPONENTS" "$tools_w" "$tools_body"
 
 echo
 apps_w="$dashboard_w"
