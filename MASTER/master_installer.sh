@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.103"
+MASTER_VERSION="1.2.104"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.23"
@@ -48,7 +48,7 @@ UPGBUILDER_VERSION="0.1.14"
 SERVICEGUARD_VERSION="0.1.6"
 INVENTORY_VERSION="0.1.14"
 P1CERT_VERSION="0.1.4"
-LOGGUARD_VERSION="0.2.1"
+LOGGUARD_VERSION="0.2.2"
 
 MODE="install"
 UPDATE_ONLY_MODE="0"
@@ -152,6 +152,104 @@ need_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
     echo "ERROR: uruchom jako root: sudo bash $0 [user]"
     exit 1
+  fi
+}
+
+configure_selinux_permissive() {
+  local config=/etc/selinux/config tmp="" state=""
+
+  if [[ -e "$config" ]]; then
+    if [[ ! -f "$config" || -L "$config" || ! -r "$config" ]]; then
+      echo "[$(ts)] ERROR: cannot safely update SELinux configuration: $config"
+      add_summary "SELinux: ERROR (cannot safely update $config)"
+      return 1
+    fi
+
+    tmp="$(mktemp "${config}.master.XXXXXX")" || {
+      echo "[$(ts)] ERROR: cannot create temporary SELinux configuration."
+      add_summary "SELinux: ERROR (cannot create temporary configuration)"
+      return 1
+    }
+    if ! awk '
+      /^[[:space:]]*SELINUX[[:space:]]*=/ {
+        if (!written) {
+          print "SELINUX=permissive"
+          written=1
+        }
+        next
+      }
+      { print }
+      END { if (!written) print "SELINUX=permissive" }
+    ' "$config" > "$tmp"; then
+      rm -f -- "$tmp"
+      echo "[$(ts)] ERROR: cannot prepare SELinux configuration update."
+      add_summary "SELinux: ERROR (cannot prepare configuration update)"
+      return 1
+    fi
+
+    if ! cmp -s "$tmp" "$config"; then
+      if [[ ! -w "$config" ]]; then
+        rm -f -- "$tmp"
+        echo "[$(ts)] ERROR: cannot safely save SELinux configuration."
+        add_summary "SELinux: ERROR (cannot save $config)"
+        return 1
+      fi
+      if ! chmod --reference="$config" "$tmp" || ! chown --reference="$config" "$tmp"; then
+        rm -f -- "$tmp"
+        echo "[$(ts)] ERROR: cannot safely save SELinux configuration."
+        add_summary "SELinux: ERROR (cannot save $config)"
+        return 1
+      fi
+      if command -v getenforce >/dev/null 2>&1 && command -v chcon >/dev/null 2>&1 && ! chcon --reference="$config" "$tmp"; then
+        rm -f -- "$tmp"
+        echo "[$(ts)] ERROR: cannot safely preserve SELinux configuration context."
+        add_summary "SELinux: ERROR (cannot preserve $config context)"
+        return 1
+      fi
+      if ! mv -f -- "$tmp" "$config"; then
+        rm -f -- "$tmp"
+        echo "[$(ts)] ERROR: cannot safely save SELinux configuration."
+        add_summary "SELinux: ERROR (cannot save $config)"
+        return 1
+      fi
+      tmp=""
+      echo "[$(ts)] OK: persistent SELinux mode set to permissive."
+      add_summary "SELinux: persistent permissive configured"
+    else
+      rm -f -- "$tmp"
+      tmp=""
+      echo "[$(ts)] OK: persistent SELinux mode already permissive."
+      add_summary "SELinux: persistent permissive already configured"
+    fi
+  else
+    echo "[$(ts)] INFO: SELinux configuration is unavailable; persistent setting skipped."
+    add_summary "SELinux: persistent configuration unavailable"
+  fi
+
+  if command -v getenforce >/dev/null 2>&1; then
+    state="$(getenforce 2>/dev/null || true)"
+    case "$state" in
+      Enforcing)
+        if ! setenforce 0; then
+          echo "[$(ts)] ERROR: cannot set runtime SELinux mode to permissive."
+          add_summary "SELinux: ERROR (setenforce 0 failed)"
+          return 1
+        fi
+        echo "[$(ts)] OK: runtime SELinux mode set to permissive."
+        add_summary "SELinux: runtime permissive configured"
+        ;;
+      Permissive|Disabled)
+        echo "[$(ts)] OK: runtime SELinux mode is $state."
+        add_summary "SELinux: runtime mode=$state"
+        ;;
+      *)
+        echo "[$(ts)] INFO: SELinux runtime state is unavailable."
+        add_summary "SELinux: runtime state unavailable"
+        ;;
+    esac
+  else
+    echo "[$(ts)] INFO: getenforce unavailable; runtime SELinux setting skipped."
+    add_summary "SELinux: runtime control unavailable"
   fi
 }
 
@@ -1110,13 +1208,23 @@ module_health_for_module() {
         && -L /usr/local/bin/p1cert ]] && echo "OK" || echo "BROKEN"
       ;;
     LOGGUARD)
-      [[ -d "$ITGO_HOME/UTILITY/LOGGUARD" \
+      if [[ -d "$ITGO_HOME/UTILITY/LOGGUARD" \
         && -f "$version_file" \
         && -x "$ITGO_HOME/UTILITY/LOGGUARD/bin/logguard" \
         && -d "$ITGO_HOME/UTILITY/LOGGUARD/config" \
         && -d "$ITGO_HOME/UTILITY/LOGGUARD/state" \
         && -d "$ITGO_HOME/UTILITY/LOGGUARD/logs" \
-        && -d "$ITGO_HOME/UTILITY/LOGGUARD/archive" ]] && echo "OK" || echo "BROKEN"
+        && -d "$ITGO_HOME/UTILITY/LOGGUARD/archive" \
+        && -x /usr/local/sbin/itgo-logguard-run \
+        && -f /etc/systemd/system/logguard.service \
+        && -f /etc/systemd/system/logguard.timer ]] \
+        && command -v systemctl >/dev/null 2>&1 \
+        && systemctl is-enabled --quiet logguard.timer \
+        && systemctl is-active --quiet logguard.timer; then
+        echo "OK"
+      else
+        echo "BROKEN"
+      fi
       ;;
     *)
       echo "UNKNOWN"
@@ -3965,7 +4073,7 @@ install_logguard_step() {
 
   if should_install_or_update_module "LOGGUARD"; then
     if [[ "$MODULE_DECISION" == "install" ]]; then
-      if ! prompt_yn "KROK: zainstalować LOGGUARD (discovery/read-only dla logów Platform Integracyjnych)?" "Y"; then
+      if ! prompt_yn "KROK: zainstalować LOGGUARD (monitoruje Platformy Integracyjne, automatycznie kontroluje catalina.out co 30 minut przez systemd timer)?" "Y"; then
         echo "[$(ts)] SKIP: LOGGUARD."
         return 0
       fi
@@ -4208,15 +4316,22 @@ uninstall_p1cert_step() {
 }
 
 uninstall_logguard_step() {
-  local app_dir
+  local logguard_dir logguard_sh
   if ! have_user; then
     echo "[$(ts)] WARN: user '$TARGET_USER' missing. Pomijam LOGGUARD uninstall."
     return 0
   fi
   ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
   [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] WARN: cannot resolve home for '$TARGET_USER'. Pomijam LOGGUARD uninstall."; return 0; }
-  app_dir="$ITGO_HOME/UTILITY/LOGGUARD"
-  rm -rf -- "$app_dir" 2>/dev/null || true
+  UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+  TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
+  [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
+  [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
+  logguard_dir="$TMP_DIR/LOGGUARD"
+  logguard_sh="$logguard_dir/logguard_installer_public.sh"
+  ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot uninstall LOGGUARD."; return 1; }
+  download_logguard_payload "$logguard_dir"
+  run_module_root "$logguard_sh" --uninstall "$TARGET_USER"
   echo "[$(ts)] OK: LOGGUARD uninstall done."
   add_summary "Uninstall: LOGGUARD"
 }
@@ -4268,6 +4383,11 @@ main() {
 
   if [[ "$TOOLS_ONLY_MODE" == "1" ]]; then
     add_summary "MODE: tools-only"
+    if ! configure_selinux_permissive; then
+      echo "[$(ts)] ERROR: SELinux preparation failed; stopping tools-only."
+      print_summary
+      exit 1
+    fi
     if ! have_user; then
       echo "[$(ts)] ERROR: user '$TARGET_USER' nie istnieje. tools-only wymaga istniejącego użytkownika."
       add_summary "Tools-only: ERROR (user missing: $TARGET_USER)"
@@ -4300,6 +4420,11 @@ main() {
 
   if [[ "$UPDATE_ONLY_MODE" == "1" ]]; then
     add_summary "MODE: update-only"
+    if ! configure_selinux_permissive; then
+      echo "[$(ts)] ERROR: SELinux preparation failed; stopping update-only."
+      print_summary
+      exit 1
+    fi
     if ! have_user; then
       echo "[$(ts)] WARN: user '$TARGET_USER' nie istnieje. Pomijam update-only."
       add_summary "Update-only: SKIP (user missing: $TARGET_USER)"
@@ -4360,6 +4485,11 @@ main() {
 
   if [[ "$MODULES_ONLY_MODE" == "1" ]]; then
     add_summary "MODE: modules-only"
+    if ! configure_selinux_permissive; then
+      echo "[$(ts)] ERROR: SELinux preparation failed; stopping modules-only."
+      print_summary
+      exit 1
+    fi
     if ! have_user; then
       echo "[$(ts)] WARN: user '$TARGET_USER' nie istnieje. Pomijam modules-only."
       add_summary "Modules-only: SKIP (user missing: $TARGET_USER)"
@@ -4471,6 +4601,11 @@ main() {
   else
     echo "[$(ts)] SKIP: bootstrap."
     prepare_dirs_after_skip_bootstrap
+  fi
+  if ! configure_selinux_permissive; then
+    echo "[$(ts)] ERROR: SELinux preparation failed; stopping installation."
+    print_summary
+    exit 1
   fi
 
   install_master_launcher
