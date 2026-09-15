@@ -1,12 +1,12 @@
 # LOGGUARD
 
-LOGGUARD 0.1.0 provides controlled log discovery, dry-run planning, and explicit archive handling for detected IntegrationPlatform installations. Discovery scans only `/srv` and `/opt`, uses `find -P`, does not follow symlinks, and ignores any `_NEW` or `_OLD` path component.
+LOGGUARD autonomously protects `catalina.out` for every detected `IntegrationPlatform` and `IntegrationPlatform_*` installation. Discovery scans only `/srv` and `/opt`, uses `find -P`, does not follow symlinks, and ignores any `_NEW` or `_OLD` path component.
 
 ## Installation and layout
 
-The installer creates the private `$HOME/UTILITY/LOGGUARD` layout: `bin`, `config`, `state`, `logs/runs`, and the technical `archive` directory. It installs the default `config/logguard.conf` only when it does not already exist, so updates preserve local configuration. It does not create `/srv/BackupLog`; that root is created only by an explicit `run` when needed.
+The installer creates the private `$HOME/UTILITY/LOGGUARD` layout: `bin`, `config`, `state`, `logs/runs`, and the technical `archive` directory. It preserves an existing `config/logguard.conf` during updates. It also installs root-owned `logguard.service`, `logguard.timer`, and the technical `/usr/local/sbin/itgo-logguard-run` wrapper, enabling the timer immediately. The wrapper is the systemd execution entry point and calls the installed launcher. The timer runs five minutes after boot and then every 30 minutes.
 
-No service unit, scheduled task, operating-system rotation configuration, privilege-policy change, system configuration file, or global wrapper is created.
+The default `CATALINA_THRESHOLD_MIB` is 512 MiB. `/srv/BackupLog` is created only when a run needs it; `--uninstall` removes the LOGGUARD installation, systemd units, and wrapper, but never `/srv/BackupLog` or its archives.
 
 ## Commands
 
@@ -15,9 +15,11 @@ No service unit, scheduled task, operating-system rotation configuration, privil
 ~/UTILITY/LOGGUARD/bin/logguard scan
 ~/UTILITY/LOGGUARD/bin/logguard plan
 ~/UTILITY/LOGGUARD/bin/logguard run
+~/UTILITY/LOGGUARD/bin/logguard version
+~/UTILITY/LOGGUARD/bin/logguard help
 ```
 
-`status` reports version, configuration, sudo availability, and discovered-platform count. `scan` is entirely read-only and prints platform, type, path, size, owner, and strategy. `plan` is dry-run: it changes nothing and records `WOULD_*` actions. Only the explicitly invoked `run` can modify files.
+`status` reports version, configuration, privilege mode, timer state, and discovered-platform count. `scan` is entirely read-only and prints platform, type, path, size, owner, and strategy. `plan` is dry-run: it changes nothing and records `WOULD_*` actions. `run` remains available for manual operation; the systemd service runs it as root automatically.
 
 ## Handling and safety
 
@@ -27,4 +29,4 @@ Older `localhost_access_log.*.txt` files are archived under `access`; dated `*.l
 
 Archive retention applies only inside `ARCHIVE_ROOT`, with configured age limits and a per-platform size limit. Deletes are restricted to canonical, verified regular files below `ARCHIVE_ROOT`; the root and platform directories are never deleted. The default configuration documents thresholds, retention, archive root, and dry-run mode, and is parsed as data rather than sourced as code.
 
-Operational metadata is logged to `logs/logguard.log`; every plan/run has `logs/runs/logguard-run-YYYYMMDDTHHMMSS.log`, retained for the configured number of days. Sudo is detected and used only for individual operations that need it; LOGGUARD is not launched wholesale through sudo.
+Operational metadata is logged to `logs/logguard.log`; every plan/run has `logs/runs/logguard-run-YYYYMMDDTHHMMSS.log`, retained for the configured number of days. Manual non-root execution still requires sudo for privileged work; service execution as root does not invoke sudo.

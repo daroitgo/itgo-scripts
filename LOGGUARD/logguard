@@ -50,8 +50,19 @@ fail() {
 
 number() { [[ "$1" =~ ^[0-9]+$ ]]; }
 sudo_present() { command -v sudo >/dev/null 2>&1; }
-sudo_noninteractive() { sudo_present && sudo -n true >/dev/null 2>&1; }
-priv() { sudo "$@"; }
+root_execution() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
+sudo_noninteractive() { root_execution || { sudo_present && sudo -n true >/dev/null 2>&1; }; }
+priv() { if root_execution; then "$@"; else sudo "$@"; fi; }
+systemctl_present() { command -v systemctl >/dev/null 2>&1; }
+timer_enabled() { systemctl_present && systemctl is-enabled --quiet logguard.timer 2>/dev/null; }
+timer_active() { systemctl_present && systemctl is-active --quiet logguard.timer 2>/dev/null; }
+timer_next() {
+  local next
+  systemctl_present || { printf '%s\n' 'UNAVAILABLE'; return; }
+  [[ -f /etc/systemd/system/logguard.timer ]] || { printf '%s\n' 'NOT_INSTALLED'; return; }
+  next="$(systemctl list-timers --all --no-legend logguard.timer 2>/dev/null | awk 'NR == 1 { print $1 " " $2 " " $3 }')"
+  printf '%s\n' "${next:-UNKNOWN}"
+}
 
 load_config() {
   local line key value
@@ -340,25 +351,25 @@ plan_retention_directory() {
   local directory="$1" days="$2" file
   while IFS= read -r -d '' file; do
     write_log INFO "mode=DRY_RUN action=WOULD_RETENTION_DELETE file=$file reason=age"
-  done < <(sudo -n find -P "$directory" -type f -mtime +"$days" -print0 2>/dev/null)
+  done < <(priv find -P "$directory" -type f -mtime +"$days" -print0 2>/dev/null)
 }
 
 plan_size_retention() {
   local platform_directory="$1" maximum total record file size
   maximum=$((ARCHIVE_MAX_SIZE_GIB * 1024 * 1024 * 1024))
-  total="$(sudo -n du -sb -- "$platform_directory" 2>/dev/null | awk '{print $1}')"
+  total="$(priv du -sb -- "$platform_directory" 2>/dev/null | awk '{print $1}')"
   number "${total:-}" || return 0
   while IFS= read -r -d '' record; do
     (( total > maximum )) || break
     file="${record#*:}"
-    size="$(sudo -n stat -c %s -- "$file" 2>/dev/null || true)"
+    size="$(priv stat -c %s -- "$file" 2>/dev/null || true)"
     if ! number "${size:-}"; then
       write_log WARN "mode=DRY_RUN action=RETENTION_SKIP file=$file reason=invalid_size"
       continue
     fi
     write_log INFO "mode=DRY_RUN action=WOULD_RETENTION_DELETE file=$file reason=size_limit"
     total=$((total - size))
-  done < <(sudo -n find -P "$platform_directory" -type f -printf '%T@:%p\0' 2>/dev/null | sort -z)
+  done < <(priv find -P "$platform_directory" -type f -printf '%T@:%p\0' 2>/dev/null | sort -z)
 }
 
 plan_retention() {
@@ -372,7 +383,7 @@ plan_retention() {
     plan_retention_directory "$platform_directory/access" "$ACCESS_RETENTION_DAYS"
     plan_retention_directory "$platform_directory/application" "$DATED_LOG_RETENTION_DAYS"
     plan_size_retention "$platform_directory"
-  done < <(sudo -n find -P "$ARCHIVE_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+  done < <(priv find -P "$ARCHIVE_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
 }
 
 plan_one() {
@@ -396,7 +407,10 @@ plan_one() {
 
 status() {
   MODE=STATUS; load_config || return 1; discover
-  printf 'LOGGUARD_VERSION: %s\nARCHIVE_ROOT: %s\nCATALINA_THRESHOLD_MIB: %s\nSUDO_PRESENT: %s\nSUDO_NONINTERACTIVE: %s\nINTEGRATION_PLATFORMS: %s\n' "$(version)" "$ARCHIVE_ROOT" "$CATALINA_THRESHOLD_MIB" "$(sudo_present && echo yes || echo no)" "$(sudo_noninteractive && echo yes || echo no)" "${#PLATFORMS[@]}"
+  printf 'LOGGUARD_VERSION: %s\nARCHIVE_ROOT: %s\nCATALINA_THRESHOLD_MIB: %s\nINTEGRATION_PLATFORMS: %s\nROOT_EXECUTION: %s\nSUDO_PRESENT: %s\nSUDO_NONINTERACTIVE: %s\nTIMER_ENABLED: %s\nTIMER_ACTIVE: %s\nTIMER_NEXT: %s\n' \
+    "$(version)" "$ARCHIVE_ROOT" "$CATALINA_THRESHOLD_MIB" "${#PLATFORMS[@]}" \
+    "$(root_execution && echo yes || echo no)" "$(sudo_present && echo yes || echo no)" "$(sudo_noninteractive && echo yes || echo no)" \
+    "$(timer_enabled && echo yes || echo no)" "$(timer_active && echo yes || echo no)" "$(timer_next)"
 }
 
 scan() { MODE=SCAN; load_config || return 1; discover; table; }
@@ -412,7 +426,7 @@ plan() {
 run() {
   local i
   MODE=RUN; load_config || return 1; init_log
-  if ! sudo_present || ! sudo -v; then
+  if ! root_execution && { ! sudo_present || ! sudo -v; }; then
     fail 'mode=RUN action=SUDO_PREFLIGHT_FAILED'
     write_log ERROR "mode=RUN action=RUN_END result=ERROR errors=$ERRORS"
     return 1
