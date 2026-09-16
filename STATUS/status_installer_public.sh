@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.23"
+VERSION="3.12.24"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -863,6 +863,7 @@ logguard_health_state() {
   local dir="$1" vf="$2" path subdir
   [[ -d "$dir" ]] || { echo "NO"; return; }
   [[ -f "$vf" ]] || { echo "BROKEN"; return; }
+  [[ -f "$dir/config/platforms.conf" ]] || { echo "BROKEN"; return; }
 
   path="$dir/bin/logguard"
   [[ -f "$path" && -x "$path" ]] || { echo "BROKEN"; return; }
@@ -872,6 +873,32 @@ logguard_health_state() {
   done
 
   echo "YES"
+}
+
+logguard_platforms_state() {
+  local file="$1" line path canonical name lower existing duplicate component
+  local -a valid=() components=()
+  [[ -f "$file" ]] || { echo "MISSING"; return; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#${line%%[![:space:]]*}}"
+    line="${line%${line##*[![:space:]]}}"
+    [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+    [[ "$line" == /* && "$line" != /srv/BackupLog && "$line" != /srv/BackupLog/* ]] || { echo "INVALID"; return; }
+    [[ ! -L "$line" && -d "$line" ]] || { echo "INVALID"; return; }
+    canonical="$(readlink -f -- "$line" 2>/dev/null || true)"
+    [[ -n "$canonical" && "$canonical" == "$line" ]] || { echo "INVALID"; return; }
+    IFS=/ read -r -a components <<< "$canonical"
+    for component in "${components[@]}"; do
+      lower="${component,,}"
+      [[ "$lower" == *_new || "$lower" == *_old ]] && { echo "INVALID"; return; }
+    done
+    name="${canonical##*/}"; lower="${name,,}"
+    [[ "$lower" == integrationplatform || "$lower" == integrationplatform_* ]] || { echo "INVALID"; return; }
+    duplicate=0
+    for existing in "${valid[@]}"; do [[ "$existing" == "$line" ]] && duplicate=1; done
+    (( duplicate )) || valid+=("$line")
+  done < "$file"
+  printf 'VALID:%s\n' "${#valid[@]}"
 }
 
 fetch_github_tags() {
@@ -934,6 +961,7 @@ inventory_dir="$HOME/UTILITY/INVENTORY"
 inventory_vf="$inventory_dir/inventory.version"
 logguard_dir="$HOME/UTILITY/LOGGUARD"
 logguard_vf="$logguard_dir/logguard.version"
+logguard_platforms_file="$logguard_dir/config/platforms.conf"
 p1cert_vf="$HOME/UTILITY/P1CERT/p1cert.version"
 p1cert_state="$HOME/UTILITY/P1CERT/state/p1cert-state"
 
@@ -953,6 +981,7 @@ inventory_installed="$(inventory_module_state "$inventory_dir" "$inventory_vf")"
 inventory_health="$(inventory_health_state "$inventory_dir" "$inventory_vf")"
 logguard_installed="$(logguard_module_state "$logguard_dir")"
 logguard_health="$(logguard_health_state "$logguard_dir" "$logguard_vf")"
+logguard_platforms_info="$(logguard_platforms_state "$logguard_platforms_file")"
 p1cert_installed="$(module_state "$p1cert_vf")"
 
 inst_ver="$(read_version_file "$status_vf")"
@@ -1010,6 +1039,33 @@ if [[ -f "$HOME/.bashrc" ]] && grep -qF "# >>> UPG XML cleanup (auto) >>>" "$HOM
 fi
 
 RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+
+logguard_platform_count="0"
+if [[ "$logguard_platforms_info" == VALID:* ]]; then
+  logguard_platform_count="${logguard_platforms_info#VALID:}"
+fi
+if [[ "$logguard_installed" == "NO" ]]; then
+  logguard_monitor_state="NOT_INSTALLED"
+elif [[ "$logguard_platforms_info" != VALID:* ]]; then
+  logguard_monitor_state="CHECK_MANUALLY"
+elif [[ "$logguard_platform_count" == "0" ]]; then
+  logguard_monitor_state="NO_TARGETS"
+elif [[ "$logguard_health" == "YES" ]] && systemctl is-enabled --quiet logguard.timer 2>/dev/null && systemctl is-active --quiet logguard.timer 2>/dev/null; then
+  logguard_monitor_state="ACTIVE"
+else
+  logguard_monitor_state="INACTIVE"
+fi
+
+logguard_monitor_line() {
+  local state="$1" count="$2" color
+  case "$state" in
+    ACTIVE) color="$GREEN" ;;
+    INACTIVE|NO_TARGETS) color="$YELLOW" ;;
+    CHECK_MANUALLY) color="$RED" ;;
+    *) color="$DIM$YELLOW" ;;
+  esac
+  printf 'LogGuard monitor: %s%s%s | platforms: %s' "$color" "$state" "$RESET" "$count"
+}
 
 hr_bytes() {
   local b="${1:-}"
@@ -1350,6 +1406,7 @@ modules_body+="$(module_row "Inventory" "${inventory_installed:-NO}" "${inventor
 modules_body+="$(module_row "LogGuard" "${logguard_installed:-NO}" "${logguard_ver:-UNKNOWN}" "${logguard_github_ver:-UNKNOWN}" "$logguard_mod_state")"$'\n'
 modules_body+="$(module_row "P1CERT" "${p1cert_installed:-NO}" "${p1cert_ver:-UNKNOWN}" "${p1cert_github_ver:-UNKNOWN}" "$p1cert_mod_state")"$'\n'
 modules_body+="${DIM}UPGclean hook: bashrc:${upg_cleanup_hook}${RESET}"
+modules_body+=$'\n'"$(logguard_monitor_line "$logguard_monitor_state" "$logguard_platform_count")"
 
 amcs_component="NO"
 amcs_details="-"
