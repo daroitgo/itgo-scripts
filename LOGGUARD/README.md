@@ -23,7 +23,7 @@ The default `CATALINA_THRESHOLD_MIB` is 512 MiB. `/srv/BackupLog` is created onl
 
 ## Handling and safety
 
-`catalina.out` is `ACTIVE_CATALINA` and uses COPYTRUNCATE only after its configured threshold. LOGGUARD copies to a temporary archive under `/srv/BackupLog/<platform>/catalina`, gzips it, runs `gzip -t`, verifies uncompressed snapshot size, publishes the archive, and only then truncates the source. A copy, gzip, or verification failure never truncates the source.
+`catalina.out` is `ACTIVE_CATALINA` and uses COPYTRUNCATE only after its configured threshold. LOGGUARD copies it to a temporary uncompressed snapshot under `/srv/BackupLog/<platform>/catalina`, validates that snapshot, and immediately truncates the source. A successful `truncate` is sufficient: the active application may immediately start writing new bytes. LOGGUARD keeps the raw snapshot until gzip, `gzip -t`, uncompressed-size verification, and archive publication all succeed. A copy failure never truncates the source; a truncate failure stops the rotation and removes the temporary snapshot. After a successful truncate, gzip, verification, or publication failure preserves the raw recovery snapshot and logs `RECOVERY_REQUIRED` with its path for manual recovery.
 
 Older `localhost_access_log.*.txt` files are archived under `access`; dated `*.log` files go under `application` (or `catalina` for `catalina.*.log`). Current-day files are skipped. Ordinary active `*.log` files are `MONITOR_ONLY`: they are never truncated, moved, compressed, or removed. Existing `.zip` and `.gz` files are `RETENTION_ONLY` and are not repacked or removed from platform directories.
 

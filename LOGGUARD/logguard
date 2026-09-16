@@ -230,7 +230,7 @@ cleanup_temp() {
 
 archive_one() {
   local platform="$1" type="$2" source="$3" source_size_at_scan="$4"
-  local directory target temporary snapshot_size unpacked_size archive_size current_source_size
+  local directory target raw_snapshot compressed_temp snapshot_size unpacked_size archive_size post_truncate_size
   directory="$(archive_dir "$platform" "$type" "$source")"
   target="$directory/${source##*/}.gz"
   [[ "$type" == ACTIVE_CATALINA ]] && target="$directory/catalina.out-$(date +%Y%m%dT%H%M%S).log.gz"
@@ -239,53 +239,89 @@ archive_one() {
     write_log WARN "mode=RUN platform=$platform action=ARCHIVE_SKIP file=$source target=$target reason=target_exists"
     return 0
   fi
-  temporary="$target.tmp.$$"
+  raw_snapshot="$target.tmp.$$"
+  compressed_temp="$raw_snapshot.gz"
   write_log INFO "mode=RUN platform=$platform action=ARCHIVE_START file=$source target=$target source_size_at_scan=$source_size_at_scan"
 
-  if ! priv install -d -m 0700 "$directory" || ! priv cp -- "$source" "$temporary"; then
+  if ! priv install -d -m 0700 "$directory" || ! priv cp -- "$source" "$raw_snapshot"; then
     fail "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=copy"
-    cleanup_temp "$platform" "$temporary"
+    cleanup_temp "$platform" "$raw_snapshot"
     return 1
   fi
-  snapshot_size="$(priv stat -c %s -- "$temporary" 2>/dev/null || true)"
-  if ! number "${snapshot_size:-}" || ! priv gzip -f -- "$temporary"; then
-    fail "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=gzip"
-    cleanup_temp "$platform" "$temporary"
-    return 1
-  fi
-  temporary="$temporary.gz"
-  unpacked_size="$(priv gzip -cd -- "$temporary" 2>/dev/null | wc -c | tr -d ' ')"
-  if ! priv gzip -t -- "$temporary" || [[ "$unpacked_size" != "$snapshot_size" ]]; then
-    fail "mode=RUN platform=$platform action=VERIFY_FAILED file=$source target=$temporary snapshot_size=$snapshot_size"
-    write_log ERROR "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=verify"
-    cleanup_temp "$platform" "${temporary%.gz}"
-    return 1
-  fi
-  archive_size="$(priv stat -c %s -- "$temporary" 2>/dev/null || true)"
-  write_log INFO "mode=RUN platform=$platform action=VERIFY_OK file=$source target=$temporary snapshot_size=$snapshot_size archive_size=$archive_size"
-  if ! priv mv -n -- "$temporary" "$target"; then
-    fail "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=publish"
-    cleanup_temp "$platform" "${temporary%.gz}"
-    return 1
-  fi
-  if priv test -e "$temporary"; then
-    write_log WARN "mode=RUN platform=$platform action=ARCHIVE_SKIP file=$source target=$target reason=target_conflict"
-    cleanup_temp "$platform" "${temporary%.gz}"
-    return 0
-  fi
-
-  write_log INFO "mode=RUN platform=$platform action=ARCHIVE_OK file=$source target=$target snapshot_size=$snapshot_size archive_size=$archive_size"
+  snapshot_size="$(priv stat -c %s -- "$raw_snapshot" 2>/dev/null || true)"
   if [[ "$type" == ACTIVE_CATALINA ]]; then
-    current_source_size="$(priv stat -c %s -- "$source" 2>/dev/null || true)"
-    if [[ "$current_source_size" != "$snapshot_size" ]]; then
-      write_log WARN "mode=RUN platform=$platform action=TRUNCATE_DEFERRED file=$source reason=source_changed_after_snapshot snapshot_size=$snapshot_size current_source_size=$current_source_size"
-      return 0
-    fi
-    if ! priv truncate -s 0 -- "$source" || [[ "$(priv stat -c %s -- "$source" 2>/dev/null || true)" != 0 ]]; then
-      fail "mode=RUN platform=$platform action=TRUNCATE_FAILED file=$source"
+    if ! number "${snapshot_size:-}"; then
+      fail "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=invalid_snapshot_size"
+      cleanup_temp "$platform" "$raw_snapshot"
       return 1
     fi
-    write_log INFO "mode=RUN platform=$platform action=TRUNCATE_OK file=$source"
+    write_log INFO "mode=RUN platform=$platform action=SNAPSHOT_OK file=$source target=$raw_snapshot snapshot_size=$snapshot_size"
+    if ! priv truncate -s 0 -- "$source"; then
+      fail "mode=RUN platform=$platform action=TRUNCATE_FAILED file=$source"
+      cleanup_temp "$platform" "$raw_snapshot"
+      return 1
+    fi
+    post_truncate_size="$(priv stat -c %s -- "$source" 2>/dev/null || true)"
+    if number "${post_truncate_size:-}"; then
+      write_log INFO "mode=RUN platform=$platform action=TRUNCATE_OK file=$source post_truncate_size=$post_truncate_size"
+    else
+      write_log INFO "mode=RUN platform=$platform action=TRUNCATE_OK file=$source"
+    fi
+
+    if ! priv sh -c 'gzip -c -- "$1" > "$2"' sh "$raw_snapshot" "$compressed_temp"; then
+      fail "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=gzip"
+      priv rm -f -- "$compressed_temp" || write_log WARN "mode=RUN platform=$platform action=TEMP_CLEANUP_FAILED file=$compressed_temp"
+      write_log ERROR "mode=RUN platform=$platform action=RECOVERY_REQUIRED file=$source snapshot=$raw_snapshot reason=gzip_failed_after_truncate"
+      return 1
+    fi
+  elif ! number "${snapshot_size:-}" || ! priv gzip -f -- "$raw_snapshot"; then
+    fail "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=gzip"
+    cleanup_temp "$platform" "$raw_snapshot"
+    return 1
+  fi
+  unpacked_size="$(priv gzip -cd -- "$compressed_temp" 2>/dev/null | wc -c | tr -d ' ')"
+  if ! priv gzip -t -- "$compressed_temp" || [[ "$unpacked_size" != "$snapshot_size" ]]; then
+    fail "mode=RUN platform=$platform action=VERIFY_FAILED file=$source target=$compressed_temp snapshot_size=$snapshot_size"
+    write_log ERROR "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=verify"
+    if [[ "$type" == ACTIVE_CATALINA ]]; then
+      priv rm -f -- "$compressed_temp" || write_log WARN "mode=RUN platform=$platform action=TEMP_CLEANUP_FAILED file=$compressed_temp"
+      write_log ERROR "mode=RUN platform=$platform action=RECOVERY_REQUIRED file=$source snapshot=$raw_snapshot reason=verify_failed_after_truncate"
+    else
+      cleanup_temp "$platform" "$raw_snapshot"
+    fi
+    return 1
+  fi
+  archive_size="$(priv stat -c %s -- "$compressed_temp" 2>/dev/null || true)"
+  write_log INFO "mode=RUN platform=$platform action=VERIFY_OK file=$source target=$compressed_temp snapshot_size=$snapshot_size archive_size=$archive_size"
+  if ! priv mv -n -- "$compressed_temp" "$target"; then
+    fail "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=publish"
+    if [[ "$type" == ACTIVE_CATALINA ]]; then
+      priv rm -f -- "$compressed_temp" || write_log WARN "mode=RUN platform=$platform action=TEMP_CLEANUP_FAILED file=$compressed_temp"
+      write_log ERROR "mode=RUN platform=$platform action=RECOVERY_REQUIRED file=$source snapshot=$raw_snapshot reason=publish_failed_after_truncate"
+    else
+      cleanup_temp "$platform" "$raw_snapshot"
+    fi
+    return 1
+  fi
+  if priv test -e "$compressed_temp"; then
+    if [[ "$type" == ACTIVE_CATALINA ]]; then
+      fail "mode=RUN platform=$platform action=ARCHIVE_FAILED file=$source reason=target_conflict"
+      priv rm -f -- "$compressed_temp" || write_log WARN "mode=RUN platform=$platform action=TEMP_CLEANUP_FAILED file=$compressed_temp"
+      write_log ERROR "mode=RUN platform=$platform action=RECOVERY_REQUIRED file=$source snapshot=$raw_snapshot reason=target_conflict_after_truncate"
+      return 1
+    else
+      write_log WARN "mode=RUN platform=$platform action=ARCHIVE_SKIP file=$source target=$target reason=target_conflict"
+      cleanup_temp "$platform" "$raw_snapshot"
+      return 0
+    fi
+  fi
+
+  if [[ "$type" == ACTIVE_CATALINA ]] && ! priv rm -f -- "$raw_snapshot"; then
+    write_log WARN "mode=RUN platform=$platform action=RECOVERY_SNAPSHOT_CLEANUP_FAILED file=$raw_snapshot"
+  fi
+  write_log INFO "mode=RUN platform=$platform action=ARCHIVE_OK file=$source target=$target snapshot_size=$snapshot_size archive_size=$archive_size"
+  if [[ "$type" == ACTIVE_CATALINA ]]; then
+    return 0
   elif ! priv rm -f -- "$source"; then
     fail "mode=RUN platform=$platform action=REMOVE_FAILED file=$source"
     return 1
