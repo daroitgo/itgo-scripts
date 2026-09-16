@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.106"
+MASTER_VERSION="1.2.107"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.24"
@@ -977,7 +977,7 @@ EOF_MASTER_UPDATE_LAUNCHER
   safe_backup "$bp"
   remove_block_from_file "$bp" "$legacy_path_start" "$legacy_path_end"
   remove_block_from_file "$bp" "$path_start" "$path_end"
-  printf "\n%s\nexport PATH=\"\$HOME/UTILITY/MASTER:\$HOME/UTILITY/STATUS/bin:\$HOME/UTILITY/TSEQ/bin:\$HOME/UTILITY/DOWNLOADER_APP/bin:\$HOME/UTILITY/UPGbuilder/bin:\$HOME/UTILITY/INVENTORY/bin:\$HOME/UTILITY/LOGGUARD/bin:\$HOME/UTILITY/AMCS:\$HOME/UTILITY/AISM/bin:\$HOME/UTILITY/TOOLS:\$PATH\"\n%s\n" "$path_start" "$path_end" >> "$bp"
+  printf "\n%s\nexport PATH=\"\$HOME/UTILITY/MASTER:\$HOME/UTILITY/STATUS/bin:\$HOME/UTILITY/TSEQ/bin:\$HOME/UTILITY/DOWNLOADER_APP/bin:\$HOME/UTILITY/UPGbuilder/bin:\$HOME/UTILITY/INVENTORY/bin:\$HOME/UTILITY/LOGGUARD/bin:\$HOME/UTILITY/AMCS:\$HOME/UTILITY/TOOLS:\$PATH\"\n%s\n" "$path_start" "$path_end" >> "$bp"
   chown "$TARGET_USER:$TARGET_USER" "$bp" 2>/dev/null || true
   chmod 0644 "$bp" 2>/dev/null || true
 
@@ -2764,283 +2764,152 @@ prompt_aism_slave_master_host() {
   done
 }
 
-generate_aism_secret() {
-  local secret=""
-
-  if [[ -r /dev/urandom ]] && command -v od >/dev/null 2>&1 && command -v tr >/dev/null 2>&1; then
-    secret="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]')"
-  fi
-
-  if [[ ${#secret} -ne 32 ]]; then
-    echo "[$(ts)] ERROR: nie udało się wygenerować bezpiecznego sekretu AISM." >&2
-    return 1
-  fi
-
-  printf "%s\n" "$secret"
-}
-
-install_aism_master_config() {
-  local app_dir="$UTILITY_DIR/AISM"
-  local master_dir="$app_dir/master"
-  local resources_dir="$master_dir/installer-resources"
-  local env_file="$master_dir/.env"
-  local override_password=""
-  local keystore_password=""
-  local encryption_key_password=""
-  local env_tmp=""
-
-  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
-    "$master_dir" \
-    "$resources_dir" \
-    "$resources_dir/resources"
+prompt_aism_server_port() {
+  local ans=""
 
   while true; do
-    printf "AISM master: podaj APPLICATION_INSTALLER_OVERRIDE_PASSWORD: " >&2
-    read -r -s override_password || true
-    printf "\n" >&2
-    if [[ -z "$override_password" ]]; then
-      echo "[$(ts)] WARN: hasło nie może być puste." >&2
-      continue
+    printf "AISM: port HTTP MASTER [8089]: " >&2
+    read -r ans || true
+    ans="${ans//$'\r'/}"
+    ans="${ans#"${ans%%[![:space:]]*}"}"
+    ans="${ans%"${ans##*[![:space:]]}"}"
+    ans="${ans:-8089}"
+
+    if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= 65535 )); then
+      printf "%s\n" "$ans"
+      return 0
     fi
 
-    if [[ "$override_password" == *"'"* || "$override_password" == *\\* ]]; then
-      echo "[$(ts)] WARN: hasło nie może zawierać apostrofu ani backslasha." >&2
-      override_password=""
-      continue
-    fi
-
-    break
+    echo "[$(ts)] WARN: podaj poprawny port TCP 1-65535." >&2
   done
-
-  if [[ ! -f "$env_file" ]]; then
-    keystore_password="$(generate_aism_secret)" || exit 1
-    encryption_key_password="$(generate_aism_secret)" || exit 1
-
-    cat > "$env_file" <<EOF_AISM_MASTER_ENV
-SERVER_PORT='8089'
-APPLICATION_INSTALLER_OVERRIDE_PASSWORD='$override_password'
-INSTALLER_KEYSTORE_PASSWORD='$keystore_password'
-INSTALLER_ENCRYPTION_KEY_PASSWORD='$encryption_key_password'
-APPLICATION_INSTALLER_MASTER_CLUSTER_PORT='5701'
-APPLICATION_INSTALLER_RESOURCES_DIR='$resources_dir'
-SECURITY_AUTO_GENERATE_KEYSTORE='true'
-INSTALLER_KEYSTORE_PATH='configs/installerkeystore.jceks'
-INSTALLER_ENCRYPTION_KEY_ALIAS='encryption-key-v1'
-SSO_JWT_SECRET=''
-# APP_CONTEXT_PATH='/amcs_installer'
-EOF_AISM_MASTER_ENV
-    add_summary "AISM master config created: ~/UTILITY/AISM/master/.env"
-  else
-    env_tmp="$(mktemp)"
-    awk -v override_password="$override_password" '
-      $0 ~ /^APPLICATION_INSTALLER_OVERRIDE_PASSWORD=/ {
-        print "APPLICATION_INSTALLER_OVERRIDE_PASSWORD='\''" override_password "'\''"
-        updated=1
-        next
-      }
-      { print }
-      END {
-        if (!updated) {
-          print "APPLICATION_INSTALLER_OVERRIDE_PASSWORD='\''" override_password "'\''"
-        }
-      }
-    ' "$env_file" > "$env_tmp"
-    cat "$env_tmp" > "$env_file"
-    rm -f "$env_tmp"
-    add_summary "AISM master config preserved; override password updated: ~/UTILITY/AISM/master/.env"
-  fi
-
-  chown "$TARGET_USER:$TARGET_USER" "$env_file" 2>/dev/null || true
-  chmod 0600 "$env_file" 2>/dev/null || true
 }
 
-install_aism_slave_config() {
-  local master_host="${1:?}"
+prompt_aism_secret_value() {
+  local label="${1:?}"
+  local value=""
+
+  while true; do
+    printf "%s: " "$label" >&2
+    read -r -s value || true
+    printf "\n" >&2
+
+    value="${value//$'\r'/}"
+
+    if [[ -z "$value" ]]; then
+      echo "[$(ts)] WARN: wartość nie może być pusta." >&2
+      continue
+    fi
+
+    if [[ "$value" == *"'"* || "$value" == *\\* ]]; then
+      echo "[$(ts)] WARN: wartość nie może zawierać apostrofu ani backslasha." >&2
+      value=""
+      continue
+    fi
+
+    printf "%s\n" "$value"
+    return 0
+  done
+}
+
+quote_systemd_value() {
+  local value="${1:?}"
+
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\$\$}"
+  value="${value//%/%%}"
+  printf '"%s"' "$value"
+}
+
+install_aism_shared_config() {
   local app_dir="$UTILITY_DIR/AISM"
-  local slave_dir="$app_dir/slave"
-  local resources_dir="$slave_dir/installer-resources"
-  local env_file="$slave_dir/.env"
+  local env_file="$app_dir/.env"
+  local override_password=""
+  local sso_jwt_secret=""
 
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
-    "$slave_dir" \
-    "$resources_dir" \
-    "$resources_dir/resources"
+    "$app_dir" \
+    "$app_dir/master/installer-resources" \
+    "$app_dir/master/installer-resources/resources" \
+    "$app_dir/slave/installer-resources" \
+    "$app_dir/slave/installer-resources/resources"
 
-  if [[ ! -f "$env_file" ]]; then
-    cat > "$env_file" <<EOF_AISM_SLAVE_ENV
-APPLICATION_INSTALLER_MASTER_HOST='$master_host'
-APPLICATION_INSTALLER_MASTER_CLUSTER_PORT='5701'
-APPLICATION_INSTALLER_MASTER_RESOURCES_PORT='8089'
-APPLICATION_INSTALLER_RESOURCES_DIR='$resources_dir'
-EOF_AISM_SLAVE_ENV
-    add_summary "AISM slave config created: ~/UTILITY/AISM/slave/.env"
+  if [[ -f "$env_file" ]]; then
+    echo "[$(ts)] INFO: istniejący AISM .env zachowany bez zmian."
+    add_summary "AISM shared config preserved: ~/UTILITY/AISM/.env"
   else
-    if grep -q '^APPLICATION_INSTALLER_MASTER_HOST=' "$env_file"; then
-      sed -i "s/^APPLICATION_INSTALLER_MASTER_HOST=.*/APPLICATION_INSTALLER_MASTER_HOST='$master_host'/" "$env_file"
-    else
-      printf "APPLICATION_INSTALLER_MASTER_HOST='%s'\n" "$master_host" >> "$env_file"
-    fi
+    override_password="$(prompt_aism_secret_value "AISM: APPLICATION_INSTALLER_OVERRIDE_PASSWORD")" || exit 1
+    sso_jwt_secret="$(prompt_aism_secret_value "AISM: SSO_JWT_SECRET")" || exit 1
 
-    echo "[$(ts)] INFO: existing AISM slave .env preserved; MASTER host updated to $master_host."
-    add_summary "AISM slave config preserved; MASTER host updated: $master_host"
+    cat > "$env_file" <<EOF_AISM_ENV
+APPLICATION_INSTALLER_OVERRIDE_PASSWORD='$override_password'
+SSO_JWT_SECRET='$sso_jwt_secret'
+APP_CONTEXT_PATH='/amcs_installer'
+EOF_AISM_ENV
+
+    add_summary "AISM shared config created: ~/UTILITY/AISM/.env"
   fi
 
   chown "$TARGET_USER:$TARGET_USER" "$env_file" 2>/dev/null || true
   chmod 0600 "$env_file" 2>/dev/null || true
 }
 
-install_aism_launcher() {
-  local app_dir="$UTILITY_DIR/AISM"
-  local bin_dir="$app_dir/bin"
-  local launcher="$bin_dir/aism"
-
-  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$app_dir" "$bin_dir"
-
-  cat > "$launcher" <<'EOF_AISM_LAUNCHER'
-#!/usr/bin/env bash
-set -euo pipefail 2>/dev/null || set -eu
-
-USER_HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
-USER_HOME="${USER_HOME:-${HOME:-/home/itgo}}"
-
-APP_DIR="${USER_HOME}/UTILITY/AISM"
-JAR="${APP_DIR}/amcs-installer.jar"
-MASTER_ENV="${APP_DIR}/master/.env"
-SLAVE_ENV="${APP_DIR}/slave/.env"
-
-usage() {
-  cat <<'EOF_USAGE'
-Usage:
-  aism status
-  aism master start|stop|restart|status|logs
-  aism slave  start|stop|restart|status|logs
-
-Internal service commands:
-  aism run-master
-  aism run-slave
-EOF_USAGE
-}
-
-require_jar() {
-  if [[ ! -f "$JAR" ]]; then
-    echo "[ERROR] Brak pliku: $JAR" >&2
-    echo "[INFO] Pobierz instalator AISM przez: dwupg" >&2
-    exit 1
-  fi
-}
-
-load_env() {
-  local env_file="${1:?}"
-
-  if [[ ! -f "$env_file" ]]; then
-    echo "[ERROR] Brak konfiguracji: $env_file" >&2
-    exit 1
-  fi
-
-  set -a
-  # shellcheck disable=SC1090
-  . "$env_file"
-  set +a
-}
-
-service_action() {
+disable_aism_unselected_role() {
   local role="${1:?}"
-  local action="${2:?}"
-  local service="aism-${role}.service"
+  local description="${2:?}"
+  local unit="/etc/systemd/system/aism-${role}.service"
 
-  case "$action" in
-    start|stop|restart)
-      if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-        systemctl "$action" "$service"
-      else
-        sudo systemctl "$action" "$service"
-      fi
-      ;;
-    status)
-      systemctl status "$service" --no-pager
-      ;;
-    logs)
-      journalctl -u "$service" -n 100 --no-pager
-      ;;
-    *)
-      usage
-      exit 1
-      ;;
-  esac
-}
+  [[ -f "$unit" ]] || return 0
 
-case "${1:-}" in
-  run-master)
-    require_jar
-    load_env "$MASTER_ENV"
-    cd "$APP_DIR"
+  if ! grep -Fqx "Description=$description" "$unit"; then
+    echo "[$(ts)] WARN: pozostawiam niezarządzaną jednostkę $unit."
+    return 0
+  fi
 
-    exec java \
-      -Dspring.profiles.active=master,is \
-      -Dapplication.installer.resources.dir="${APPLICATION_INSTALLER_RESOURCES_DIR:-$APP_DIR/master/installer-resources}" \
-      -Dapplication.installer.master.cluster-port="${APPLICATION_INSTALLER_MASTER_CLUSTER_PORT:-5701}" \
-      -Dserver.port="${SERVER_PORT:-8089}" \
-      -jar "$JAR"
-    ;;
-
-  run-slave)
-    require_jar
-    load_env "$SLAVE_ENV"
-
-    if [[ -z "${APPLICATION_INSTALLER_MASTER_HOST:-}" ]]; then
-      echo "[ERROR] APPLICATION_INSTALLER_MASTER_HOST nie jest ustawiony w $SLAVE_ENV" >&2
-      exit 1
-    fi
-
-    cd "$APP_DIR"
-
-    exec java \
-      -Dspring.profiles.active=slave,is \
-      -Dapplication.installer.resources.dir="${APPLICATION_INSTALLER_RESOURCES_DIR:-$APP_DIR/slave/installer-resources}" \
-      -Dapplication.installer.master.host="$APPLICATION_INSTALLER_MASTER_HOST" \
-      -Dapplication.installer.master.cluster-port="${APPLICATION_INSTALLER_MASTER_CLUSTER_PORT:-5701}" \
-      -Dapplication.installer.master.resources-port="${APPLICATION_INSTALLER_MASTER_RESOURCES_PORT:-8089}" \
-      -jar "$JAR"
-    ;;
-
-  master|slave)
-    role="$1"
-    action="${2:-status}"
-    service_action "$role" "$action"
-    ;;
-
-  status)
-    echo "===== AISM MASTER ====="
-    systemctl status aism-master.service --no-pager 2>/dev/null || true
-    echo
-    echo "===== AISM SLAVE ====="
-    systemctl status aism-slave.service --no-pager 2>/dev/null || true
-    ;;
-
-  -h|--help|help|"")
-    usage
-    ;;
-
-  *)
-    usage
-    exit 1
-    ;;
-esac
-EOF_AISM_LAUNCHER
-
-  chown "$TARGET_USER:$TARGET_USER" "$launcher" 2>/dev/null || true
-  chmod 0700 "$launcher" 2>/dev/null || true
-
-  add_summary "AISM launcher installed: ~/UTILITY/AISM/bin/aism"
+  echo "[$(ts)] ACTION: disable --now aism-${role}.service"
+  systemctl disable --now "aism-${role}.service" >/dev/null 2>&1 || true
+  rm -f "$unit"
+  add_summary "AISM systemd disabled and removed: aism-${role}.service"
 }
 
 install_aism_systemd_units() {
   local master_enabled="${1:-0}"
   local slave_enabled="${2:-0}"
+  local master_host="${3:-}"
+  local server_port="${4:-8089}"
   local app_dir="$UTILITY_DIR/AISM"
-  local launcher="$app_dir/bin/aism"
+  local env_file="$app_dir/.env"
   local master_unit="/etc/systemd/system/aism-master.service"
   local slave_unit="/etc/systemd/system/aism-slave.service"
+  local slave_after="network-online.target"
+  local systemd_app_dir=""
+  local systemd_env_file=""
+  local systemd_master_resources=""
+  local systemd_slave_resources=""
+  local systemd_jar=""
+  local systemd_master_host=""
+
+  systemd_app_dir="$(quote_systemd_value "$app_dir")"
+  systemd_env_file="$(quote_systemd_value "$env_file")"
+  systemd_master_resources="$(quote_systemd_value "$app_dir/master/installer-resources")"
+  systemd_slave_resources="$(quote_systemd_value "$app_dir/slave/installer-resources")"
+  systemd_jar="$(quote_systemd_value "$app_dir/amcs-installer.jar")"
+
+  if [[ "$slave_enabled" == "1" ]]; then
+    [[ -n "$master_host" ]] || {
+      echo "[$(ts)] ERROR: AISM SLAVE wymaga adresu MASTER."
+      exit 1
+    }
+    systemd_master_host="$(quote_systemd_value "$master_host")"
+  fi
+
+  if [[ "$master_enabled" != "1" ]]; then
+    disable_aism_unselected_role "master" "AISM Installer Master"
+  fi
+
+  if [[ "$slave_enabled" != "1" ]]; then
+    disable_aism_unselected_role "slave" "AISM Installer Slave"
+  fi
 
   if [[ "$master_enabled" == "1" ]]; then
     cat > "$master_unit" <<EOF_AISM_MASTER_UNIT
@@ -3053,9 +2922,9 @@ Wants=network-online.target
 Type=simple
 User=$TARGET_USER
 Group=$TARGET_USER
-WorkingDirectory=$app_dir
-EnvironmentFile=$app_dir/master/.env
-ExecStart=$launcher run-master
+WorkingDirectory=$systemd_app_dir
+EnvironmentFile=$systemd_env_file
+ExecStart=/usr/bin/java -Dapplication.installer.resources.dir=$systemd_master_resources -Dspring.profiles.active=master,linux,is -Dserver.port=$server_port -jar $systemd_jar
 Restart=on-failure
 RestartSec=5
 
@@ -3068,19 +2937,23 @@ EOF_AISM_MASTER_UNIT
   fi
 
   if [[ "$slave_enabled" == "1" ]]; then
+    if [[ "$master_enabled" == "1" ]]; then
+      slave_after="network-online.target aism-master.service"
+    fi
+
     cat > "$slave_unit" <<EOF_AISM_SLAVE_UNIT
 [Unit]
 Description=AISM Installer Slave
-After=network-online.target
+After=$slave_after
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=$TARGET_USER
 Group=$TARGET_USER
-WorkingDirectory=$app_dir
-EnvironmentFile=$app_dir/slave/.env
-ExecStart=$launcher run-slave
+WorkingDirectory=$systemd_app_dir
+EnvironmentFile=$systemd_env_file
+ExecStart=/usr/bin/java -Dspring.profiles.active=linux,slave,is -Dapplication.installer.resources.dir=$systemd_slave_resources -Dapplication.installer.master.host=$systemd_master_host -Dapplication.installer.master.cluster-port=5701 -Dapplication.installer.master.resources-port=$server_port -jar $systemd_jar
 Restart=on-failure
 RestartSec=5
 
@@ -3093,12 +2966,23 @@ EOF_AISM_SLAVE_UNIT
   fi
 
   systemctl daemon-reload
+
+  if [[ "$master_enabled" == "1" ]]; then
+    systemctl enable --now aism-master.service
+    add_summary "AISM systemd enabled: aism-master.service"
+  fi
+
+  if [[ "$slave_enabled" == "1" ]]; then
+    systemctl enable --now aism-slave.service
+    add_summary "AISM systemd enabled: aism-slave.service"
+  fi
 }
 
 configure_aism_master_firewall() {
+  local server_port="${1:-8089}"
   local firewall_cmd=""
   local port changed=0 port_error=0
-  local ports=("8089/tcp" "5701/tcp")
+  local ports=("${server_port}/tcp" "5701/tcp")
   local query_rc=0
   local add_rc=0
 
@@ -3127,21 +3011,24 @@ configure_aism_master_firewall() {
       echo "[$(ts)] OK: firewalld public already allows $port"
     elif [[ "$query_rc" -eq 1 ]]; then
       echo "[$(ts)] ACTION: firewall-cmd --permanent --zone=public --add-port=$port"
+
       if "$firewall_cmd" --permanent --zone=public --add-port="$port" >/dev/null 2>&1; then
         add_rc=0
       else
         add_rc=$?
       fi
+
       if [[ "$add_rc" -ne 0 ]]; then
         echo "[$(ts)] SKIP: firewalld add-port failed for $port."
-        add_summary "AISM firewall: SKIP (add-port failed; 8089/tcp + 5701/tcp)"
+        add_summary "AISM firewall: SKIP (add-port failed: $port)"
         port_error=1
         break
       fi
+
       changed=1
     else
       echo "[$(ts)] SKIP: firewalld query failed for $port."
-      add_summary "AISM firewall: SKIP (query failed; 8089/tcp + 5701/tcp)"
+      add_summary "AISM firewall: SKIP (query failed: $port)"
       port_error=1
       break
     fi
@@ -3149,18 +3036,20 @@ configure_aism_master_firewall() {
 
   if [[ "$changed" == "1" ]]; then
     echo "[$(ts)] ACTION: firewall-cmd --reload"
+
     if ! "$firewall_cmd" --reload >/dev/null 2>&1; then
       echo "[$(ts)] SKIP: firewalld reload failed."
-      add_summary "AISM firewall: SKIP (reload failed; 8089/tcp + 5701/tcp)"
+      add_summary "AISM firewall: SKIP (reload failed)"
       return 0
     fi
+
     if [[ "$port_error" == "0" ]]; then
-      add_summary "AISM firewall public: ports added successfully (8089/tcp + 5701/tcp)"
+      add_summary "AISM firewall public: ports ready (${server_port}/tcp + 5701/tcp)"
     fi
   elif [[ "$port_error" == "1" ]]; then
     return 0
   else
-    add_summary "AISM firewall public: ports already set (8089/tcp + 5701/tcp)"
+    add_summary "AISM firewall public: ports already set (${server_port}/tcp + 5701/tcp)"
   fi
 }
 
@@ -3180,6 +3069,7 @@ install_aism_step() {
   local master_enabled=0
   local slave_enabled=0
   local slave_master_host=""
+  local server_port="8089"
 
   if [[ "$UPDATE_ONLY_MODE" == "1" ]]; then
     add_summary "AISM: skip (update-only mode)"
@@ -3192,7 +3082,10 @@ install_aism_step() {
   fi
 
   ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
-  [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+  [[ -n "${ITGO_HOME:-}" ]] || {
+    echo "[$(ts)] ERROR: cannot resolve home"
+    exit 1
+  }
 
   UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
 
@@ -3204,30 +3097,39 @@ install_aism_step() {
 
   install_aism_runtime_dirs
   ensure_amcs_java_runtime
-  install_aism_launcher
+  install_aism_shared_config
+
+  server_port="$(prompt_aism_server_port)"
 
   if prompt_yn "AISM: skonfigurować rolę MASTER?" "Y"; then
     master_enabled=1
-    install_aism_master_config
-    configure_aism_master_firewall
+    configure_aism_master_firewall "$server_port"
   fi
 
   if prompt_yn "AISM: skonfigurować rolę SLAVE?" "N"; then
     slave_enabled=1
     slave_master_host="$(prompt_aism_slave_master_host)"
-    install_aism_slave_config "$slave_master_host"
   fi
 
   if [[ "$master_enabled" == "0" && "$slave_enabled" == "0" ]]; then
+    install_aism_systemd_units \
+      "$master_enabled" \
+      "$slave_enabled" \
+      "$slave_master_host" \
+      "$server_port"
     echo "[$(ts)] WARN: AISM wybrany, ale nie skonfigurowano żadnej roli."
     add_summary "AISM: no role configured"
     return 0
   fi
 
-  install_aism_systemd_units "$master_enabled" "$slave_enabled"
+  install_aism_systemd_units \
+    "$master_enabled" \
+    "$slave_enabled" \
+    "$slave_master_host" \
+    "$server_port"
 
   echo "[$(ts)] OK: AISM done."
-  add_summary "AISM roles: master=$master_enabled slave=$slave_enabled"
+  add_summary "AISM roles: master=$master_enabled slave=$slave_enabled port=$server_port"
 }
 install_downloader_app_script() {
   local src="${1:?}"
