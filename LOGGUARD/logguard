@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VERSION_FILE="$INSTALL_DIR/logguard.version"
 CONFIG_FILE="$INSTALL_DIR/config/logguard.conf"
+PLATFORMS_FILE="$INSTALL_DIR/config/platforms.conf"
 MAX_PLATFORM_DEPTH=5
 MAX_LOG_DEPTH=10
 
@@ -104,6 +105,16 @@ technical_path() {
   return 1
 }
 
+platform_name_valid() {
+  local name="${1##*/}" lower
+  lower="${name,,}"
+  [[ "$lower" == integrationplatform || "$lower" == integrationplatform_* ]]
+}
+
+path_in_archive_root() {
+  [[ "$1" == "$ARCHIVE_ROOT" || "$1" == "$ARCHIVE_ROOT"/* ]]
+}
+
 find_platforms() {
   local base path
   local -a sorted=()
@@ -111,11 +122,44 @@ find_platforms() {
   for base in /srv /opt; do
     [[ -r "$base" && -d "$base" ]] || continue
     while IFS= read -r -d '' path; do
-      technical_path "$path" || PLATFORMS+=("$path")
-    done < <(find -P "$base" -xdev -maxdepth "$MAX_PLATFORM_DEPTH" -type d \( -iname integrationplatform -o -iname 'integrationplatform_*' \) -print0 2>/dev/null || true)
+      technical_path "$path" || path_in_archive_root "$path" || PLATFORMS+=("$path")
+    done < <(
+      if [[ "$base" == /srv ]]; then
+        find -P "$base" -xdev -maxdepth "$MAX_PLATFORM_DEPTH" \( -path /srv/BackupLog -prune \) -o \( -type d \( -iname integrationplatform -o -iname 'integrationplatform_*' \) -print0 \) 2>/dev/null || true
+      else
+        find -P "$base" -xdev -maxdepth "$MAX_PLATFORM_DEPTH" -type d \( -iname integrationplatform -o -iname 'integrationplatform_*' \) -print0 2>/dev/null || true
+      fi
+    )
   done
   if (( ${#PLATFORMS[@]} > 0 )); then
     while IFS= read -r -d '' path; do sorted+=("$path"); done < <(printf '%s\0' "${PLATFORMS[@]}" | sort -z -u)
+    PLATFORMS=("${sorted[@]}")
+  fi
+}
+
+load_platforms() {
+  local line path canonical
+  local -a loaded=() sorted=()
+  PLATFORMS=()
+  [[ -f "$PLATFORMS_FILE" ]] || { fail "mode=${MODE:-STATUS} action=PLATFORMS_CONFIG_FAILED reason=missing_config file=$PLATFORMS_FILE"; return 1; }
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#${line%%[![:space:]]*}}"
+    line="${line%${line##*[![:space:]]}}"
+    [[ -z "$line" || "${line:0:1}" == '#' ]] && continue
+    [[ "$line" == /* ]] || { fail "mode=$MODE action=PLATFORMS_CONFIG_FAILED reason=not_absolute path=$line"; return 1; }
+    path_in_archive_root "$line" && { fail "mode=$MODE action=PLATFORMS_CONFIG_FAILED reason=archive_root path=$line"; return 1; }
+    [[ ! -L "$line" && -d "$line" ]] || { fail "mode=$MODE action=PLATFORMS_CONFIG_FAILED reason=not_directory path=$line"; return 1; }
+    canonical="$(readlink -f -- "$line" 2>/dev/null || true)"
+    [[ -n "$canonical" && "$canonical" == "$line" ]] || { fail "mode=$MODE action=PLATFORMS_CONFIG_FAILED reason=noncanonical_path path=$line"; return 1; }
+    path_in_archive_root "$canonical" && { fail "mode=$MODE action=PLATFORMS_CONFIG_FAILED reason=archive_root path=$line"; return 1; }
+    platform_name_valid "$canonical" || { fail "mode=$MODE action=PLATFORMS_CONFIG_FAILED reason=invalid_name path=$line"; return 1; }
+    technical_path "$canonical" && { fail "mode=$MODE action=PLATFORMS_CONFIG_FAILED reason=technical_path path=$line"; return 1; }
+    loaded+=("$canonical")
+  done < "$PLATFORMS_FILE"
+
+  if (( ${#loaded[@]} > 0 )); then
+    while IFS= read -r -d '' path; do sorted+=("$path"); done < <(printf '%s\0' "${loaded[@]}" | sort -z -u)
     PLATFORMS=("${sorted[@]}")
   fi
 }
@@ -160,7 +204,8 @@ find_candidates() {
   done
 }
 
-discover() { find_platforms; find_candidates; }
+discover() { find_platforms; }
+load_candidates() { load_platforms && find_candidates; }
 
 table() {
   local i
@@ -441,19 +486,111 @@ plan_one() {
   esac
 }
 
+show_platforms() {
+  local path
+  printf 'MONITORED_PLATFORMS: %s\n' "${#PLATFORMS[@]}"
+  for path in "${PLATFORMS[@]}"; do printf ' - %s\n' "$path"; done
+}
+
+show_discovered_platforms() {
+  local i
+  printf 'Detected Integration Platforms:\n'
+  if (( ${#PLATFORMS[@]} == 0 )); then
+    printf '  (none)\n'
+    return
+  fi
+  for i in "${!PLATFORMS[@]}"; do printf '  [%s] %s\n' "$((i + 1))" "${PLATFORMS[$i]}"; done
+}
+
+select_platforms() {
+  local answer item index selected duplicate
+  SELECTED_PLATFORMS=()
+  while :; do
+    SELECTED_PLATFORMS=()
+    printf 'Select monitored platforms (ENTER=all, numbers separated by spaces, NONE=none): '
+    IFS= read -r answer || return 1
+    answer="${answer#${answer%%[![:space:]]*}}"
+    answer="${answer%${answer##*[![:space:]]}}"
+    if [[ -z "$answer" ]]; then
+      SELECTED_PLATFORMS=("${PLATFORMS[@]}")
+      return 0
+    fi
+    if [[ "${answer^^}" == NONE ]]; then
+      return 0
+    fi
+    for item in $answer; do
+      [[ "$item" =~ ^[0-9]+$ ]] || { printf 'ERROR: use ENTER, NONE, or valid numbers.\n' >&2; continue 2; }
+      index=$((10#$item - 1))
+      (( index >= 0 && index < ${#PLATFORMS[@]} )) || { printf 'ERROR: invalid platform number: %s\n' "$item" >&2; continue 2; }
+      duplicate=0
+      for selected in "${SELECTED_PLATFORMS[@]}"; do
+        [[ "$selected" == "${PLATFORMS[$index]}" ]] && { duplicate=1; break; }
+      done
+      (( duplicate )) || SELECTED_PLATFORMS+=("${PLATFORMS[$index]}")
+    done
+    return 0
+  done
+}
+
+write_platforms() {
+  local temporary owner
+  owner="$(priv stat -c %u:%g -- "$PLATFORMS_FILE" 2>/dev/null || priv stat -c %u:%g -- "${PLATFORMS_FILE%/*}" 2>/dev/null || true)"
+  [[ -n "$owner" ]] || { fail "mode=$MODE action=PLATFORMS_CONFIG_FAILED reason=owner"; return 1; }
+  temporary="$(priv mktemp "${PLATFORMS_FILE}.tmp.XXXXXX" 2>/dev/null || true)"
+  [[ -n "$temporary" ]] || { fail "mode=$MODE action=PLATFORMS_CONFIG_FAILED reason=temp_create"; return 1; }
+  if ! printf '%s\n' "${SELECTED_PLATFORMS[@]}" | priv tee "$temporary" >/dev/null \
+     || ! priv chown "$owner" -- "$temporary" \
+     || ! priv chmod 0600 -- "$temporary" \
+     || ! priv mv -f -- "$temporary" "$PLATFORMS_FILE"; then
+    fail "mode=$MODE action=PLATFORMS_CONFIG_FAILED reason=write"
+    priv rm -f -- "$temporary" || true
+    return 1
+  fi
+}
+
+platforms() {
+  MODE=PLATFORMS; load_config || return 1; load_platforms || return 1; show_platforms
+}
+
+platforms_rescan() {
+  local path
+  MODE=PLATFORMS_RESCAN; load_config || return 1
+  [[ -t 0 && -t 1 ]] || { fail 'mode=PLATFORMS_RESCAN action=PLATFORMS_RESCAN_FAILED reason=interactive_terminal_required'; return 1; }
+  if [[ -f "$PLATFORMS_FILE" ]]; then
+    if load_platforms; then
+      printf 'Currently monitored platforms:\n'
+      show_platforms
+    else
+      write_log WARN "mode=$MODE action=PLATFORMS_CONFIG_INVALID file=$PLATFORMS_FILE"
+    fi
+  fi
+  discover
+  show_discovered_platforms
+  select_platforms || { fail 'mode=PLATFORMS_RESCAN action=PLATFORMS_RESCAN_FAILED reason=selection'; return 1; }
+  printf 'Selected monitored platforms:\n'
+  if (( ${#SELECTED_PLATFORMS[@]} == 0 )); then printf '  (none)\n'; else for path in "${SELECTED_PLATFORMS[@]}"; do printf '  %s\n' "$path"; done; fi
+  write_platforms || return 1
+  if (( ${#SELECTED_PLATFORMS[@]} > 0 )); then
+    priv systemctl enable --now logguard.timer || { fail 'mode=PLATFORMS_RESCAN action=TIMER_ENABLE_FAILED'; return 1; }
+  else
+    priv systemctl disable --now logguard.timer || { fail 'mode=PLATFORMS_RESCAN action=TIMER_DISABLE_FAILED'; return 1; }
+  fi
+  write_log INFO "mode=$MODE action=PLATFORMS_RESCAN_OK count=${#SELECTED_PLATFORMS[@]}"
+}
+
 status() {
-  MODE=STATUS; load_config || return 1; discover
-  printf 'LOGGUARD_VERSION: %s\nARCHIVE_ROOT: %s\nCATALINA_THRESHOLD_MIB: %s\nINTEGRATION_PLATFORMS: %s\nROOT_EXECUTION: %s\nSUDO_PRESENT: %s\nSUDO_NONINTERACTIVE: %s\nTIMER_ENABLED: %s\nTIMER_ACTIVE: %s\nTIMER_NEXT: %s\n' \
+  MODE=STATUS; load_config || return 1; load_platforms || return 1
+  printf 'LOGGUARD_VERSION: %s\nARCHIVE_ROOT: %s\nCATALINA_THRESHOLD_MIB: %s\nMONITORED_PLATFORMS: %s\nROOT_EXECUTION: %s\nSUDO_PRESENT: %s\nSUDO_NONINTERACTIVE: %s\nTIMER_ENABLED: %s\nTIMER_ACTIVE: %s\nTIMER_NEXT: %s\n' \
     "$(version)" "$ARCHIVE_ROOT" "$CATALINA_THRESHOLD_MIB" "${#PLATFORMS[@]}" \
     "$(root_execution && echo yes || echo no)" "$(sudo_present && echo yes || echo no)" "$(sudo_noninteractive && echo yes || echo no)" \
     "$(timer_enabled && echo yes || echo no)" "$(timer_active && echo yes || echo no)" "$(timer_next)"
 }
 
-scan() { MODE=SCAN; load_config || return 1; discover; table; }
+scan() { MODE=SCAN; load_config || return 1; load_candidates || return 1; table; }
 
 plan() {
   local i
-  MODE=DRY_RUN; load_config || return 1; init_log; discover
+  MODE=DRY_RUN; load_config || return 1; init_log; load_candidates || return 1
   for i in "${!CANDIDATE_FILES[@]}"; do plan_one "$i"; done
   runlog_retention
   plan_retention
@@ -473,7 +610,7 @@ run() {
     return 1
   fi
   runlog_retention
-  discover
+  load_candidates || { write_log ERROR "mode=RUN action=RUN_END result=ERROR errors=$ERRORS"; return 1; }
   for i in "${!CANDIDATE_FILES[@]}"; do
     case "${CANDIDATE_TYPES[$i]}" in
       ACTIVE_CATALINA)
@@ -489,13 +626,15 @@ run() {
   (( ERRORS == 0 )) && write_log INFO 'mode=RUN action=RUN_END result=OK' || { write_log ERROR "mode=RUN action=RUN_END result=ERROR errors=$ERRORS"; return 1; }
 }
 
-help() { printf '%s\n' 'Usage: logguard [status|scan|plan|run|version|help]' 'status and scan are read-only; plan is dry-run; run performs explicit verified operations.'; }
+help() { printf '%s\n' 'Usage: logguard [status|scan|plan|run|platforms|platforms-rescan|version|help]' 'status and scan are read-only; plan is dry-run; run performs explicit verified operations.'; }
 
 case "${1:-status}" in
   status) status ;;
   scan) scan ;;
   plan) plan ;;
   run) run ;;
+  platforms) platforms ;;
+  platforms-rescan) platforms_rescan ;;
   version) version ;;
   help|-h|--help) help ;;
   *) printf 'ERROR: unknown command: %s\n' "$1" >&2; exit 2 ;;

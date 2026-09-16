@@ -14,6 +14,88 @@ ITGO_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"; TARGET_GROUP="$(id -g
 [[ -d "$ITGO_HOME" ]] || { printf 'ERROR: home directory is unavailable.\n' >&2; exit 1; }
 INSTALL_DIR="$ITGO_HOME/UTILITY/LOGGUARD"
 SYSTEM_WRAPPER=/usr/local/sbin/itgo-logguard-run
+PLATFORMS_FILE="$INSTALL_DIR/config/platforms.conf"
+PLATFORMS_CONFIG_EXISTED=0
+[[ -e "$PLATFORMS_FILE" ]] && PLATFORMS_CONFIG_EXISTED=1
+
+platform_is_technical() {
+  local component lower
+  local -a components=()
+  IFS=/ read -r -a components <<< "$1"
+  for component in "${components[@]}"; do
+    lower="${component,,}"
+    [[ "$lower" == *_new || "$lower" == *_old ]] && return 0
+  done
+  return 1
+}
+
+discover_platforms() {
+  local base path
+  local -a found=() sorted=()
+  DISCOVERED_PLATFORMS=()
+  for base in /srv /opt; do
+    [[ -d "$base" && -r "$base" ]] || continue
+    while IFS= read -r -d '' path; do
+      [[ "$path" == /srv/BackupLog || "$path" == /srv/BackupLog/* ]] && continue
+      platform_is_technical "$path" || found+=("$path")
+    done < <(
+      if [[ "$base" == /srv ]]; then
+        find -P "$base" -xdev -maxdepth 5 \( -path /srv/BackupLog -prune \) -o \( -type d \( -iname integrationplatform -o -iname 'integrationplatform_*' \) -print0 \) 2>/dev/null || true
+      else
+        find -P "$base" -xdev -maxdepth 5 -type d \( -iname integrationplatform -o -iname 'integrationplatform_*' \) -print0 2>/dev/null || true
+      fi
+    )
+  done
+  if (( ${#found[@]} > 0 )); then
+    while IFS= read -r -d '' path; do sorted+=("$path"); done < <(printf '%s\0' "${found[@]}" | sort -z -u)
+    DISCOVERED_PLATFORMS=("${sorted[@]}")
+  fi
+}
+
+select_initial_platforms() {
+  local answer item index i selected duplicate
+  SELECTED_PLATFORMS=()
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    printf 'WARNING: no interactive terminal; writing empty LOGGUARD platforms.conf and leaving monitoring inactive.\n' >&2
+    return 0
+  fi
+  printf 'Detected Integration Platforms:\n'
+  if (( ${#DISCOVERED_PLATFORMS[@]} == 0 )); then
+    printf '  (none)\n'
+  else
+    for i in "${!DISCOVERED_PLATFORMS[@]}"; do printf '  [%s] %s\n' "$((i + 1))" "${DISCOVERED_PLATFORMS[$i]}"; done
+  fi
+  while :; do
+    SELECTED_PLATFORMS=()
+    printf 'Select monitored platforms (ENTER=all, numbers separated by spaces, NONE=none): '
+    IFS= read -r answer || { printf 'WARNING: selection unavailable; writing empty configuration.\n' >&2; return 0; }
+    answer="${answer#${answer%%[![:space:]]*}}"; answer="${answer%${answer##*[![:space:]]}}"
+    if [[ -z "$answer" ]]; then SELECTED_PLATFORMS=("${DISCOVERED_PLATFORMS[@]}"); break; fi
+    [[ "${answer^^}" == NONE ]] && break
+    for item in $answer; do
+      [[ "$item" =~ ^[0-9]+$ ]] || { printf 'ERROR: use ENTER, NONE, or valid numbers.\n' >&2; continue 2; }
+      index=$((10#$item - 1))
+      (( index >= 0 && index < ${#DISCOVERED_PLATFORMS[@]} )) || { printf 'ERROR: invalid platform number: %s\n' "$item" >&2; continue 2; }
+      duplicate=0
+      for selected in "${SELECTED_PLATFORMS[@]}"; do
+        [[ "$selected" == "${DISCOVERED_PLATFORMS[$index]}" ]] && { duplicate=1; break; }
+      done
+      (( duplicate )) || SELECTED_PLATFORMS+=("${DISCOVERED_PLATFORMS[$index]}")
+    done
+    break
+  done
+  printf 'Selected monitored platforms:\n'
+  if (( ${#SELECTED_PLATFORMS[@]} == 0 )); then printf '  (none)\n'; else printf '  %s\n' "${SELECTED_PLATFORMS[@]}"; fi
+}
+
+write_initial_platforms() {
+  local temporary
+  temporary="$(mktemp "${PLATFORMS_FILE}.tmp.XXXXXX")"
+  printf '%s\n' "${SELECTED_PLATFORMS[@]}" > "$temporary"
+  chown "$TARGET_USER:$TARGET_GROUP" "$temporary"
+  chmod 0600 "$temporary"
+  mv -f -- "$temporary" "$PLATFORMS_FILE"
+}
 
 if (( UNINSTALL )); then
   if command -v systemctl >/dev/null 2>&1; then
@@ -36,6 +118,11 @@ chown -R "$TARGET_USER:$TARGET_GROUP" "$INSTALL_DIR"
 find "$INSTALL_DIR" -type d -exec chmod 0700 {} +
 find "$INSTALL_DIR" -type f -exec chmod 0600 {} +
 chmod 0700 "$INSTALL_DIR/bin/logguard"
+if (( ! PLATFORMS_CONFIG_EXISTED )); then
+  discover_platforms
+  select_initial_platforms
+  write_initial_platforms
+fi
 install -o root -g root -m 0755 /dev/stdin "$SYSTEM_WRAPPER" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail 2>/dev/null || set -eu
@@ -71,5 +158,11 @@ Unit=logguard.service
 WantedBy=timers.target
 EOF
 systemctl daemon-reload
-systemctl enable --now logguard.timer
+if (( ! PLATFORMS_CONFIG_EXISTED )); then
+  if (( ${#SELECTED_PLATFORMS[@]} > 0 )); then
+    systemctl enable --now logguard.timer
+  else
+    systemctl disable --now logguard.timer 2>/dev/null || true
+  fi
+fi
 "$INSTALL_DIR/bin/logguard" version

@@ -1,10 +1,10 @@
 # LOGGUARD
 
-LOGGUARD autonomously protects `catalina.out` for every detected `IntegrationPlatform` and `IntegrationPlatform_*` installation. Discovery scans only `/srv` and `/opt`, uses `find -P`, does not follow symlinks, and ignores any `_NEW` or `_OLD` path component.
+LOGGUARD protects `catalina.out` only for explicitly configured `IntegrationPlatform` and `IntegrationPlatform_*` installations. The first installation discovers candidates under `/srv` and `/opt` and asks the administrator to select them; the resulting list is stored in `config/platforms.conf`. Normal `status`, `scan`, `plan`, and `run` use only that list. Discovery uses `find -P`, does not follow symlinks, ignores `_NEW` and `_OLD` path components, and always excludes `/srv/BackupLog` and its subtree.
 
 ## Installation and layout
 
-The installer creates the private `$HOME/UTILITY/LOGGUARD` layout: `bin`, `config`, `state`, `logs/runs`, and the technical `archive` directory. It preserves an existing `config/logguard.conf` during updates. It also installs root-owned `logguard.service`, `logguard.timer`, and the technical `/usr/local/sbin/itgo-logguard-run` wrapper, enabling the timer immediately. The wrapper is the systemd execution entry point and calls the installed launcher. The timer runs five minutes after boot and then every 30 minutes.
+The installer creates the private `$HOME/UTILITY/LOGGUARD` layout: `bin`, `config`, `state`, `logs/runs`, and the technical `archive` directory. It preserves `config/logguard.conf` and `config/platforms.conf` during updates. On a first interactive installation it saves the selected platform paths with mode `0600`; without an interactive terminal it saves an empty list, warns the administrator, and leaves the timer disabled. The installer also installs root-owned `logguard.service`, `logguard.timer`, and the technical `/usr/local/sbin/itgo-logguard-run` wrapper. The timer runs five minutes after boot and then every 30 minutes.
 
 The default `CATALINA_THRESHOLD_MIB` is 512 MiB. `/srv/BackupLog` is created only when a run needs it; `--uninstall` removes the LOGGUARD installation, systemd units, and wrapper, but never `/srv/BackupLog` or its archives.
 
@@ -15,11 +15,13 @@ The default `CATALINA_THRESHOLD_MIB` is 512 MiB. `/srv/BackupLog` is created onl
 ~/UTILITY/LOGGUARD/bin/logguard scan
 ~/UTILITY/LOGGUARD/bin/logguard plan
 ~/UTILITY/LOGGUARD/bin/logguard run
+~/UTILITY/LOGGUARD/bin/logguard platforms
+~/UTILITY/LOGGUARD/bin/logguard platforms-rescan
 ~/UTILITY/LOGGUARD/bin/logguard version
 ~/UTILITY/LOGGUARD/bin/logguard help
 ```
 
-`status` reports version, configuration, privilege mode, timer state, and discovered-platform count. `scan` is entirely read-only and prints platform, type, path, size, owner, and strategy. `plan` is dry-run: it changes nothing and records `WOULD_*` actions. `run` remains available for manual operation; the systemd service runs it as root automatically.
+`status` reports version, configuration, privilege mode, timer state, and monitored-platform count. `scan` is entirely read-only and prints platform, type, path, size, owner, and strategy for configured platforms only. `plan` is dry-run: it changes nothing and records `WOULD_*` actions. `run` remains available for manual operation; the systemd service runs it as root automatically. `platforms` prints the saved list. `platforms-rescan` requires an interactive terminal, discovers candidates for administrator selection, atomically rewrites `config/platforms.conf`, and enables or disables the timer according to whether the final list is non-empty.
 
 ## Handling and safety
 
