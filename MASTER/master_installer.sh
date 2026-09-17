@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.109"
+MASTER_VERSION="1.2.110"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.25"
@@ -3028,6 +3028,7 @@ install_aism_systemd_units() {
   local master_unit="/etc/systemd/system/aism-master.service"
   local slave_unit="/etc/systemd/system/aism-slave.service"
   local slave_after="network-online.target"
+  local slave_requires=""
   local systemd_master_resources=""
   local systemd_slave_resources=""
   local systemd_jar=""
@@ -3081,12 +3082,14 @@ EOF_AISM_MASTER_UNIT
   if [[ "$slave_enabled" == "1" ]]; then
     if [[ "$master_enabled" == "1" ]]; then
       slave_after="network-online.target aism-master.service"
+      slave_requires="Requires=aism-master.service"
     fi
 
     cat > "$slave_unit" <<EOF_AISM_SLAVE_UNIT
 [Unit]
 Description=AISM Installer Slave
 After=$slave_after
+$slave_requires
 Wants=network-online.target
 
 [Service]
@@ -3095,6 +3098,7 @@ User=$TARGET_USER
 Group=$TARGET_USER
 WorkingDirectory=$app_dir
 EnvironmentFile=$env_file
+ExecStartPre=/usr/bin/bash -c "for attempt in \$\$(seq 1 60); do if [ \"\$\$(/usr/bin/curl --silent --output /dev/null --write-out %%{http_code} --connect-timeout 2 --max-time 2 http://$master_host:$server_port/)\" = \"200\" ]; then exit 0; fi; sleep 1; done; exit 1"
 ExecStart=/usr/bin/java -Dspring.profiles.active=linux,slave,is -Dapplication.installer.resources.dir=$systemd_slave_resources -Dapplication.installer.master.host=$systemd_master_host -Dapplication.installer.master.cluster-port=5701 -Dapplication.installer.master.resources-port=$server_port -jar $systemd_jar
 Restart=on-failure
 RestartSec=5
