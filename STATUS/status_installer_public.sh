@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.24"
+VERSION="3.12.25"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -966,9 +966,9 @@ p1cert_vf="$HOME/UTILITY/P1CERT/p1cert.version"
 p1cert_state="$HOME/UTILITY/P1CERT/state/p1cert-state"
 
 amcs_launcher="$HOME/UTILITY/AMCS/AMCS"
-aism_launcher="$HOME/UTILITY/AISM/bin/aism"
-aism_master_env="$HOME/UTILITY/AISM/master/.env"
-aism_slave_env="$HOME/UTILITY/AISM/slave/.env"
+aism_jar="$HOME/UTILITY/AISM/amcs-installer.jar"
+aism_master_unit="/etc/systemd/system/aism-master.service"
+aism_slave_unit="/etc/systemd/system/aism-slave.service"
 cp_upg_launcher="$HOME/UTILITY/TOOLS/cp-upg"
 
 status_installed="$(module_state "$status_vf")"
@@ -1427,16 +1427,16 @@ aism_details="-"
 aism_master_present=0
 aism_slave_present=0
 
-if [[ -x "$aism_launcher" ]]; then
+if [[ -f "$aism_master_unit" ]] && grep -Fqx "Description=AISM Installer Master" "$aism_master_unit" 2>/dev/null; then
+  aism_master_present=1
+fi
+
+if [[ -f "$aism_slave_unit" ]] && grep -Fqx "Description=AISM Installer Slave" "$aism_slave_unit" 2>/dev/null; then
+  aism_slave_present=1
+fi
+
+if [[ -s "$aism_jar" || "$aism_master_present" == "1" || "$aism_slave_present" == "1" ]]; then
   aism_component="YES"
-
-  if [[ -f "$aism_master_env" || -f /etc/systemd/system/aism-master.service ]]; then
-    aism_master_present=1
-  fi
-
-  if [[ -f "$aism_slave_env" || -f /etc/systemd/system/aism-slave.service ]]; then
-    aism_slave_present=1
-  fi
 
   if [[ "$aism_master_present" == "1" && "$aism_slave_present" == "1" ]]; then
     aism_details="master+slave"
@@ -1445,7 +1445,7 @@ if [[ -x "$aism_launcher" ]]; then
   elif [[ "$aism_slave_present" == "1" ]]; then
     aism_details="slave"
   else
-    aism_details="launcher only"
+    aism_details="files only"
   fi
 fi
 
