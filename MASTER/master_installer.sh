@@ -37,10 +37,10 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.108"
+MASTER_VERSION="1.2.109"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
-STATUS_VERSION="3.12.24"
+STATUS_VERSION="3.12.25"
 CLEANUP_VERSION="1.0.3"
 TSEQ_VERSION="3.12.9"
 DOWNLOADER_APP_VERSION="1.0.7"
@@ -2849,104 +2849,122 @@ EOF_AISM_ENV
   chmod 0600 "$env_file" 2>/dev/null || true
 }
 
-activate_aism_secret() {
+ensure_aism_secret_value() {
   local env_file="${1:?}"
   local key="${2:?}"
   local label="${3:?}"
-  local value=""
   local active_value=""
+  local commented_value=""
+  local selected_state=""
+  local selected_value=""
   local env_tmp=""
 
   active_value="$(awk -v key="$key" '
-    function has_value(line, raw) {
-      if (substr(line, 1, length(key) + 1) != key "=") {
-        return 0
-      }
-      raw = substr(line, length(key) + 2)
+    function is_configured(raw) {
       gsub(/^[[:space:]]+/, "", raw)
       gsub(/[[:space:]]+$/, "", raw)
       return raw != "" && raw != "\047\047" && raw != "\042\042"
     }
-    has_value($0) {
-      print substr($0, length(key) + 2)
-      exit
+    substr($0, 1, length(key) + 1) == key "=" {
+      value = substr($0, length(key) + 2)
+      if (is_configured(value)) {
+        print value
+        exit
+      }
     }
   ' "$env_file")"
-  active_value="${active_value#"${active_value%%[![:space:]]*}"}"
-  active_value="${active_value%"${active_value##*[![:space:]]}"}"
 
-  if [[ -n "$active_value" && "$active_value" != "''" && "$active_value" != '""' ]]; then
-    return 0
-  fi
-
-  value="$(prompt_aism_secret_value "$label")" || exit 1
-  env_tmp="$(mktemp)"
-  awk -v key="$key" -v value="$value" '
-    function is_empty_active(line, raw) {
-      if (substr(line, 1, length(key) + 1) != key "=") {
-        return 0
-      }
-      raw = substr(line, length(key) + 2)
+  commented_value="$(awk -v key="$key" '
+    function is_configured(raw) {
       gsub(/^[[:space:]]+/, "", raw)
       gsub(/[[:space:]]+$/, "", raw)
-      return raw == "" || raw == "\047\047" || raw == "\042\042"
+      return raw != "" && raw != "\047\047" && raw != "\042\042"
     }
-    $0 == "#" key "=" || is_empty_active($0) {
-      if (!updated) {
-        print key "='\''" value "'\''"
-        updated=1
-      }
-      next
-    }
-    { print }
-    END {
-      if (!updated) {
-        print key "='\''" value "'\''"
+    substr($0, 1, length(key) + 2) == "#" key "=" {
+      value = substr($0, length(key) + 3)
+      if (is_configured(value)) {
+        print value
+        exit
       }
     }
-  ' "$env_file" > "$env_tmp"
-  cat "$env_tmp" > "$env_file"
-  rm -f "$env_tmp"
-}
+  ' "$env_file")"
 
-activate_aism_context_path() {
-  local env_file="${1:?}"
-  local env_tmp=""
-
-  grep -q '^APP_CONTEXT_PATH=' "$env_file" && return 0
+  if [[ -n "$active_value" ]]; then
+    selected_state="active"
+    selected_value="$active_value"
+  elif [[ -n "$commented_value" ]]; then
+    selected_state="commented"
+    selected_value="$commented_value"
+  else
+    selected_state="$(awk -v key="$key" '
+      substr($0, 1, length(key) + 1) == key "=" {
+        print "active"
+        exit
+      }
+      substr($0, 1, length(key) + 2) == "#" key "=" {
+        print "commented"
+        exit
+      }
+    ' "$env_file")"
+    selected_state="${selected_state:-commented}"
+    value="$(prompt_aism_secret_value "$label")" || exit 1
+    selected_value="'$value'"
+  fi
 
   env_tmp="$(mktemp)"
-  awk '
-    $0 == "#APP_CONTEXT_PATH='\''/amcs_installer'\''" {
-      print "APP_CONTEXT_PATH='\''/amcs_installer'\''"
-      updated=1
-      next
+  awk -v key="$key" -v selected_state="$selected_state" -v value="$selected_value" '
+    function key_state(line, prefix) {
+      if (substr(line, 1, length(key) + 1) == key "=") {
+        return "active"
+      }
+      prefix = "#" key "="
+      if (substr(line, 1, length(prefix)) == prefix) {
+        return "commented"
+      }
+      return ""
     }
-    { print }
+    {
+      current_state = key_state($0)
+      if (current_state != "") {
+        if (!updated) {
+          if (selected_state == "active") {
+            print key "=" value
+          } else {
+            print "#" key "=" value
+          }
+          updated=1
+        }
+        next
+      }
+      print
+    }
     END {
       if (!updated) {
-        print "APP_CONTEXT_PATH='\''/amcs_installer'\''"
+        if (selected_state == "active") {
+          print key "=" value
+        } else {
+          print "#" key "=" value
+        }
       }
     }
   ' "$env_file" > "$env_tmp"
   cat "$env_tmp" > "$env_file"
   rm -f "$env_tmp"
+  chown "$TARGET_USER:$TARGET_USER" "$env_file" 2>/dev/null || true
+  chmod 0600 "$env_file" 2>/dev/null || true
 }
 
-configure_aism_shared_env() {
+ensure_aism_shared_secret_values() {
   local env_file="$UTILITY_DIR/AISM/.env"
 
-  activate_aism_secret \
+  ensure_aism_secret_value \
     "$env_file" \
     "APPLICATION_INSTALLER_OVERRIDE_PASSWORD" \
     "AISM: APPLICATION_INSTALLER_OVERRIDE_PASSWORD"
-  activate_aism_secret \
+  ensure_aism_secret_value \
     "$env_file" \
     "SSO_JWT_SECRET" \
     "AISM: SSO_JWT_SECRET"
-  activate_aism_context_path "$env_file"
-  chown "$TARGET_USER:$TARGET_USER" "$env_file" 2>/dev/null || true
-  chmod 0600 "$env_file" 2>/dev/null || true
 }
 
 ensure_aism_installer_jar() {
@@ -3222,6 +3240,7 @@ install_aism_step() {
   install_aism_runtime_dirs
   ensure_amcs_java_runtime
   install_aism_shared_config
+  ensure_aism_shared_secret_values
 
   server_port="$(prompt_aism_server_port)"
 
@@ -3247,7 +3266,6 @@ install_aism_step() {
   fi
 
   ensure_aism_installer_jar || exit 1
-  configure_aism_shared_env
 
   install_aism_systemd_units \
     "$master_enabled" \
