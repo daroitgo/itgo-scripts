@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.107"
+MASTER_VERSION="1.2.108"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.24"
@@ -2824,8 +2824,6 @@ quote_systemd_value() {
 install_aism_shared_config() {
   local app_dir="$UTILITY_DIR/AISM"
   local env_file="$app_dir/.env"
-  local override_password=""
-  local sso_jwt_secret=""
 
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
     "$app_dir" \
@@ -2838,13 +2836,10 @@ install_aism_shared_config() {
     echo "[$(ts)] INFO: istniejący AISM .env zachowany bez zmian."
     add_summary "AISM shared config preserved: ~/UTILITY/AISM/.env"
   else
-    override_password="$(prompt_aism_secret_value "AISM: APPLICATION_INSTALLER_OVERRIDE_PASSWORD")" || exit 1
-    sso_jwt_secret="$(prompt_aism_secret_value "AISM: SSO_JWT_SECRET")" || exit 1
-
     cat > "$env_file" <<EOF_AISM_ENV
-APPLICATION_INSTALLER_OVERRIDE_PASSWORD='$override_password'
-SSO_JWT_SECRET='$sso_jwt_secret'
-APP_CONTEXT_PATH='/amcs_installer'
+#APPLICATION_INSTALLER_OVERRIDE_PASSWORD=
+#SSO_JWT_SECRET=
+#APP_CONTEXT_PATH='/amcs_installer'
 EOF_AISM_ENV
 
     add_summary "AISM shared config created: ~/UTILITY/AISM/.env"
@@ -2852,6 +2847,139 @@ EOF_AISM_ENV
 
   chown "$TARGET_USER:$TARGET_USER" "$env_file" 2>/dev/null || true
   chmod 0600 "$env_file" 2>/dev/null || true
+}
+
+activate_aism_secret() {
+  local env_file="${1:?}"
+  local key="${2:?}"
+  local label="${3:?}"
+  local value=""
+  local active_value=""
+  local env_tmp=""
+
+  active_value="$(awk -v key="$key" '
+    function has_value(line, raw) {
+      if (substr(line, 1, length(key) + 1) != key "=") {
+        return 0
+      }
+      raw = substr(line, length(key) + 2)
+      gsub(/^[[:space:]]+/, "", raw)
+      gsub(/[[:space:]]+$/, "", raw)
+      return raw != "" && raw != "\047\047" && raw != "\042\042"
+    }
+    has_value($0) {
+      print substr($0, length(key) + 2)
+      exit
+    }
+  ' "$env_file")"
+  active_value="${active_value#"${active_value%%[![:space:]]*}"}"
+  active_value="${active_value%"${active_value##*[![:space:]]}"}"
+
+  if [[ -n "$active_value" && "$active_value" != "''" && "$active_value" != '""' ]]; then
+    return 0
+  fi
+
+  value="$(prompt_aism_secret_value "$label")" || exit 1
+  env_tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" '
+    function is_empty_active(line, raw) {
+      if (substr(line, 1, length(key) + 1) != key "=") {
+        return 0
+      }
+      raw = substr(line, length(key) + 2)
+      gsub(/^[[:space:]]+/, "", raw)
+      gsub(/[[:space:]]+$/, "", raw)
+      return raw == "" || raw == "\047\047" || raw == "\042\042"
+    }
+    $0 == "#" key "=" || is_empty_active($0) {
+      if (!updated) {
+        print key "='\''" value "'\''"
+        updated=1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!updated) {
+        print key "='\''" value "'\''"
+      }
+    }
+  ' "$env_file" > "$env_tmp"
+  cat "$env_tmp" > "$env_file"
+  rm -f "$env_tmp"
+}
+
+activate_aism_context_path() {
+  local env_file="${1:?}"
+  local env_tmp=""
+
+  grep -q '^APP_CONTEXT_PATH=' "$env_file" && return 0
+
+  env_tmp="$(mktemp)"
+  awk '
+    $0 == "#APP_CONTEXT_PATH='\''/amcs_installer'\''" {
+      print "APP_CONTEXT_PATH='\''/amcs_installer'\''"
+      updated=1
+      next
+    }
+    { print }
+    END {
+      if (!updated) {
+        print "APP_CONTEXT_PATH='\''/amcs_installer'\''"
+      }
+    }
+  ' "$env_file" > "$env_tmp"
+  cat "$env_tmp" > "$env_file"
+  rm -f "$env_tmp"
+}
+
+configure_aism_shared_env() {
+  local env_file="$UTILITY_DIR/AISM/.env"
+
+  activate_aism_secret \
+    "$env_file" \
+    "APPLICATION_INSTALLER_OVERRIDE_PASSWORD" \
+    "AISM: APPLICATION_INSTALLER_OVERRIDE_PASSWORD"
+  activate_aism_secret \
+    "$env_file" \
+    "SSO_JWT_SECRET" \
+    "AISM: SSO_JWT_SECRET"
+  activate_aism_context_path "$env_file"
+  chown "$TARGET_USER:$TARGET_USER" "$env_file" 2>/dev/null || true
+  chmod 0600 "$env_file" 2>/dev/null || true
+}
+
+ensure_aism_installer_jar() {
+  local app_dir="$UTILITY_DIR/AISM"
+  local jar="$app_dir/amcs-installer.jar"
+  local dwupg="$UTILITY_DIR/DOWNLOADER_APP/bin/dwupg"
+
+  if [[ -s "$jar" ]]; then
+    echo "[$(ts)] INFO: zachowuję istniejący artefakt AISM: $jar"
+    add_summary "AISM installer JAR: present"
+    return 0
+  fi
+
+  if [[ ! -x "$dwupg" ]]; then
+    echo "[$(ts)] ERROR: brak launchera DOWNLOADER_APP/dwupg: $dwupg"
+    add_summary "AISM installer JAR: ERROR (dwupg missing)"
+    return 1
+  fi
+
+  echo "[$(ts)] ACTION: brak JAR AISM; uruchamiam dwupg jako '$TARGET_USER'."
+  echo "[$(ts)] INFO: w menu dwupg wybierz: 5) AISM, a następnie wersję."
+  if ! sudo -H -u "$TARGET_USER" "$dwupg"; then
+    echo "[$(ts)] ERROR: dwupg zakończył się błędem podczas pobierania AISM."
+  fi
+
+  if [[ ! -s "$jar" ]]; then
+    echo "[$(ts)] ERROR: brak wymaganego, niepustego artefaktu AISM: $jar"
+    add_summary "AISM installer JAR: ERROR (missing after dwupg)"
+    return 1
+  fi
+
+  echo "[$(ts)] OK: artefakt AISM pobrany: $jar"
+  add_summary "AISM installer JAR: downloaded by dwupg"
 }
 
 disable_aism_unselected_role() {
@@ -2882,15 +3010,11 @@ install_aism_systemd_units() {
   local master_unit="/etc/systemd/system/aism-master.service"
   local slave_unit="/etc/systemd/system/aism-slave.service"
   local slave_after="network-online.target"
-  local systemd_app_dir=""
-  local systemd_env_file=""
   local systemd_master_resources=""
   local systemd_slave_resources=""
   local systemd_jar=""
   local systemd_master_host=""
 
-  systemd_app_dir="$(quote_systemd_value "$app_dir")"
-  systemd_env_file="$(quote_systemd_value "$env_file")"
   systemd_master_resources="$(quote_systemd_value "$app_dir/master/installer-resources")"
   systemd_slave_resources="$(quote_systemd_value "$app_dir/slave/installer-resources")"
   systemd_jar="$(quote_systemd_value "$app_dir/amcs-installer.jar")"
@@ -2922,8 +3046,8 @@ Wants=network-online.target
 Type=simple
 User=$TARGET_USER
 Group=$TARGET_USER
-WorkingDirectory=$systemd_app_dir
-EnvironmentFile=$systemd_env_file
+WorkingDirectory=$app_dir
+EnvironmentFile=$env_file
 ExecStart=/usr/bin/java -Dapplication.installer.resources.dir=$systemd_master_resources -Dspring.profiles.active=master,linux,is -Dserver.port=$server_port -jar $systemd_jar
 Restart=on-failure
 RestartSec=5
@@ -2951,8 +3075,8 @@ Wants=network-online.target
 Type=simple
 User=$TARGET_USER
 Group=$TARGET_USER
-WorkingDirectory=$systemd_app_dir
-EnvironmentFile=$systemd_env_file
+WorkingDirectory=$app_dir
+EnvironmentFile=$env_file
 ExecStart=/usr/bin/java -Dspring.profiles.active=linux,slave,is -Dapplication.installer.resources.dir=$systemd_slave_resources -Dapplication.installer.master.host=$systemd_master_host -Dapplication.installer.master.cluster-port=5701 -Dapplication.installer.master.resources-port=$server_port -jar $systemd_jar
 Restart=on-failure
 RestartSec=5
@@ -3121,6 +3245,9 @@ install_aism_step() {
     add_summary "AISM: no role configured"
     return 0
   fi
+
+  ensure_aism_installer_jar || exit 1
+  configure_aism_shared_env
 
   install_aism_systemd_units \
     "$master_enabled" \
