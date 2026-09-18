@@ -45,15 +45,18 @@ PAYLOAD_TMP=""
 PAYLOAD_ERROR=""
 TARGET_ROOT_FP=""
 TARGET_TLS_FP=""
+TARGET_WSS_FP=""
 SERVER_CERT_FP=""
 TARGET_ROOT_PRESENT=unknown
 TARGET_TLS_PRESENT=unknown
+TARGET_WSS_PRESENT=unknown
 SERVER_CERT_TARGET_PRESENT=unknown
 JAVA_DETECTED=no
 JAVA_LABEL='NIE WYKRYTO'
 JAVA_CACERTS=""
 JAVA_TARGET_ROOT_PRESENT=unknown
 JAVA_TARGET_TLS_PRESENT=unknown
+JAVA_TARGET_WSS_PRESENT=unknown
 AUDIT_RESULT=OK
 
 # Tests can mirror /srv below an isolated directory.  Production keeps paths
@@ -146,8 +149,8 @@ manifest_value() {
 }
 validate_manifest() {
   local file="$1" key value
-  awk '/^[[:space:]]*($|#)/ { next } /^[A-Z_]+=[^[:cntrl:]]*$/ { key=$0; sub(/=.*/, "", key); if (key !~ /^(PAYLOAD_SCHEMA|PAYLOAD_ID|CHANGE_AT|TARGET_ROOT_FILE|TARGET_TLS_FILE|SERVER_CERT_MODE|SERVER_CERT_FILE|PRESERVE_WSS)$/ || ++seen[key] > 1) exit 1; next } { exit 1 }' "$file" || return 1
-  for key in PAYLOAD_SCHEMA PAYLOAD_ID TARGET_ROOT_FILE TARGET_TLS_FILE SERVER_CERT_MODE PRESERVE_WSS CHANGE_AT; do value="$(manifest_value "$file" "$key")"; [ -n "$value" ] || return 1; done
+  awk '/^[[:space:]]*($|#)/ { next } /^[A-Z_]+=[^[:cntrl:]]*$/ { key=$0; sub(/=.*/, "", key); if (key !~ /^(PAYLOAD_SCHEMA|PAYLOAD_ID|CHANGE_AT|TARGET_ROOT_FILE|TARGET_TLS_FILE|TARGET_WSS_FILE|SERVER_CERT_MODE|SERVER_CERT_FILE|PRESERVE_WSS)$/ || ++seen[key] > 1) exit 1; next } { exit 1 }' "$file" || return 1
+  for key in PAYLOAD_SCHEMA PAYLOAD_ID TARGET_ROOT_FILE TARGET_TLS_FILE TARGET_WSS_FILE SERVER_CERT_MODE PRESERVE_WSS CHANGE_AT; do value="$(manifest_value "$file" "$key")"; [ -n "$value" ] || return 1; done
   [ "$(manifest_value "$file" PAYLOAD_SCHEMA)" = 1 ] || return 1
   case "$(manifest_value "$file" SERVER_CERT_MODE)" in preserve|replace) ;; *) return 1 ;; esac
   case "$(manifest_value "$file" PRESERVE_WSS)" in true|false) ;; *) return 1 ;; esac
@@ -167,10 +170,10 @@ read_certificate() {
   subject="$(printf '%s\n' "$data" | sed -n 's/^subject=//p')"; issuer="$(printf '%s\n' "$data" | sed -n 's/^issuer=//p')"
   not_before="$(printf '%s\n' "$data" | sed -n 's/^notBefore=//p')"; not_after="$(printf '%s\n' "$data" | sed -n 's/^notAfter=//p')"
   [ -n "$fingerprint" ] && [ -n "$subject" ] && [ -n "$issuer" ] && [ -n "$not_before" ] && [ -n "$not_after" ] || return 1
-  case "$type" in ROOT) TARGET_ROOT_FP="$fingerprint" ;; TLS) TARGET_TLS_FP="$fingerprint" ;; SERVER) SERVER_CERT_FP="$fingerprint" ;; esac
+  case "$type" in ROOT) TARGET_ROOT_FP="$fingerprint" ;; TLS) TARGET_TLS_FP="$fingerprint" ;; WSS) TARGET_WSS_FP="$fingerprint" ;; SERVER) SERVER_CERT_FP="$fingerprint" ;; esac
 }
 load_payload() {
-  local manifest root_file tls_file server_file
+  local manifest root_file tls_file wss_file server_file
   command -v unzip >/dev/null 2>&1 || { payload_fail 'unzip unavailable'; return; }
   command -v openssl >/dev/null 2>&1 || { payload_fail 'openssl unavailable'; return; }
   find_payload || { payload_fail 'payload ZIP missing'; return; }
@@ -179,12 +182,14 @@ load_payload() {
   validate_manifest "$manifest" || { payload_fail 'invalid manifest.env'; return; }
   PAYLOAD_ID="$(manifest_value "$manifest" PAYLOAD_ID)"; PAYLOAD_CHANGE_AT="$(manifest_value "$manifest" CHANGE_AT)"
   SERVER_CERT_MODE="$(manifest_value "$manifest" SERVER_CERT_MODE)"; PRESERVE_WSS="$(manifest_value "$manifest" PRESERVE_WSS)"
-  root_file="$(manifest_value "$manifest" TARGET_ROOT_FILE)"; tls_file="$(manifest_value "$manifest" TARGET_TLS_FILE)"; server_file="$(manifest_value "$manifest" SERVER_CERT_FILE)"
-  safe_payload_path "$root_file" && safe_payload_path "$tls_file" || { payload_fail 'unsafe target path in manifest'; return; }
+  root_file="$(manifest_value "$manifest" TARGET_ROOT_FILE)"; tls_file="$(manifest_value "$manifest" TARGET_TLS_FILE)"; wss_file="$(manifest_value "$manifest" TARGET_WSS_FILE)"; server_file="$(manifest_value "$manifest" SERVER_CERT_FILE)"
+  safe_payload_path "$root_file" && safe_payload_path "$tls_file" && safe_payload_path "$wss_file" || { payload_fail 'unsafe target path in manifest'; return; }
   extract_file "$root_file" "$PAYLOAD_TMP/root.pem" || { payload_fail 'target RootCA missing from payload'; return; }
   extract_file "$tls_file" "$PAYLOAD_TMP/tls.pem" || { payload_fail 'target SubCA TLS missing from payload'; return; }
+  extract_file "$wss_file" "$PAYLOAD_TMP/wss.pem" || { payload_fail 'target SubCA WSS missing from payload'; return; }
   read_certificate "$PAYLOAD_TMP/root.pem" ROOT || { payload_fail 'cannot read target RootCA certificate'; return; }
   read_certificate "$PAYLOAD_TMP/tls.pem" TLS || { payload_fail 'cannot read target SubCA TLS certificate'; return; }
+  read_certificate "$PAYLOAD_TMP/wss.pem" WSS || { payload_fail 'cannot read target SubCA WSS certificate'; return; }
   if [ "$SERVER_CERT_MODE" = replace ]; then safe_payload_path "$server_file" || { payload_fail 'unsafe server certificate path in manifest'; return; }; extract_file "$server_file" "$PAYLOAD_TMP/server.pem" || { payload_fail 'target server certificate missing from payload'; return; }; read_certificate "$PAYLOAD_TMP/server.pem" SERVER || { payload_fail 'cannot read target server certificate'; return; }; fi
 }
 
@@ -357,6 +362,7 @@ mark_targets() {
   local data="$1"
   if printf '%s\n' "$data" | grep -F -q "$TARGET_ROOT_FP"; then TARGET_ROOT_PRESENT=yes; else TARGET_ROOT_PRESENT=no; fi
   if printf '%s\n' "$data" | grep -F -q "$TARGET_TLS_FP"; then TARGET_TLS_PRESENT=yes; else TARGET_TLS_PRESENT=no; fi
+  if printf '%s\n' "$data" | grep -F -q "$TARGET_WSS_FP"; then TARGET_WSS_PRESENT=yes; else TARGET_WSS_PRESENT=no; fi
 }
 
 audit_pem() {
@@ -450,6 +456,11 @@ audit_java_cacerts() {
   else
     JAVA_TARGET_TLS_PRESENT=no
   fi
+  if printf '%s\n' "$output" | grep -F -q "$TARGET_WSS_FP"; then
+    JAVA_TARGET_WSS_PRESENT=yes
+  else
+    JAVA_TARGET_WSS_PRESENT=no
+  fi
 }
 
 write_state() {
@@ -467,9 +478,9 @@ write_state() {
     [ -n "$CLIENT_WSS_PATH" ] && printf 'CLIENT_WSS_TYPE=%s\nCLIENT_WSS_PATH=%s\n' "$CLIENT_WSS_TYPE" "$CLIENT_WSS_PATH"
     [ -n "$SOURCE_PATH" ] && printf 'SOURCE_TYPE=%s\nSOURCE_PATH=%s\n' "$SOURCE_TYPE" "$SOURCE_PATH"
     [ -n "$PAYLOAD_ID" ] && printf 'PAYLOAD_ID=%s\nPAYLOAD_CHANGE_AT=%s\n' "$PAYLOAD_ID" "$PAYLOAD_CHANGE_AT"
-    printf 'TARGET_ROOT_PRESENT=%s\nTARGET_TLS_PRESENT=%s\nSERVER_CERT_MODE=%s\nSERVER_CERT_TARGET_PRESENT=%s\nPRESERVE_WSS=%s\nJAVA_DETECTED=%s\n' "$TARGET_ROOT_PRESENT" "$TARGET_TLS_PRESENT" "${SERVER_CERT_MODE:-unknown}" "$SERVER_CERT_TARGET_PRESENT" "${PRESERVE_WSS:-unknown}" "$JAVA_DETECTED"
+    printf 'TARGET_ROOT_PRESENT=%s\nTARGET_TLS_PRESENT=%s\nTARGET_WSS_PRESENT=%s\nSERVER_CERT_MODE=%s\nSERVER_CERT_TARGET_PRESENT=%s\nPRESERVE_WSS=%s\nJAVA_DETECTED=%s\n' "$TARGET_ROOT_PRESENT" "$TARGET_TLS_PRESENT" "$TARGET_WSS_PRESENT" "${SERVER_CERT_MODE:-unknown}" "$SERVER_CERT_TARGET_PRESENT" "${PRESERVE_WSS:-unknown}" "$JAVA_DETECTED"
     [ -n "$JAVA_CACERTS" ] && printf 'JAVA_CACERTS=%s\n' "$JAVA_CACERTS"
-    printf 'JAVA_TARGET_ROOT_PRESENT=%s\nJAVA_TARGET_TLS_PRESENT=%s\nAUDIT_RESULT=%s\nAUDIT_TIMESTAMP=%s\n' "$JAVA_TARGET_ROOT_PRESENT" "$JAVA_TARGET_TLS_PRESENT" "$AUDIT_RESULT" "$(date '+%FT%T%z')"
+    printf 'JAVA_TARGET_ROOT_PRESENT=%s\nJAVA_TARGET_TLS_PRESENT=%s\nJAVA_TARGET_WSS_PRESENT=%s\nAUDIT_RESULT=%s\nAUDIT_TIMESTAMP=%s\n' "$JAVA_TARGET_ROOT_PRESENT" "$JAVA_TARGET_TLS_PRESENT" "$JAVA_TARGET_WSS_PRESENT" "$AUDIT_RESULT" "$(date '+%FT%T%z')"
   } > "$temp_file"
   mv -f "$temp_file" "$STATE_FILE"
   chmod 0644 "$STATE_FILE"
@@ -480,9 +491,9 @@ mkdir -p "$LOG_DIR" "$STATE_DIR"; LOG_FILE="$LOG_DIR/p1cert-audit-$(date '+%Y%m%
 if [ "$P1_USED" = yes ] && [ "$AUDIT_RESULT" != UNKNOWN ]; then SOURCE_CONTAINER="$(find_container)"; case "$SERVER_TRUST_TYPE" in PEM|pem|CER|cer|CRT|crt) audit_pem || { AUDIT_RESULT=UNKNOWN; log 'server trust PEM could not be inspected'; } ;; *) audit_store || { AUDIT_RESULT=UNKNOWN; log 'server trust store could not be inspected'; } ;; esac; fi
 detect_java; [ "$AUDIT_RESULT" = UNKNOWN ] || audit_java_cacerts; write_state; log "audit finished result=$AUDIT_RESULT p1_used=$P1_USED"
 printf 'P1CERT %s\nHost: %s\nP1: %s\nProfil: %s\nEndpoint: %s\n' "$P1CERT_VERSION" "$(hostname 2>/dev/null || printf UNKNOWN)" "$(yesno "$P1_USED")" "$PROFILE" "${ENDPOINT:-NIE WYKRYTO}"
-printf 'Zaufanie serwera:\n  Typ: %s\n  Źródło: %s\n  Docelowy RootCA: %s\n  Docelowy SubCA TLS: %s\n' "$SERVER_TRUST_TYPE" "${SERVER_TRUST_PATH:-NIE WYKRYTO}" "$(yesno "$TARGET_ROOT_PRESENT")" "$(yesno "$TARGET_TLS_PRESENT")"
+printf 'Zaufanie serwera:\n  Typ: %s\n  Źródło: %s\n  Docelowy RootCA: %s\n  Docelowy SubCA TLS: %s\n  Docelowy SubCA WSS: %s\n' "$SERVER_TRUST_TYPE" "${SERVER_TRUST_PATH:-NIE WYKRYTO}" "$(yesno "$TARGET_ROOT_PRESENT")" "$(yesno "$TARGET_TLS_PRESENT")" "$(yesno "$TARGET_WSS_PRESENT")"
 printf 'TLS klienta:\n  %s\nWSS klienta:\n  %s\n' "${CLIENT_TLS_PATH:-NIE WYKRYTO}" "${CLIENT_WSS_PATH:-NIE WYKRYTO}"
 if [ -n "$PAYLOAD_ID" ]; then printf 'Payload: %s\nZmiana: %s\n' "$PAYLOAD_ID" "$PAYLOAD_CHANGE_AT"; else printf 'Payload: NIEZNANY (%s)\n' "${PAYLOAD_ERROR:-nie wykryto}"; fi
 case "$SERVER_CERT_MODE" in preserve) printf 'Certyfikat serwera: ZACHOWAJ\n' ;; replace) printf 'Certyfikat serwera: target NIEZNANE\n' ;; *) printf 'Certyfikat serwera: NIEZNANE\n' ;; esac
 if [ "$PRESERVE_WSS" = true ]; then printf 'WSS: ZACHOWAJ\n'; elif [ -n "$PRESERVE_WSS" ]; then printf 'WSS: polityka payloadu=%s\n' "$PRESERVE_WSS"; else printf 'WSS: NIEZNANE\n'; fi
-printf 'Java: %s\nJava cacerts: %s\nDocelowy RootCA w Java cacerts: %s\nDocelowy SubCA TLS w Java cacerts: %s\nWynik audytu: %s\n' "$JAVA_LABEL" "${JAVA_CACERTS:-NIE WYKRYTO}" "$(yesno "$JAVA_TARGET_ROOT_PRESENT")" "$(yesno "$JAVA_TARGET_TLS_PRESENT")" "$AUDIT_RESULT"
+printf 'Java: %s\nJava cacerts: %s\nDocelowy RootCA w Java cacerts: %s\nDocelowy SubCA TLS w Java cacerts: %s\nDocelowy SubCA WSS w Java cacerts: %s\nWynik audytu: %s\n' "$JAVA_LABEL" "${JAVA_CACERTS:-NIE WYKRYTO}" "$(yesno "$JAVA_TARGET_ROOT_PRESENT")" "$(yesno "$JAVA_TARGET_TLS_PRESENT")" "$(yesno "$JAVA_TARGET_WSS_PRESENT")" "$AUDIT_RESULT"

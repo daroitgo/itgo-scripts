@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Added `CCP1SubCAWSS2025` as a third target CA alongside RootCA 2025 and
+  SubCA TLS 2025.
+- AUDIT now reports WSS CA presence in the application trust store and Java
+  cacerts.
+- UPDATE now imports the target WSS CA idempotently using alias
+  `itgo-p1-subca-wss-2025`.
+- Kept `PRESERVE_WSS=true` semantics unchanged: existing client WSS
+  certificates are preserved.
+
 ## 0.1.3 - 2026-09-02
 
 - Fixed certificate payload parsing compatibility across RHEL-family OpenSSL

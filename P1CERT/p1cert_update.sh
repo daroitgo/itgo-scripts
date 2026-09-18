@@ -16,8 +16,10 @@ UPDATE_BACKUP_DIR=""
 BACKED_STORES=""
 APP_ROOT_RESULT=UNKNOWN
 APP_TLS_RESULT=UNKNOWN
+APP_WSS_RESULT=UNKNOWN
 JAVA_ROOT_RESULT='NIE WYKRYTO'
 JAVA_TLS_RESULT='NIE WYKRYTO'
+JAVA_WSS_RESULT='NIE WYKRYTO'
 LAST_CA_RESULT=error
 
 update_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
@@ -91,12 +93,13 @@ update_one_ca() {
 }
 
 update_store_pair() {
-  local scope="$1" store="$2" store_type="$3" password="$4" container="$5" root_result tls_result
+  local scope="$1" store="$2" store_type="$3" password="$4" container="$5" root_result tls_result wss_result
   update_one_ca RootCA "$TARGET_ROOT_FP" itgo-p1-rootca-2025 "$PAYLOAD_TMP/root.pem" "$store" "$store_type" "$password" "$container"; root_result="$LAST_CA_RESULT"
   update_one_ca SubCA-TLS "$TARGET_TLS_FP" itgo-p1-subca-tls-2025 "$PAYLOAD_TMP/tls.pem" "$store" "$store_type" "$password" "$container"; tls_result="$LAST_CA_RESULT"
+  update_one_ca SubCA-WSS "$TARGET_WSS_FP" itgo-p1-subca-wss-2025 "$PAYLOAD_TMP/wss.pem" "$store" "$store_type" "$password" "$container"; wss_result="$LAST_CA_RESULT"
   case "$scope" in
-    app) APP_ROOT_RESULT="$root_result"; APP_TLS_RESULT="$tls_result" ;;
-    java) JAVA_ROOT_RESULT="$root_result"; JAVA_TLS_RESULT="$tls_result" ;;
+    app) APP_ROOT_RESULT="$root_result"; APP_TLS_RESULT="$tls_result"; APP_WSS_RESULT="$wss_result" ;;
+    java) JAVA_ROOT_RESULT="$root_result"; JAVA_TLS_RESULT="$tls_result"; JAVA_WSS_RESULT="$wss_result" ;;
   esac
 }
 
@@ -114,17 +117,18 @@ write_update_state() {
 
 refresh_update_presence() {
   local app_store="$1" app_container="$2" java_container="$3" output
-  TARGET_ROOT_PRESENT=unknown; TARGET_TLS_PRESENT=unknown
+  TARGET_ROOT_PRESENT=unknown; TARGET_TLS_PRESENT=unknown; TARGET_WSS_PRESENT=unknown
   if [ -n "$app_store" ]; then
     output="$(store_output app "$app_store" "$SERVER_TRUST_TYPE" "$SERVER_TRUST_PASSWORD" "$app_container")"
     [ -z "$output" ] || mark_targets "$output"
   fi
-  JAVA_TARGET_ROOT_PRESENT=unknown; JAVA_TARGET_TLS_PRESENT=unknown
+  JAVA_TARGET_ROOT_PRESENT=unknown; JAVA_TARGET_TLS_PRESENT=unknown; JAVA_TARGET_WSS_PRESENT=unknown
   if [ "$JAVA_DETECTED" = yes ] && [ -n "$JAVA_CACERTS" ]; then
     output="$(store_output java "$JAVA_CACERTS" JKS changeit "$java_container")"
     if [ -n "$output" ]; then
       if printf '%s\n' "$output" | grep -F -q "$TARGET_ROOT_FP"; then JAVA_TARGET_ROOT_PRESENT=yes; else JAVA_TARGET_ROOT_PRESENT=no; fi
       if printf '%s\n' "$output" | grep -F -q "$TARGET_TLS_FP"; then JAVA_TARGET_TLS_PRESENT=yes; else JAVA_TARGET_TLS_PRESENT=no; fi
+      if printf '%s\n' "$output" | grep -F -q "$TARGET_WSS_FP"; then JAVA_TARGET_WSS_PRESENT=yes; else JAVA_TARGET_WSS_PRESENT=no; fi
     fi
   fi
 }
@@ -145,7 +149,7 @@ run_update() {
     app_container="$(find_container)"; [ -n "$app_container" ] && app_store="$(container_path "$app_container" || true)"
   fi
   if [ -z "$app_store" ] || { [ -n "$app_container" ] && ! docker exec "$app_container" sh -c 'command -v keytool >/dev/null 2>&1' >/dev/null 2>&1; }; then
-    APP_ROOT_RESULT=error; APP_TLS_RESULT=error
+    APP_ROOT_RESULT=error; APP_TLS_RESULT=error; APP_WSS_RESULT=error
   else
     update_store_pair app "$app_store" "$SERVER_TRUST_TYPE" "$SERVER_TRUST_PASSWORD" "$app_container"
   fi
@@ -156,10 +160,10 @@ run_update() {
     update_store_pair java "$JAVA_CACERTS" JKS changeit "$java_container"
     [ -z "$java_container" ] || printf '%s\n' 'UWAGA: Java cacerts zmodyfikowany wewnątrz kontenera; zmiana może zniknąć po odtworzeniu kontenera.'
   fi
-  if [ "$APP_ROOT_RESULT" != error ] && [ "$APP_TLS_RESULT" != error ] && [ "$JAVA_ROOT_RESULT" != error ] && [ "$JAVA_TLS_RESULT" != error ] && [ "$JAVA_ROOT_RESULT" != 'NIE WYKRYTO' ] && [ "$JAVA_TLS_RESULT" != 'NIE WYKRYTO' ]; then UPDATE_RESULT=OK; else UPDATE_RESULT=UNKNOWN; fi
+  if [ "$APP_ROOT_RESULT" != error ] && [ "$APP_TLS_RESULT" != error ] && [ "$APP_WSS_RESULT" != error ] && [ "$JAVA_ROOT_RESULT" != error ] && [ "$JAVA_TLS_RESULT" != error ] && [ "$JAVA_WSS_RESULT" != error ] && [ "$JAVA_ROOT_RESULT" != 'NIE WYKRYTO' ] && [ "$JAVA_TLS_RESULT" != 'NIE WYKRYTO' ] && [ "$JAVA_WSS_RESULT" != 'NIE WYKRYTO' ]; then UPDATE_RESULT=OK; else UPDATE_RESULT=UNKNOWN; fi
   refresh_update_presence "$app_store" "$app_container" "$java_container"
   write_update_state; update_log "update finished result=$UPDATE_RESULT"
-  printf 'Magazyn aplikacji:\n  RootCA 2025: %s\n  SubCA TLS 2025: %s\nJava cacerts:\n  RootCA 2025: %s\n  SubCA TLS 2025: %s\nWynik update: %s\n' "$(result_label "$APP_ROOT_RESULT")" "$(result_label "$APP_TLS_RESULT")" "$(result_label "$JAVA_ROOT_RESULT")" "$(result_label "$JAVA_TLS_RESULT")" "$UPDATE_RESULT"
+  printf 'Magazyn aplikacji:\n  RootCA 2025: %s\n  SubCA TLS 2025: %s\n  SubCA WSS 2025: %s\nJava cacerts:\n  RootCA 2025: %s\n  SubCA TLS 2025: %s\n  SubCA WSS 2025: %s\nWynik update: %s\n' "$(result_label "$APP_ROOT_RESULT")" "$(result_label "$APP_TLS_RESULT")" "$(result_label "$APP_WSS_RESULT")" "$(result_label "$JAVA_ROOT_RESULT")" "$(result_label "$JAVA_TLS_RESULT")" "$(result_label "$JAVA_WSS_RESULT")" "$UPDATE_RESULT"
   [ "$UPDATE_RESULT" != OK ] || printf '%s\n' 'Zmiany zapisane. Wymagany restart aplikacji/kontenera przed użyciem nowych CA.'
 }
 
