@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.25"
+VERSION="3.12.26"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -895,7 +895,7 @@ logguard_platforms_state() {
     name="${canonical##*/}"; lower="${name,,}"
     [[ "$lower" == integrationplatform || "$lower" == integrationplatform_* ]] || { echo "INVALID"; return; }
     duplicate=0
-    for existing in "${valid[@]}"; do [[ "$existing" == "$line" ]] && duplicate=1; done
+    for existing in ${valid[@]+"${valid[@]}"}; do [[ "$existing" == "$line" ]] && duplicate=1; done
     (( duplicate )) || valid+=("$line")
   done < "$file"
   printf 'VALID:%s\n' "${#valid[@]}"
