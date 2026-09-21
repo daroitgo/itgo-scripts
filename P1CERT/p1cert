@@ -51,7 +51,7 @@ case "${1:-help}" in
     exec "$SCRIPT_DIR/p1cert_audit.sh"
     ;;
   update)
-    exec "$SCRIPT_DIR/p1cert_update.sh"
+    exec "$SCRIPT_DIR/p1cert_update.sh" "${@:2}"
     ;;
   status)
     if [ -r "$MODULE_DIR/state/p1cert-state" ]; then

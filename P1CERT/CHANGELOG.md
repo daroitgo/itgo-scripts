@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Added `update --java-only` and `update --with-keystore`. Automatic UPDATE
+  now updates host Java cacerts and, when detected, an application JKS/PKCS12
+  truststore; PEM/CER server-trust files remain untouched.
+- Hardened UPDATE backups against path, scope and same-second collisions, and
+  use a deterministic fingerprint-based alias when a preferred alias is
+  already occupied by another certificate.
+- UPDATE now returns a non-zero status for an incomplete or failed operation.
+
 - Java detection and Java cacerts handling are now host-only; container Java
   runtimes are ignored by both AUDIT and UPDATE.
 
@@ -39,4 +47,3 @@
 - Initial P1CERT module.
 - Added read-only AUDIT/VERIFY for P1ADAPTER and P1CER certificate sources.
 - UPDATE and SCHEDULE are not implemented.
-

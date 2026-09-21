@@ -411,6 +411,10 @@ audit_store() {
 detect_java() {
   local java_bin=""
   local settings=""
+  local java_home=""
+  local keytool_candidate=""
+
+  JAVA_KEYTOOL=""
 
   command -v java >/dev/null 2>&1 || return 0
   java_bin="$(command -v java)"
@@ -421,7 +425,20 @@ detect_java() {
 
   JAVA_DETECTED=yes
   JAVA_LABEL="$(printf '%s\n' "$settings" | awk -F= '/^[[:space:]]*java.vendor[[:space:]]*=/{v=$2} /^[[:space:]]*java.version[[:space:]]*=/{x=$2} END {gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); gsub(/^[[:space:]]+|[[:space:]]+$/, "", x); print v " " x}')"
-  JAVA_CACERTS="$(printf '%s\n' "$settings" | awk -F= '/^[[:space:]]*java.home[[:space:]]*=/{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2 "/lib/security/cacerts"; exit}')"
+  java_home="$(printf '%s\n' "$settings" | awk -F= '/^[[:space:]]*java.home[[:space:]]*=/{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')"
+  JAVA_CACERTS="${java_home:+$java_home/lib/security/cacerts}"
+
+  if [ -n "$java_home" ]; then
+    for keytool_candidate in \
+      "$java_home/bin/keytool" \
+      "$java_home/../bin/keytool"
+    do
+      if [ -x "$keytool_candidate" ]; then
+        JAVA_KEYTOOL="$keytool_candidate"
+        break
+      fi
+    done
+  fi
 
   [ -f "$JAVA_CACERTS" ] || JAVA_CACERTS=""
 }
@@ -430,8 +447,8 @@ audit_java_cacerts() {
   local output
 
   [ "$JAVA_DETECTED" = yes ] && [ -n "$JAVA_CACERTS" ] || return 0
-  command -v keytool >/dev/null 2>&1 || return 0
-  output="$(printf '%s\n' changeit | keytool -list -v -keystore "$JAVA_CACERTS" 2>/dev/null || true)"
+  [ -n "${JAVA_KEYTOOL:-}" ] && [ -x "$JAVA_KEYTOOL" ] || return 0
+  output="$(printf '%s\n' changeit | "$JAVA_KEYTOOL" -list -v -keystore "$JAVA_CACERTS" 2>/dev/null || true)"
   [ -n "$output" ] || return 0
   if printf '%s\n' "$output" | grep -F -q "$TARGET_ROOT_FP"; then
     JAVA_TARGET_ROOT_PRESENT=yes

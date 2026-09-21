@@ -19,14 +19,19 @@ It also creates `/usr/local/bin/p1cert` as a symlink to the installed wrapper.
 p1cert audit
 p1cert verify
 p1cert update
+p1cert update --java-only
+p1cert update --with-keystore
 p1cert status
 p1cert version
 ```
 
 `AUDIT`/`VERIFY` inspect the detected P1 configuration and certificate targets.
 Java trust inspection is host-only; Java runtimes and cacerts inside Docker
-containers are ignored. `UPDATE` performs a controlled, idempotent CA update
-for supported profiles and updates only host Java cacerts.
+containers are ignored. `UPDATE` always updates the host Java cacerts. In
+automatic mode it also updates a detected application JKS/PKCS12 truststore;
+PEM/CER server-trust files are never modified. `--java-only` skips the
+application store, while `--with-keystore` requires a detected application
+JKS/PKCS12 before making any change. Docker Java cacerts are never modified.
 `SCHEDULE` is not implemented.
 
 ## Certificate payload
