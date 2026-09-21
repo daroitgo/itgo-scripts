@@ -155,10 +155,9 @@ run_update() {
   fi
 
   SOURCE_CONTAINER="$app_container"; detect_java
-  java_container="$SOURCE_CONTAINER"
+  java_container=''
   if [ "$JAVA_DETECTED" = yes ] && [ -n "$JAVA_CACERTS" ]; then
     update_store_pair java "$JAVA_CACERTS" JKS changeit "$java_container"
-    [ -z "$java_container" ] || printf '%s\n' 'UWAGA: Java cacerts zmodyfikowany wewnątrz kontenera; zmiana może zniknąć po odtworzeniu kontenera.'
   fi
   if [ "$APP_ROOT_RESULT" != error ] && [ "$APP_TLS_RESULT" != error ] && [ "$APP_WSS_RESULT" != error ] && [ "$JAVA_ROOT_RESULT" != error ] && [ "$JAVA_TLS_RESULT" != error ] && [ "$JAVA_WSS_RESULT" != error ] && [ "$JAVA_ROOT_RESULT" != 'NIE WYKRYTO' ] && [ "$JAVA_TLS_RESULT" != 'NIE WYKRYTO' ] && [ "$JAVA_WSS_RESULT" != 'NIE WYKRYTO' ]; then UPDATE_RESULT=OK; else UPDATE_RESULT=UNKNOWN; fi
   refresh_update_presence "$app_store" "$app_container" "$java_container"

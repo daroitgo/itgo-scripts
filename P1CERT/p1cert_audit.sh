@@ -411,40 +411,27 @@ audit_store() {
 detect_java() {
   local java_bin=""
   local settings=""
-  local container="${SOURCE_CONTAINER:-$(find_container)}"
 
-  if [ -n "$container" ] && docker exec "$container" sh -c 'command -v java >/dev/null 2>&1' >/dev/null 2>&1; then
-    settings="$(docker exec "$container" java -XshowSettings:properties -version 2>&1 || true)"
-    SOURCE_CONTAINER="$container"
-  else
-    java_bin="$(ps -eo pid=,args= 2>/dev/null | awk '/[j]ava/ && /\/srv\/(P1ADAPTER|P1CER|IntegrationPlatform_ERECEPTY|zm_docker|EKRN)/ {print $1; exit}')"
-    if [ -n "$java_bin" ] && [ -r "/proc/$java_bin/exe" ]; then
-      java_bin="$(readlink -f "/proc/$java_bin/exe" 2>/dev/null || true)"
-    elif [ -z "$container" ] && command -v java >/dev/null 2>&1; then
-      java_bin=java
-    else
-      return 0
-    fi
-    settings="$("$java_bin" -XshowSettings:properties -version 2>&1 || true)"
-  fi
+  command -v java >/dev/null 2>&1 || return 0
+  java_bin="$(command -v java)"
+  java_bin="$(readlink -f "$java_bin" 2>/dev/null || printf '%s\n' "$java_bin")"
+
+  settings="$("$java_bin" -XshowSettings:properties -version 2>&1 || true)"
+  [ -n "$settings" ] || return 0
 
   JAVA_DETECTED=yes
   JAVA_LABEL="$(printf '%s\n' "$settings" | awk -F= '/^[[:space:]]*java.vendor[[:space:]]*=/{v=$2} /^[[:space:]]*java.version[[:space:]]*=/{x=$2} END {gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); gsub(/^[[:space:]]+|[[:space:]]+$/, "", x); print v " " x}')"
   JAVA_CACERTS="$(printf '%s\n' "$settings" | awk -F= '/^[[:space:]]*java.home[[:space:]]*=/{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2 "/lib/security/cacerts"; exit}')"
-  [ -n "$SOURCE_CONTAINER" ] || [ -f "$JAVA_CACERTS" ] || JAVA_CACERTS=""
+
+  [ -f "$JAVA_CACERTS" ] || JAVA_CACERTS=""
 }
 
 audit_java_cacerts() {
   local output
 
   [ "$JAVA_DETECTED" = yes ] && [ -n "$JAVA_CACERTS" ] || return 0
-  if [ -n "$SOURCE_CONTAINER" ]; then
-    docker exec "$SOURCE_CONTAINER" sh -c 'command -v keytool >/dev/null 2>&1' >/dev/null 2>&1 || return 0
-    output="$(printf '%s\n' changeit | docker exec -i "$SOURCE_CONTAINER" keytool -list -v -keystore "$JAVA_CACERTS" 2>/dev/null || true)"
-  else
-    command -v keytool >/dev/null 2>&1 || return 0
-    output="$(printf '%s\n' changeit | keytool -list -v -keystore "$JAVA_CACERTS" 2>/dev/null || true)"
-  fi
+  command -v keytool >/dev/null 2>&1 || return 0
+  output="$(printf '%s\n' changeit | keytool -list -v -keystore "$JAVA_CACERTS" 2>/dev/null || true)"
   [ -n "$output" ] || return 0
   if printf '%s\n' "$output" | grep -F -q "$TARGET_ROOT_FP"; then
     JAVA_TARGET_ROOT_PRESENT=yes

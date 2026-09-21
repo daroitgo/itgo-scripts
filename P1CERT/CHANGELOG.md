@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Java detection and Java cacerts handling are now host-only; container Java
+  runtimes are ignored by both AUDIT and UPDATE.
+
 - Added `CCP1SubCAWSS2025` as a third target CA alongside RootCA 2025 and
   SubCA TLS 2025.
 - AUDIT now reports WSS CA presence in the application trust store and Java

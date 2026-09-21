@@ -24,7 +24,9 @@ p1cert version
 ```
 
 `AUDIT`/`VERIFY` inspect the detected P1 configuration and certificate targets.
-`UPDATE` performs a controlled, idempotent CA update for supported profiles.
+Java trust inspection is host-only; Java runtimes and cacerts inside Docker
+containers are ignored. `UPDATE` performs a controlled, idempotent CA update
+for supported profiles and updates only host Java cacerts.
 `SCHEDULE` is not implemented.
 
 ## Certificate payload
