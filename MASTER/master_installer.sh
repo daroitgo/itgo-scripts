@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.115"
+MASTER_VERSION="1.2.116"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.26"
@@ -47,7 +47,7 @@ DOWNLOADER_APP_VERSION="1.0.7"
 UPGBUILDER_VERSION="0.1.14"
 SERVICEGUARD_VERSION="0.1.6"
 INVENTORY_VERSION="0.1.14"
-P1CERT_VERSION="0.1.8"
+P1CERT_VERSION="0.1.9"
 LOGGUARD_VERSION="0.2.4"
 
 MODE="install"
