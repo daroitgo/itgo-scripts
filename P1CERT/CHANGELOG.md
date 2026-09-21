@@ -9,6 +9,8 @@
   use a deterministic fingerprint-based alias when a preferred alias is
   already occupied by another certificate.
 - UPDATE now returns a non-zero status for an incomplete or failed operation.
+- Fixed preferred-alias selection so a free target alias is accepted correctly
+  instead of being reported as unavailable during CA import.
 
 - Java detection and Java cacerts handling are now host-only; container Java
   runtimes are ignored by both AUDIT and UPDATE.

@@ -315,11 +315,13 @@ select_import_alias() {
     [ "$alias_result" -eq 1 ] || return 1
     IMPORT_ALIAS="$selected"
     return 0
+  else
+    alias_result=$?
   fi
 
-  alias_result=$?
   [ "$alias_result" -eq 1 ] || return 1
   IMPORT_ALIAS="$preferred"
+  return 0
 }
 
 backup_store() {
