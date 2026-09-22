@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - wget
 # ==========================================================
 
-VERSION="1.0.7"
+VERSION="1.0.8"
 MANIFEST_URL="https://helpdesk.itgo.com.pl/nextcloud/index.php/s/s2778Z6z4rEibLp/download"
 
 TARGET_DIR="${HOME}/UPG"
@@ -135,7 +135,15 @@ cleanup_old_artifacts() {
     bk)
       find "$TARGET_DIR" -maxdepth 1 -type f -name "*.war" -print -delete 2>/dev/null || true
       ;;
-    amcs|wildfly)
+    amcs)
+      for target_file in "$AMCS_TARGET_DIR"/amcs-installer*.jar; do
+        if [ -f "$target_file" ]; then
+          printf '%s\n' "$target_file"
+          rm -f "$target_file"
+        fi
+      done
+      ;;
+    wildfly)
       for target_file in "$@"; do
         if [ -f "$target_file" ]; then
           printf '%s\n' "$target_file"
@@ -152,6 +160,48 @@ cleanup_old_artifacts() {
       done
       ;;
   esac
+}
+
+backup_and_clear_amcs_runtime() {
+  local timestamp backup_dir runtime_item source_file backup_file
+  local runtime_items=(config resources/logs resources/resources resources/states)
+  local existing_items=()
+
+  for runtime_item in "${runtime_items[@]}"; do
+    if [ -e "$AMCS_TARGET_DIR/$runtime_item" ]; then
+      existing_items+=("$runtime_item")
+    fi
+  done
+
+  [ "${#existing_items[@]}" -gt 0 ] || return 0
+
+  timestamp="$(date +%Y%m%d_%H%M%S)"
+  backup_dir="$AMCS_TARGET_DIR/backup/$timestamp"
+  if [ -e "$backup_dir" ]; then
+    echo "ERROR: Katalog backupu AMCS już istnieje: $backup_dir"
+    return 1
+  fi
+
+  echo "Backup runtime AMCS do: $backup_dir"
+  mkdir -p "$backup_dir" || return 1
+
+  for runtime_item in "${existing_items[@]}"; do
+    source_file="$AMCS_TARGET_DIR/$runtime_item"
+    backup_file="$backup_dir/$runtime_item"
+    mkdir -p "$(dirname "$backup_file")" || return 1
+    if ! cp -a "$source_file" "$backup_file"; then
+      echo "ERROR: Backup runtime AMCS nie powiódł się: $source_file"
+      return 1
+    fi
+  done
+
+  for runtime_item in "${existing_items[@]}"; do
+    source_file="$AMCS_TARGET_DIR/$runtime_item"
+    if ! rm -rf "$source_file"; then
+      echo "ERROR: Nie udało się usunąć aktywnego runtime AMCS: $source_file"
+      return 1
+    fi
+  done
 }
 
 fetch_manifest() {
@@ -363,7 +413,7 @@ main() {
   fi
 
   for url in "${urls[@]}"; do
-    if [ "$app_type" = "aism" ]; then
+    if [ "$app_type" = "amcs" ] || [ "$app_type" = "aism" ]; then
       filename="amcs-installer.jar"
     else
       filename="$(resolve_filename_from_header "$url")"
@@ -376,6 +426,12 @@ main() {
   echo
   echo "Przygotowanie katalogu docelowego: ${download_dir}"
   mkdir -p "$download_dir"
+  if [ "$app_type" = "amcs" ]; then
+    backup_and_clear_amcs_runtime || {
+      echo "ERROR: Przerwano aktualizację AMCS przed usunięciem starego instalatora i pobraniem nowej wersji."
+      exit 1
+    }
+  fi
   echo "Usuwanie starych plików dla typu ${app_type^^} z ${download_dir}:"
   cleanup_old_artifacts "$app_type" "${target_files[@]}"
 
