@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.116"
+MASTER_VERSION="1.2.117"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.26"
@@ -1817,6 +1817,346 @@ EOF_ITGO_ACL_REFRESH_SUDOERS
   add_summary "ACL refresh installed: /usr/local/sbin/itgo-refresh-acl"
   add_summary "ACL refresh sudoers installed: /etc/sudoers.d/itgo-refresh-acl"
   add_summary "ACL refresh enabled in ~/.bash_profile"
+}
+
+docker_load_os_release() {
+  local ID="" ID_LIKE="" VERSION_ID="" VERSION_CODENAME="" UBUNTU_CODENAME=""
+
+  [[ -r /etc/os-release ]] || {
+    echo "[$(ts)] ERROR: /etc/os-release is unavailable; cannot select a safe Docker repository."
+    return 1
+  }
+
+  DOCKER_OS_ID=""
+  DOCKER_OS_ID_LIKE=""
+  DOCKER_OS_VERSION_ID=""
+  DOCKER_OS_VERSION_CODENAME=""
+  DOCKER_OS_UBUNTU_CODENAME=""
+
+  # Keep imported os-release fields local so inherited environment values
+  # cannot influence repository selection when a field is absent in the file.
+  . /etc/os-release
+  DOCKER_OS_ID="${ID:-}"
+  DOCKER_OS_ID_LIKE="${ID_LIKE:-}"
+  DOCKER_OS_VERSION_ID="${VERSION_ID:-}"
+  DOCKER_OS_VERSION_CODENAME="${VERSION_CODENAME:-}"
+  DOCKER_OS_UBUNTU_CODENAME="${UBUNTU_CODENAME:-}"
+
+  [[ -n "$DOCKER_OS_ID" && -n "$DOCKER_OS_VERSION_ID" ]] || {
+    echo "[$(ts)] ERROR: incomplete /etc/os-release; ID and VERSION_ID are required for Docker."
+    return 1
+  }
+}
+
+docker_preflight_conflicting_packages() {
+  local pkg
+  local conflicts=()
+  local conflict_packages=()
+
+  case "$(os_family)" in
+    debian_family)
+      # Docker's Debian/Ubuntu instructions require these distro packages to
+      # be removed before installing Docker CE.  MASTER only reports them.
+      conflict_packages=(docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc)
+      ;;
+    rhel_family)
+      # Docker's RHEL-family instructions list these as conflicting packages.
+      conflict_packages=(docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine podman runc)
+      ;;
+    *)
+      echo "[$(ts)] ERROR: unsupported OS family; cannot safely check Docker CE package conflicts."
+      return 1
+      ;;
+  esac
+
+  for pkg in "${conflict_packages[@]}"; do
+    if pkg_installed "$pkg"; then
+      conflicts+=("$pkg")
+    fi
+  done
+
+  [[ "${#conflicts[@]}" -eq 0 ]] && return 0
+
+  echo "[$(ts)] ERROR: Docker CE installation was not started; conflicting installed packages detected: ${conflicts[*]}"
+  echo "[$(ts)] ERROR: MASTER never removes Docker or container packages automatically."
+  echo "[$(ts)] INFO: an administrator must review and remove or migrate the listed packages before rerunning Docker setup."
+  return 1
+}
+
+docker_existing_cli_is_official() {
+  local docker_path="" owner=""
+
+  docker_path="$(get_active_command_path docker)"
+  owner="$(pkg_owner_of_path "$docker_path")"
+
+  if [[ "$owner" == docker-ce-cli ]] && pkg_installed docker-ce-cli; then
+    return 0
+  fi
+
+  echo "[$(ts)] ERROR: Docker CLI exists but Compose v2 is missing, and its package source is not a verified Docker CE installation."
+  echo "[$(ts)] INFO: docker path: ${docker_path:-unknown}; owning package: ${owner:-unknown}."
+  echo "[$(ts)] INFO: MASTER will not mix Docker CE packages with docker.io or another ambiguous Docker source; ask an administrator to install Compose v2 from the matching source or migrate Docker deliberately."
+  return 1
+}
+
+docker_select_repository() {
+  local major=""
+
+  docker_load_os_release || return 1
+  major="${DOCKER_OS_VERSION_ID%%.*}"
+  DOCKER_REPOSITORY_FLAVOR=""
+  DOCKER_APT_CODENAME=""
+
+  case "$DOCKER_OS_ID" in
+    debian)
+      DOCKER_REPOSITORY_FLAVOR=debian
+      DOCKER_APT_CODENAME="$DOCKER_OS_VERSION_CODENAME"
+      ;;
+    ubuntu)
+      DOCKER_REPOSITORY_FLAVOR=ubuntu
+      DOCKER_APT_CODENAME="${DOCKER_OS_UBUNTU_CODENAME:-$DOCKER_OS_VERSION_CODENAME}"
+      ;;
+    rhel)
+      case "$major" in 8|9|10) ;; *)
+        echo "[$(ts)] ERROR: RHEL ${DOCKER_OS_VERSION_ID} is not supported for automatic Docker CE installation."
+        return 1
+      esac
+      DOCKER_REPOSITORY_FLAVOR=rhel
+      ;;
+    rocky)
+      case "$major" in 8|9|10) ;; *)
+        echo "[$(ts)] ERROR: Rocky Linux ${DOCKER_OS_VERSION_ID} is not supported for automatic Docker CE installation."
+        return 1
+      esac
+      DOCKER_REPOSITORY_FLAVOR=rocky
+      ;;
+    almalinux)
+      case "$major" in 8|9|10) ;; *)
+        echo "[$(ts)] ERROR: AlmaLinux ${DOCKER_OS_VERSION_ID} is not supported for automatic Docker CE installation."
+        return 1
+      esac
+      DOCKER_REPOSITORY_FLAVOR=alma
+      ;;
+    ol)
+      # Docker publishes a distinct Oracle Linux repository.  Do not map OL
+      # to CentOS: only OL8/OL9 are enabled here deliberately.
+      case "$major" in 8|9) ;; *)
+        echo "[$(ts)] ERROR: Oracle Linux ${DOCKER_OS_VERSION_ID} is not supported for automatic Docker CE installation (supported: OL8, OL9)."
+        return 1
+      esac
+      DOCKER_REPOSITORY_FLAVOR=oracle
+      ;;
+    centos)
+      # CentOS Linux is EOL; permit only current Stream-era major releases
+      # for which Docker still publishes a dedicated CentOS repository.
+      case "$major" in 9|10) ;; *)
+        echo "[$(ts)] ERROR: CentOS ${DOCKER_OS_VERSION_ID} is not supported for automatic Docker CE installation."
+        return 1
+      esac
+      DOCKER_REPOSITORY_FLAVOR=centos
+      ;;
+    *)
+      echo "[$(ts)] ERROR: unsupported Linux ID '$DOCKER_OS_ID'; Docker repository will not be guessed."
+      return 1
+      ;;
+  esac
+
+  case "$DOCKER_REPOSITORY_FLAVOR" in
+    debian|ubuntu)
+      [[ -n "$DOCKER_APT_CODENAME" ]] || {
+        echo "[$(ts)] ERROR: missing distribution codename in /etc/os-release for $DOCKER_OS_ID."
+        return 1
+      }
+      [[ "$DOCKER_APT_CODENAME" =~ ^[A-Za-z0-9._-]+$ ]] || {
+        echo "[$(ts)] ERROR: unsafe distribution codename '$DOCKER_APT_CODENAME'."
+        return 1
+      }
+      ;;
+  esac
+
+  if [[ -n "$DOCKER_OS_ID_LIKE" ]]; then
+    case "$DOCKER_REPOSITORY_FLAVOR" in
+      debian|ubuntu)
+        [[ " $DOCKER_OS_ID_LIKE " == *" debian "* ]] || {
+          echo "[$(ts)] ERROR: ID_LIKE='$DOCKER_OS_ID_LIKE' is inconsistent with Debian-family Docker setup."
+          return 1
+        }
+        ;;
+      rhel|rocky|alma|oracle|centos)
+        [[ " $DOCKER_OS_ID_LIKE " == *" rhel "* || " $DOCKER_OS_ID_LIKE " == *" fedora "* ]] || {
+          echo "[$(ts)] ERROR: ID_LIKE='$DOCKER_OS_ID_LIKE' is inconsistent with RHEL-family Docker setup."
+          return 1
+        }
+        ;;
+    esac
+  fi
+
+  echo "[$(ts)] INFO: Docker OS detection: ID=$DOCKER_OS_ID ID_LIKE=${DOCKER_OS_ID_LIKE:-NONE} VERSION_ID=$DOCKER_OS_VERSION_ID VERSION_CODENAME=${DOCKER_OS_VERSION_CODENAME:-NONE}."
+}
+
+docker_setup_apt_repository() {
+  local keyring="/etc/apt/keyrings/docker.asc"
+  local repo_file="/etc/apt/sources.list.d/docker.list"
+  local repo_url="https://download.docker.com/linux/$DOCKER_REPOSITORY_FLAVOR"
+  local arch expected_entry key_tmp repo_tmp
+
+  command -v apt-get >/dev/null 2>&1 || {
+    echo "[$(ts)] ERROR: apt-get is required for Docker on $DOCKER_OS_ID."
+    return 1
+  }
+  command -v dpkg >/dev/null 2>&1 || {
+    echo "[$(ts)] ERROR: dpkg is required to determine Docker APT architecture."
+    return 1
+  }
+
+  ensure_package_installed ca-certificates || return 1
+  ensure_package_installed curl || return 1
+  ensure_package_installed gnupg || return 1
+  arch="$(dpkg --print-architecture)"
+  expected_entry="deb [arch=$arch signed-by=$keyring] $repo_url $DOCKER_APT_CODENAME stable"
+
+  if [[ -e "$repo_file" ]] && ! grep -Fxq "$expected_entry" "$repo_file"; then
+    echo "[$(ts)] ERROR: existing $repo_file does not point to the expected official Docker repository; refusing to overwrite it."
+    return 1
+  fi
+
+  if [[ ! -f "$keyring" ]]; then
+    echo "[$(ts)] ACTION: install Docker APT signing key"
+    install -d -m 0755 /etc/apt/keyrings
+    key_tmp="$(mktemp "${keyring}.XXXXXX")" || return 1
+    if ! curl -fsSL "$repo_url/gpg" -o "$key_tmp"; then
+      rm -f "$key_tmp"
+      return 1
+    fi
+    mv -f "$key_tmp" "$keyring"
+    chmod a+r "$keyring"
+  fi
+
+  if [[ ! -f "$repo_file" ]]; then
+    echo "[$(ts)] ACTION: configure official Docker APT repository for $DOCKER_OS_ID $DOCKER_APT_CODENAME"
+    install -d -m 0755 /etc/apt/sources.list.d
+    repo_tmp="$(mktemp "${repo_file}.XXXXXX")" || return 1
+    if ! printf '%s\n' "$expected_entry" > "$repo_tmp"; then
+      rm -f "$repo_tmp"
+      return 1
+    fi
+    mv -f "$repo_tmp" "$repo_file"
+    chmod 0644 "$repo_file"
+  else
+    echo "[$(ts)] OK: official Docker APT repository already configured."
+  fi
+
+  echo "[$(ts)] ACTION: apt-get update"
+  apt-get update
+}
+
+docker_setup_rpm_repository() {
+  local repo_file="/etc/yum.repos.d/docker-ce.repo"
+  local repo_url="https://download.docker.com/linux/$DOCKER_REPOSITORY_FLAVOR/docker-ce.repo"
+
+  command -v dnf >/dev/null 2>&1 || {
+    echo "[$(ts)] ERROR: dnf is required for safe Docker CE installation on $DOCKER_OS_ID."
+    return 1
+  }
+
+  if [[ -e "$repo_file" ]] && ! grep -Fq "https://download.docker.com/linux/$DOCKER_REPOSITORY_FLAVOR" "$repo_file"; then
+    echo "[$(ts)] ERROR: existing $repo_file does not point to the expected official Docker repository; refusing to overwrite it."
+    return 1
+  fi
+
+  if [[ ! -f "$repo_file" ]]; then
+    ensure_package_installed dnf-plugins-core || return 1
+    echo "[$(ts)] ACTION: configure official Docker RPM repository for $DOCKER_OS_ID $DOCKER_OS_VERSION_ID"
+    dnf config-manager --add-repo "$repo_url"
+  else
+    echo "[$(ts)] OK: official Docker RPM repository already configured."
+  fi
+}
+
+docker_enable_and_verify() {
+  command -v systemctl >/dev/null 2>&1 || {
+    echo "[$(ts)] ERROR: systemctl is required to manage Docker service."
+    return 1
+  }
+
+  echo "[$(ts)] ACTION: systemctl enable --now docker"
+  systemctl enable --now docker || return 1
+
+  docker --version >/dev/null 2>&1 || {
+    echo "[$(ts)] ERROR: docker --version failed after Docker setup."
+    return 1
+  }
+  docker compose version >/dev/null 2>&1 || {
+    echo "[$(ts)] ERROR: docker compose version failed after Docker setup."
+    return 1
+  }
+  systemctl is-active --quiet docker || {
+    echo "[$(ts)] ERROR: Docker service is not active after setup."
+    return 1
+  }
+
+  echo "[$(ts)] OK: Docker Engine and Docker Compose v2 are working."
+}
+
+ensure_docker_runtime() {
+  local docker_ready=no compose_ready=no pkg
+  local docker_packages=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+
+  if docker --version >/dev/null 2>&1; then
+    docker_ready=yes
+  fi
+  if docker compose version >/dev/null 2>&1; then
+    compose_ready=yes
+  fi
+
+  if [[ "$docker_ready" == yes && "$compose_ready" == yes ]]; then
+    echo "[$(ts)] INFO: Docker Engine and Compose v2 are already installed; repository configuration is unchanged."
+    docker_enable_and_verify || return 1
+    add_summary "Docker runtime: OK (existing Engine + Compose v2 verified)"
+    return 0
+  fi
+
+  docker_select_repository || return 1
+
+  if [[ "$docker_ready" == yes ]]; then
+    docker_existing_cli_is_official || return 1
+  else
+    docker_preflight_conflicting_packages || return 1
+  fi
+
+  case "$(os_family)" in
+    debian_family)
+      case "$DOCKER_REPOSITORY_FLAVOR" in debian|ubuntu) ;; *)
+        echo "[$(ts)] ERROR: OS family/repository mismatch; refusing Docker setup."
+        return 1
+      esac
+      docker_setup_apt_repository || return 1
+      ;;
+    rhel_family)
+      case "$DOCKER_REPOSITORY_FLAVOR" in rhel|rocky|alma|oracle|centos) ;; *)
+        echo "[$(ts)] ERROR: OS family/repository mismatch; refusing Docker setup."
+        return 1
+      esac
+      docker_setup_rpm_repository || return 1
+      ;;
+    *)
+      echo "[$(ts)] ERROR: unsupported OS family; refusing Docker setup."
+      return 1
+      ;;
+  esac
+
+  if [[ "$docker_ready" == yes && "$compose_ready" != yes ]]; then
+    echo "[$(ts)] INFO: Docker CLI exists but Compose v2 is missing; installing only docker-compose-plugin."
+    ensure_package_installed docker-compose-plugin || return 1
+  else
+    echo "[$(ts)] INFO: installing official Docker Engine packages."
+    for pkg in "${docker_packages[@]}"; do
+      ensure_package_installed "$pkg" || return 1
+    done
+  fi
+
+  docker_enable_and_verify || return 1
+  add_summary "Docker runtime: OK ($DOCKER_OS_ID $DOCKER_OS_VERSION_ID, official $DOCKER_REPOSITORY_FLAVOR repository)"
 }
 
 ensure_docker_group_membership() {
@@ -4145,12 +4485,13 @@ install_logguard_step() {
 }
 
 bootstrap_block() {
-  ensure_user_and_password_if_missing
-  ensure_home_dirs
-  ensure_sudo_nopasswd_block
-  ensure_acls_block
-  ensure_docker_group_membership
-  docker_login_amms_registry
+  ensure_user_and_password_if_missing || return 1
+  ensure_home_dirs || return 1
+  ensure_sudo_nopasswd_block || return 1
+  ensure_acls_block || return 1
+  ensure_docker_runtime || return 1
+  ensure_docker_group_membership || return 1
+  docker_login_amms_registry || return 1
 }
 
 prepare_dirs_after_skip_bootstrap() {
@@ -4647,8 +4988,13 @@ main() {
   fi
 
   section "SEKCJA 1/9 - BOOTSTRAP"
-  if prompt_yn "BOOTSTRAP: user '$TARGET_USER' + katalogi HOME + (opcjonalnie) sudoers + ACL + docker group?" "Y"; then
-    bootstrap_block
+  if prompt_yn "BOOTSTRAP: user '$TARGET_USER' + katalogi HOME + (opcjonalnie) sudoers + ACL + Docker Engine/Compose v2 + docker group?" "Y"; then
+    if ! bootstrap_block; then
+      echo "[$(ts)] ERROR: bootstrap failed; stopping installation before Docker group/login dependent steps."
+      add_summary "Bootstrap: ERROR (Docker runtime or prerequisite failed)"
+      print_summary
+      exit 1
+    fi
   else
     echo "[$(ts)] SKIP: bootstrap."
     prepare_dirs_after_skip_bootstrap
