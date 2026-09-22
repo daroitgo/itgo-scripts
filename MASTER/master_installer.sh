@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.118"
+MASTER_VERSION="1.2.119"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.26"
@@ -4576,9 +4576,20 @@ bootstrap_block() {
   ensure_home_dirs || return 1
   ensure_sudo_nopasswd_block || return 1
   ensure_acls_block || return 1
-  ensure_docker_runtime || return 1
-  ensure_docker_group_membership || return 1
-  docker_login_amms_registry || return 1
+
+  if prompt_yn "Sprawdzić / zainstalować Docker Engine + Docker Compose v2?" "Y"; then
+    ensure_docker_runtime || return 1
+  else
+    echo "[$(ts)] SKIP: Docker Engine + Docker Compose v2 setup."
+  fi
+
+  if command -v docker >/dev/null 2>&1; then
+    ensure_docker_group_membership || return 1
+    docker_login_amms_registry || return 1
+  else
+    echo "[$(ts)] SKIP: docker CLI nie istnieje. Pomijam docker group."
+    echo "[$(ts)] SKIP: docker CLI nie istnieje. Pomijam docker login."
+  fi
 }
 
 prepare_dirs_after_skip_bootstrap() {
@@ -5075,7 +5086,7 @@ main() {
   fi
 
   section "SEKCJA 1/9 - BOOTSTRAP"
-  if prompt_yn "BOOTSTRAP: user '$TARGET_USER' + katalogi HOME + (opcjonalnie) sudoers + ACL + Docker Engine/Compose v2 + docker group?" "Y"; then
+  if prompt_yn "BOOTSTRAP: user '$TARGET_USER' + katalogi HOME + (opcjonalnie) sudoers + ACL?" "Y"; then
     if ! bootstrap_block; then
       echo "[$(ts)] ERROR: bootstrap failed; stopping installation before Docker group/login dependent steps."
       add_summary "Bootstrap: ERROR (Docker runtime or prerequisite failed)"
