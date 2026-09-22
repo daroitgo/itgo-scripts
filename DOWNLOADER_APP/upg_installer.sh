@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - wget
 # ==========================================================
 
-VERSION="1.0.8"
+VERSION="1.0.9"
 MANIFEST_URL="https://helpdesk.itgo.com.pl/nextcloud/index.php/s/s2778Z6z4rEibLp/download"
 
 TARGET_DIR="${HOME}/UPG"
@@ -164,7 +164,7 @@ cleanup_old_artifacts() {
 
 backup_and_clear_amcs_runtime() {
   local timestamp backup_dir runtime_item source_file backup_file
-  local runtime_items=(config resources/logs resources/resources resources/states)
+  local runtime_items=(configs resources/logs resources/resources resources/states)
   local existing_items=()
 
   for runtime_item in "${runtime_items[@]}"; do
