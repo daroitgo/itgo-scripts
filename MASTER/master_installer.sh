@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.117"
+MASTER_VERSION="1.2.118"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.26"
@@ -1906,6 +1906,7 @@ docker_select_repository() {
   major="${DOCKER_OS_VERSION_ID%%.*}"
   DOCKER_REPOSITORY_FLAVOR=""
   DOCKER_APT_CODENAME=""
+  DOCKER_RPM_REPOSITORY_RELEASE_VERSION=""
 
   case "$DOCKER_OS_ID" in
     debian)
@@ -1928,23 +1929,26 @@ docker_select_repository() {
         echo "[$(ts)] ERROR: Rocky Linux ${DOCKER_OS_VERSION_ID} is not supported for automatic Docker CE installation."
         return 1
       esac
-      DOCKER_REPOSITORY_FLAVOR=rocky
+      # Docker's Rocky repository currently lacks docker-ce and docker-ce-cli;
+      # use the full, compatible RHEL repository while retaining detected OS.
+      DOCKER_REPOSITORY_FLAVOR=rhel
       ;;
     almalinux)
       case "$major" in 8|9|10) ;; *)
         echo "[$(ts)] ERROR: AlmaLinux ${DOCKER_OS_VERSION_ID} is not supported for automatic Docker CE installation."
         return 1
       esac
-      DOCKER_REPOSITORY_FLAVOR=alma
+      # Docker's Alma repository currently lacks docker-ce and docker-ce-cli.
+      DOCKER_REPOSITORY_FLAVOR=rhel
       ;;
     ol)
-      # Docker publishes a distinct Oracle Linux repository.  Do not map OL
-      # to CentOS: only OL8/OL9 are enabled here deliberately.
+      # Docker's Oracle repository currently lacks docker-ce and docker-ce-cli.
+      # Only OL8/OL9 are enabled here deliberately.
       case "$major" in 8|9) ;; *)
         echo "[$(ts)] ERROR: Oracle Linux ${DOCKER_OS_VERSION_ID} is not supported for automatic Docker CE installation (supported: OL8, OL9)."
         return 1
       esac
-      DOCKER_REPOSITORY_FLAVOR=oracle
+      DOCKER_REPOSITORY_FLAVOR=rhel
       ;;
     centos)
       # CentOS Linux is EOL; permit only current Stream-era major releases
@@ -1971,6 +1975,12 @@ docker_select_repository() {
         echo "[$(ts)] ERROR: unsafe distribution codename '$DOCKER_APT_CODENAME'."
         return 1
       }
+      ;;
+  esac
+
+  case "$DOCKER_REPOSITORY_FLAVOR" in
+    rhel|centos)
+      DOCKER_RPM_REPOSITORY_RELEASE_VERSION="$major"
       ;;
   esac
 
@@ -2059,18 +2069,91 @@ docker_setup_rpm_repository() {
     return 1
   }
 
-  if [[ -e "$repo_file" ]] && ! grep -Fq "https://download.docker.com/linux/$DOCKER_REPOSITORY_FLAVOR" "$repo_file"; then
-    echo "[$(ts)] ERROR: existing $repo_file does not point to the expected official Docker repository; refusing to overwrite it."
+  echo "[$(ts)] INFO: detected OS: $DOCKER_OS_ID $DOCKER_OS_VERSION_ID; Docker RPM repository: $DOCKER_REPOSITORY_FLAVOR/$DOCKER_RPM_REPOSITORY_RELEASE_VERSION"
+
+  if [[ -e "$repo_file" && ! -f "$repo_file" ]]; then
+    echo "[$(ts)] ERROR: Docker RPM repository path is not a regular file: $repo_file"
     return 1
   fi
 
   if [[ ! -f "$repo_file" ]]; then
     ensure_package_installed dnf-plugins-core || return 1
     echo "[$(ts)] ACTION: configure official Docker RPM repository for $DOCKER_OS_ID $DOCKER_OS_VERSION_ID"
-    dnf config-manager --add-repo "$repo_url"
+    dnf config-manager --add-repo "$repo_url" || return 1
   else
     echo "[$(ts)] OK: official Docker RPM repository already configured."
   fi
+
+  docker_set_rpm_repository_release_version "$repo_file"
+}
+
+docker_set_rpm_repository_release_version() {
+  local repo_file="${1:?}"
+  local release_version="$DOCKER_RPM_REPOSITORY_RELEASE_VERSION" repo_tmp=""
+
+  [[ "$release_version" =~ ^[0-9]+$ ]] || {
+    echo "[$(ts)] ERROR: cannot derive a major Docker RPM repository version from VERSION_ID='$DOCKER_OS_VERSION_ID'."
+    return 1
+  }
+  echo "[$(ts)] INFO: Docker RPM repository flavor: $DOCKER_REPOSITORY_FLAVOR; release version: $release_version"
+
+  [[ -f "$repo_file" ]] || {
+    echo "[$(ts)] ERROR: expected Docker RPM repository file is missing: $repo_file"
+    return 1
+  }
+
+  # Accept an earlier MASTER Docker repository for safe migration, then alter
+  # only Docker URL fields.  DNF's global releasever and other repositories
+  # remain untouched.
+  if ! grep -Eq '^((baseurl)|(gpgkey))=https://download\.docker\.com/linux/(rhel|rocky|alma|almalinux|oracle|centos)/' "$repo_file"; then
+    echo "[$(ts)] ERROR: $repo_file is not a recognized official Docker repository; refusing to modify it."
+    return 1
+  fi
+
+  repo_tmp="$(mktemp "${repo_file}.XXXXXX")" || return 1
+  if ! sed -E \
+    -e "/^(baseurl|gpgkey)=https:\/\/download\.docker\.com\/linux\/(rhel|rocky|alma|almalinux|oracle|centos)\// s#https://download.docker.com/linux/(rhel|rocky|alma|almalinux|oracle|centos)/#https://download.docker.com/linux/$DOCKER_REPOSITORY_FLAVOR/#" \
+    -e "/^baseurl=https:\/\/download\.docker\.com\/linux\/$DOCKER_REPOSITORY_FLAVOR\// s/\\\$releasever/$release_version/g" \
+    "$repo_file" > "$repo_tmp"; then
+    rm -f "$repo_tmp"
+    return 1
+  fi
+
+  if cmp -s "$repo_file" "$repo_tmp"; then
+    rm -f "$repo_tmp"
+    chmod 0644 "$repo_file" || return 1
+    echo "[$(ts)] OK: Docker RPM repository already uses release version $release_version."
+  else
+    echo "[$(ts)] ACTION: set Docker RPM repository to $DOCKER_REPOSITORY_FLAVOR/$release_version"
+    chmod 0644 "$repo_tmp" || {
+      rm -f "$repo_tmp"
+      return 1
+    }
+    mv -f "$repo_tmp" "$repo_file"
+  fi
+}
+
+docker_verify_rpm_package_availability() {
+  local pkg
+  local missing=()
+  local docker_packages=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+
+  ensure_package_installed dnf-plugins-core || {
+    echo "[$(ts)] ERROR: dnf-plugins-core is required to query Docker RPM repository metadata."
+    return 1
+  }
+
+  for pkg in "${docker_packages[@]}"; do
+    if ! dnf -q --refresh --disablerepo='*' --enablerepo=docker-ce-stable repoquery --available --qf '%{name}' "$pkg" 2>/dev/null | grep -Fxq "$pkg"; then
+      missing+=("$pkg")
+    fi
+  done
+
+  [[ "${#missing[@]}" -eq 0 ]] && return 0
+
+  echo "[$(ts)] ERROR: Docker RPM repository is missing required packages: ${missing[*]}"
+  echo "[$(ts)] ERROR: Docker package installation was not started; correct the Docker repository before retrying."
+  return 1
 }
 
 docker_enable_and_verify() {
@@ -2144,6 +2227,10 @@ ensure_docker_runtime() {
       return 1
       ;;
   esac
+
+  if [[ "$docker_ready" != yes && "$(os_family)" == rhel_family ]]; then
+    docker_verify_rpm_package_availability || return 1
+  fi
 
   if [[ "$docker_ready" == yes && "$compose_ready" != yes ]]; then
     echo "[$(ts)] INFO: Docker CLI exists but Compose v2 is missing; installing only docker-compose-plugin."
