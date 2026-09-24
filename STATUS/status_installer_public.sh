@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.26"
+VERSION="3.12.27"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -970,6 +970,7 @@ aism_jar="$HOME/UTILITY/AISM/amcs-installer.jar"
 aism_master_unit="/etc/systemd/system/aism-master.service"
 aism_slave_unit="/etc/systemd/system/aism-slave.service"
 cp_upg_launcher="$HOME/UTILITY/TOOLS/cp-upg"
+apache_clean_launcher="$HOME/UTILITY/TOOLS/apache-clean"
 
 status_installed="$(module_state "$status_vf")"
 tseq_installed="$(module_state "$tseq_vf")"
@@ -1422,6 +1423,13 @@ if [[ -x "$cp_upg_launcher" ]]; then
   cp_upg_details="launcher"
 fi
 
+apache_clean_component="NO"
+apache_clean_details="-"
+if [[ -x "$apache_clean_launcher" ]]; then
+  apache_clean_component="YES"
+  apache_clean_details="launcher"
+fi
+
 aism_component="NO"
 aism_details="-"
 aism_master_present=0
@@ -1454,7 +1462,8 @@ tools_body+="$(printf "%-12s %-6s %s" "COMPONENT" "INST" "DETAILS")"$'\n'
 tools_body+="$(printf "%-12s %-6s %s" "------------" "------" "----------------")"$'\n'
 tools_body+="$(component_row "AMCS" "$amcs_component" "$amcs_details")"$'\n'
 tools_body+="$(component_row "AISM" "$aism_component" "$aism_details")"$'\n'
-tools_body+="$(component_row "cp-upg" "$cp_upg_component" "$cp_upg_details")"
+tools_body+="$(component_row "cp-upg" "$cp_upg_component" "$cp_upg_details")"$'\n'
+tools_body+="$(component_row "apache-clean" "$apache_clean_component" "$apache_clean_details")"
 
 echo
 render_two_boxes "MODULES" "$modules_body" "TOOLS / COMPONENTS" "$tools_body" "$cols"
