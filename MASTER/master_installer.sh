@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.122"
+MASTER_VERSION="1.2.123"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.27"
@@ -3100,8 +3100,8 @@ main() {
     return 1
   fi
 
-  if [[ ! -d "$CACHE_DIR" ]]; then
-    echo "ERROR: Apache proxy cache directory does not exist: $CACHE_DIR" >&2
+  if ! sudo test -d "$CACHE_DIR"; then
+    echo "ERROR: Apache proxy cache directory does not exist or is not accessible with sudo: $CACHE_DIR" >&2
     return 1
   fi
 
