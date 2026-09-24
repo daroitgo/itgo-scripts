@@ -37,10 +37,10 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.121"
+MASTER_VERSION="1.2.122"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
-STATUS_VERSION="3.12.26"
+STATUS_VERSION="3.12.27"
 CLEANUP_VERSION="1.0.3"
 TSEQ_VERSION="3.12.9"
 DOWNLOADER_APP_VERSION="1.0.9"
@@ -3050,6 +3050,92 @@ install_cp_upg_step() {
   install_cp_upg_helper
 }
 
+install_apache_clean_helper() {
+  local tools_dir="$UTILITY_DIR/TOOLS"
+  local apache_clean_launcher="$tools_dir/apache-clean"
+
+  echo "[$(ts)] ACTION: install Apache cache-cleaning launcher into $tools_dir"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$tools_dir"
+
+  cat > "$apache_clean_launcher" <<'EOF_APACHE_CLEAN'
+#!/usr/bin/env bash
+set -euo pipefail 2>/dev/null || set -eu
+
+readonly CACHE_DIR="/var/cache/httpd/proxy"
+
+usage() {
+  cat <<'EOF_USAGE'
+Usage:
+  apache-clean
+  apache-clean -h
+  apache-clean --help
+
+Clean the Apache HTTP proxy cache at the fixed path:
+  /var/cache/httpd/proxy
+EOF_USAGE
+}
+
+main() {
+  if [[ "$#" -gt 1 ]]; then
+    echo "ERROR: apache-clean does not accept more than one argument." >&2
+    usage >&2
+    return 1
+  fi
+
+  case "${1:-}" in
+    "")
+      ;;
+    -h|--help)
+      usage
+      return 0
+      ;;
+    *)
+      echo "ERROR: unsupported argument '$1'. Use 'apache-clean --help'." >&2
+      return 1
+      ;;
+  esac
+
+  if ! command -v htcacheclean >/dev/null 2>&1; then
+    echo "ERROR: required command 'htcacheclean' was not found in PATH." >&2
+    return 1
+  fi
+
+  if [[ ! -d "$CACHE_DIR" ]]; then
+    echo "ERROR: Apache proxy cache directory does not exist: $CACHE_DIR" >&2
+    return 1
+  fi
+
+  echo "INFO: Apache proxy cache size before cleanup:"
+  sudo du -sh /var/cache/httpd/proxy
+
+  sudo htcacheclean -v -t -p /var/cache/httpd/proxy -l 1K
+
+  echo "INFO: Apache proxy cache size after cleanup:"
+  sudo du -sh /var/cache/httpd/proxy
+}
+
+main "$@"
+EOF_APACHE_CLEAN
+
+  chown "$TARGET_USER:$TARGET_USER" "$apache_clean_launcher" 2>/dev/null || true
+  chmod 0700 "$apache_clean_launcher" 2>/dev/null || true
+
+  add_summary "TOOLS launcher installed: ~/UTILITY/TOOLS/apache-clean"
+}
+
+install_apache_clean_step() {
+  if ! have_user; then
+    echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+    exit 1
+  fi
+
+  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+  [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+  UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+  install_apache_clean_helper
+}
+
 configure_amcs_firewall_public() {
   local firewall_cmd=""
   local port changed=0
@@ -4900,6 +4986,12 @@ main() {
       echo "[$(ts)] SKIP: TOOLS/cp-upg."
       add_summary "TOOLS/cp-upg: skipped by user"
     fi
+    if prompt_yn "MODUŁ: TOOLS/apache-clean (czyszczenie Apache proxy cache /var/cache/httpd/proxy)?" "Y"; then
+      install_apache_clean_step
+    else
+      echo "[$(ts)] SKIP: TOOLS/apache-clean."
+      add_summary "TOOLS/apache-clean: skipped by user"
+    fi
     install_amcs_step
     install_aism_step
 
@@ -4936,6 +5028,11 @@ main() {
     print_detected_modules_summary "$detected_modules"
 
     install_cp_upg_helper
+    if [[ -x "$ITGO_HOME/UTILITY/TOOLS/apache-clean" ]]; then
+      install_apache_clean_helper
+    else
+      add_summary "TOOLS/apache-clean: SKIP (not installed)"
+    fi
 
     if ! ensure_tmp_dir_for_module_actions; then
       echo "[$(ts)] WARN: nie udało się przygotować TMP_DIR dla update-only. Pomijam update-only."
@@ -5190,6 +5287,12 @@ main() {
   else
     echo "[$(ts)] SKIP: TOOLS/cp-upg."
     add_summary "TOOLS/cp-upg: skipped by user"
+  fi
+  if prompt_yn "MODUŁ: TOOLS/apache-clean (czyszczenie Apache proxy cache /var/cache/httpd/proxy)?" "Y"; then
+    install_apache_clean_step
+  else
+    echo "[$(ts)] SKIP: TOOLS/apache-clean."
+    add_summary "TOOLS/apache-clean: skipped by user"
   fi
 
   section "SEKCJA 7/9 - AMCS"
