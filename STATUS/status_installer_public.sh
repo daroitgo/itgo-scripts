@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.27"
+VERSION="3.12.28"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -971,6 +971,7 @@ aism_master_unit="/etc/systemd/system/aism-master.service"
 aism_slave_unit="/etc/systemd/system/aism-slave.service"
 cp_upg_launcher="$HOME/UTILITY/TOOLS/cp-upg"
 apache_clean_launcher="$HOME/UTILITY/TOOLS/apache-clean"
+db_install_launcher="$HOME/UTILITY/TOOLS/db-install"
 
 status_installed="$(module_state "$status_vf")"
 tseq_installed="$(module_state "$tseq_vf")"
@@ -1430,6 +1431,13 @@ if [[ -x "$apache_clean_launcher" ]]; then
   apache_clean_details="launcher"
 fi
 
+db_install_component="NO"
+db_install_details="-"
+if [[ -x "$db_install_launcher" ]]; then
+  db_install_component="YES"
+  db_install_details="launcher"
+fi
+
 aism_component="NO"
 aism_details="-"
 aism_master_present=0
@@ -1463,7 +1471,8 @@ tools_body+="$(printf "%-12s %-6s %s" "------------" "------" "----------------"
 tools_body+="$(component_row "AMCS" "$amcs_component" "$amcs_details")"$'\n'
 tools_body+="$(component_row "AISM" "$aism_component" "$aism_details")"$'\n'
 tools_body+="$(component_row "cp-upg" "$cp_upg_component" "$cp_upg_details")"$'\n'
-tools_body+="$(component_row "apache-clean" "$apache_clean_component" "$apache_clean_details")"
+tools_body+="$(component_row "apache-clean" "$apache_clean_component" "$apache_clean_details")"$'\n'
+tools_body+="$(component_row "db-install" "$db_install_component" "$db_install_details")"
 
 echo
 render_two_boxes "MODULES" "$modules_body" "TOOLS / COMPONENTS" "$tools_body" "$cols"
