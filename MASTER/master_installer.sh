@@ -37,10 +37,10 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.123"
+MASTER_VERSION="1.2.124"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
-STATUS_VERSION="3.12.27"
+STATUS_VERSION="3.12.28"
 CLEANUP_VERSION="1.0.3"
 TSEQ_VERSION="3.12.9"
 DOWNLOADER_APP_VERSION="1.0.9"
@@ -3136,6 +3136,178 @@ install_apache_clean_step() {
   install_apache_clean_helper
 }
 
+install_db_install_helper() {
+  local tools_dir="$UTILITY_DIR/TOOLS"
+  local db_install_launcher="$tools_dir/db-install"
+
+  echo "[$(ts)] ACTION: install database installer launcher into $tools_dir"
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$tools_dir"
+
+  cat > "$db_install_launcher" <<'EOF_DB_INSTALL'
+#!/usr/bin/env bash
+set -euo pipefail 2>/dev/null || set -eu
+
+usage() {
+  cat <<'EOF_USAGE'
+Usage:
+  db-install edm
+  db-install mpi
+  db-install -h
+  db-install --help
+EOF_USAGE
+}
+
+find_candidates() {
+  local db_type="$1"
+  local root candidate
+
+  CANDIDATES=()
+  while IFS= read -r -d '' candidate; do
+    [[ -f "$candidate/db-installer-ora.yml" ]] && CANDIDATES+=("$candidate")
+  done < <(
+    for root in /srv /opt; do
+      [[ -d "$root" ]] || continue
+      find "$root" -mindepth 1 -maxdepth 1 -type d -iname "${db_type}*" -print0
+    done | LC_ALL=C sort -z
+  )
+}
+
+choose_candidate() {
+  local selection
+
+  if (( ${#CANDIDATES[@]} == 1 )); then
+    SELECTED_DIR="${CANDIDATES[0]}"
+    echo "INFO: znaleziono katalog: $SELECTED_DIR"
+    return 0
+  fi
+
+  echo "INFO: znaleziono więcej niż jeden katalog:"
+  local i
+  for i in "${!CANDIDATES[@]}"; do
+    printf '  %d) %s\n' "$((i + 1))" "${CANDIDATES[i]}"
+  done
+
+  read -r -p "Wybierz numer katalogu: " selection || {
+    echo "ERROR: nie wybrano katalogu." >&2
+    return 1
+  }
+  if [[ ! "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > ${#CANDIDATES[@]} )); then
+    echo "ERROR: nieprawidłowy numer katalogu." >&2
+    return 1
+  fi
+
+  SELECTED_DIR="${CANDIDATES[selection - 1]}"
+  echo "INFO: wybrano katalog: $SELECTED_DIR"
+}
+
+confirm_run() {
+  local answer
+
+  read -r -p "Uruchomić instalator bazy? [y/N]: " answer || return 1
+  [[ "$answer" == "y" || "$answer" == "Y" ]]
+}
+
+main() {
+  local db_type service rc compose_services
+
+  case "${1:-}" in
+    -h|--help)
+      [[ $# -eq 1 ]] || { usage >&2; exit 1; }
+      usage
+      exit 0
+      ;;
+    edm|mpi)
+      [[ $# -eq 1 ]] || { echo "ERROR: podaj dokładnie jeden typ: edm lub mpi." >&2; usage >&2; exit 1; }
+      db_type="$1"
+      ;;
+    '')
+      echo "ERROR: brak typu bazy (edm lub mpi)." >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      echo "ERROR: nieobsługiwany typ bazy: $1 (dozwolone: edm, mpi)." >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+
+  find_candidates "$db_type"
+  if (( ${#CANDIDATES[@]} == 0 )); then
+    echo "ERROR: nie znaleziono poprawnego katalogu dla typu $db_type; przeszukano /srv i /opt." >&2
+    exit 1
+  fi
+
+  choose_candidate || exit 1
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: nie znaleziono polecenia docker." >&2
+    exit 1
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    echo "ERROR: Docker Compose v2 ('docker compose') nie jest dostępny." >&2
+    exit 1
+  fi
+  if [[ ! -d "$SELECTED_DIR" ]]; then
+    echo "ERROR: wybrany katalog już nie istnieje: $SELECTED_DIR" >&2
+    exit 1
+  fi
+  if [[ ! -f "$SELECTED_DIR/db-installer-ora.yml" ]]; then
+    echo "ERROR: brakuje pliku: $SELECTED_DIR/db-installer-ora.yml" >&2
+    exit 1
+  fi
+
+  if [[ "$db_type" == "edm" ]]; then
+    service="dbInstall"
+  else
+    service="dbInstallOra"
+  fi
+
+  if ! compose_services="$(cd -- "$SELECTED_DIR" && docker compose -f db-installer-ora.yml config --services)"; then
+    echo "ERROR: nie udało się odczytać usług z db-installer-ora.yml." >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$compose_services" | grep -Fxq -- "$service"; then
+    echo "ERROR: wymagana usługa '$service' nie istnieje w db-installer-ora.yml." >&2
+    exit 1
+  fi
+
+  printf 'Typ bazy : %s\nKatalog  : %s\nCompose  : db-installer-ora.yml\nUsługa   : %s\nPolecenie: docker compose -f db-installer-ora.yml up %s\n' "${db_type^^}" "$SELECTED_DIR" "$service" "$service"
+  if ! confirm_run; then
+    echo "INFO: instalator nie został uruchomiony."
+    exit 0
+  fi
+
+  if (cd -- "$SELECTED_DIR" && docker compose -f db-installer-ora.yml up "$service"); then
+    echo "SUCCESS: instalator bazy zakończył się pomyślnie."
+  else
+    rc=$?
+    echo "FAILED: docker compose zakończył się kodem $rc." >&2
+    exit "$rc"
+  fi
+}
+
+main "$@"
+EOF_DB_INSTALL
+
+  chown "$TARGET_USER:$TARGET_USER" "$db_install_launcher" 2>/dev/null || true
+  chmod 0700 "$db_install_launcher" 2>/dev/null || true
+
+  add_summary "TOOLS launcher installed: ~/UTILITY/TOOLS/db-install"
+}
+
+install_db_install_step() {
+  if ! have_user; then
+    echo "[$(ts)] ERROR: user '$TARGET_USER' missing."
+    exit 1
+  fi
+
+  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
+  [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
+
+  UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
+  install_db_install_helper
+}
+
 configure_amcs_firewall_public() {
   local firewall_cmd=""
   local port changed=0
@@ -4992,6 +5164,12 @@ main() {
       echo "[$(ts)] SKIP: TOOLS/apache-clean."
       add_summary "TOOLS/apache-clean: skipped by user"
     fi
+    if prompt_yn "MODUŁ: TOOLS/db-install (świadome uruchamianie instalatorów baz EDM/MPI)?" "Y"; then
+      install_db_install_step
+    else
+      echo "[$(ts)] SKIP: TOOLS/db-install."
+      add_summary "TOOLS/db-install: skipped by user"
+    fi
     install_amcs_step
     install_aism_step
 
@@ -5032,6 +5210,11 @@ main() {
       install_apache_clean_helper
     else
       add_summary "TOOLS/apache-clean: SKIP (not installed)"
+    fi
+    if [[ -x "$ITGO_HOME/UTILITY/TOOLS/db-install" ]]; then
+      install_db_install_helper
+    else
+      add_summary "TOOLS/db-install: SKIP (not installed)"
     fi
 
     if ! ensure_tmp_dir_for_module_actions; then
@@ -5293,6 +5476,12 @@ main() {
   else
     echo "[$(ts)] SKIP: TOOLS/apache-clean."
     add_summary "TOOLS/apache-clean: skipped by user"
+  fi
+  if prompt_yn "MODUŁ: TOOLS/db-install (świadome uruchamianie instalatorów baz EDM/MPI)?" "Y"; then
+    install_db_install_step
+  else
+    echo "[$(ts)] SKIP: TOOLS/db-install."
+    add_summary "TOOLS/db-install: skipped by user"
   fi
 
   section "SEKCJA 7/9 - AMCS"
