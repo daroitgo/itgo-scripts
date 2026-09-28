@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.124"
+MASTER_VERSION="1.2.125"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.28"
@@ -3208,7 +3208,8 @@ confirm_run() {
 }
 
 main() {
-  local db_type service rc compose_services
+  local db_type service rc compose_services compose_variant compose_display
+  local -a compose_cmd
 
   case "${1:-}" in
     -h|--help)
@@ -3239,12 +3240,16 @@ main() {
   fi
 
   choose_candidate || exit 1
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "ERROR: nie znaleziono polecenia docker." >&2
-    exit 1
-  fi
-  if ! docker compose version >/dev/null 2>&1; then
-    echo "ERROR: Docker Compose v2 ('docker compose') nie jest dostępny." >&2
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    compose_cmd=(docker compose)
+    compose_variant="Docker Compose v2"
+    compose_display="docker compose"
+  elif command -v docker-compose >/dev/null 2>&1 && docker-compose --version >/dev/null 2>&1; then
+    compose_cmd=(docker-compose)
+    compose_variant="Docker Compose v1"
+    compose_display="docker-compose"
+  else
+    echo "ERROR: nie znaleziono działającego Docker Compose (v2: 'docker compose', v1: 'docker-compose')." >&2
     exit 1
   fi
   if [[ ! -d "$SELECTED_DIR" ]]; then
@@ -3262,7 +3267,7 @@ main() {
     service="dbInstallOra"
   fi
 
-  if ! compose_services="$(cd -- "$SELECTED_DIR" && docker compose -f db-installer-ora.yml config --services)"; then
+  if ! compose_services="$(cd -- "$SELECTED_DIR" && "${compose_cmd[@]}" -f db-installer-ora.yml config --services)"; then
     echo "ERROR: nie udało się odczytać usług z db-installer-ora.yml." >&2
     exit 1
   fi
@@ -3271,17 +3276,17 @@ main() {
     exit 1
   fi
 
-  printf 'Typ bazy : %s\nKatalog  : %s\nCompose  : db-installer-ora.yml\nUsługa   : %s\nPolecenie: docker compose -f db-installer-ora.yml up %s\n' "${db_type^^}" "$SELECTED_DIR" "$service" "$service"
+  printf 'Typ bazy : %s\nKatalog  : %s\nCompose  : %s\nPlik     : db-installer-ora.yml\nUsługa   : %s\nPolecenie: %s -f db-installer-ora.yml up %s\n' "${db_type^^}" "$SELECTED_DIR" "$compose_variant" "$service" "$compose_display" "$service"
   if ! confirm_run; then
     echo "INFO: instalator nie został uruchomiony."
     exit 0
   fi
 
-  if (cd -- "$SELECTED_DIR" && docker compose -f db-installer-ora.yml up "$service"); then
+  if (cd -- "$SELECTED_DIR" && "${compose_cmd[@]}" -f db-installer-ora.yml up "$service"); then
     echo "SUCCESS: instalator bazy zakończył się pomyślnie."
   else
     rc=$?
-    echo "FAILED: docker compose zakończył się kodem $rc." >&2
+    echo "FAILED: $compose_display zakończył się kodem $rc." >&2
     exit "$rc"
   fi
 }
