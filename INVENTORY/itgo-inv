@@ -20,15 +20,20 @@ REPORTS_DIR="${BASE_DIR}/reports"
 LOGS_DIR="${BASE_DIR}/logs"
 VERSION_FILE="${BASE_DIR}/inventory.version"
 IDENTITY_FILE="${ITGO_HOME}/UTILITY/ITGO-CONFIG/client-identity.json"
+CONFIG_DIR="${BASE_DIR}/config"
+NEXTCLOUD_CONF="${CONFIG_DIR}/nextcloud.conf"
+NEXTCLOUD_CRED="${CONFIG_DIR}/nextcloud.cred"
 
 usage() {
   cat <<'EOF'
-Usage: itgo-inv [collect|latest|version|help]
+Usage: itgo-inv [collect|latest|version|configure-nextcloud|test-nextcloud|help]
 
 Commands:
   collect   Generate an offline inventory JSON report
   latest    Show the newest local inventory report
   version   Show module and collector versions
+  configure-nextcloud  Configure Nextcloud WebDAV upload
+  test-nextcloud       Test configured Nextcloud WebDAV access
   help      Show this help
 EOF
 }
@@ -83,6 +88,274 @@ except Exception:
   fi
 
   safe_filename_part "$code"
+}
+
+has_cr_or_lf() {
+  case "$1" in
+    *$'\r'*|*$'\n'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+nextcloud_configuration_state() {
+  if [ -f "$NEXTCLOUD_CONF" ] && [ -f "$NEXTCLOUD_CRED" ]; then
+    return 0
+  fi
+  if [ ! -e "$NEXTCLOUD_CONF" ] && [ ! -e "$NEXTCLOUD_CRED" ]; then
+    return 2
+  fi
+  printf 'ERROR: incomplete Nextcloud configuration; both nextcloud.conf and nextcloud.cred are required.\n' >&2
+  return 1
+}
+
+curl_config_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s' "$value"
+}
+
+url_encode_nextcloud_user() {
+  local py_cmd
+
+  py_cmd="$(python_command)" || return 1
+  "$py_cmd" -c 'import sys
+try:
+    from urllib.parse import quote
+except ImportError:
+    from urllib import quote
+print(quote(sys.argv[1], safe=""))
+' "$1"
+}
+
+load_nextcloud_config() {
+  local key value
+
+  NEXTCLOUD_URL=""
+  NEXTCLOUD_USER=""
+  CREDENTIAL_MODE=""
+
+  [ -f "$NEXTCLOUD_CONF" ] || {
+    printf 'ERROR: Nextcloud WebDAV is not configured: %s\n' "$NEXTCLOUD_CONF" >&2
+    return 1
+  }
+  [ -f "$NEXTCLOUD_CRED" ] || {
+    printf 'ERROR: Nextcloud credential is missing: %s\n' "$NEXTCLOUD_CRED" >&2
+    return 1
+  }
+
+  while IFS='=' read -r key value || [ -n "$key" ]; do
+    case "$key" in
+      NEXTCLOUD_URL) NEXTCLOUD_URL="$value" ;;
+      NEXTCLOUD_USER) NEXTCLOUD_USER="$value" ;;
+      CREDENTIAL_MODE) CREDENTIAL_MODE="$value" ;;
+      ''|'#'*) ;;
+    esac
+  done < "$NEXTCLOUD_CONF"
+
+  if [ -z "$NEXTCLOUD_URL" ] || [ -z "$NEXTCLOUD_USER" ] || [ -z "$CREDENTIAL_MODE" ] \
+    || has_cr_or_lf "$NEXTCLOUD_URL" || has_cr_or_lf "$NEXTCLOUD_USER" || has_cr_or_lf "$CREDENTIAL_MODE"; then
+    printf 'ERROR: invalid Nextcloud configuration.\n' >&2
+    return 1
+  fi
+  case "$CREDENTIAL_MODE" in
+    systemd-creds|plain-0600) ;;
+    *)
+      printf 'ERROR: unsupported Nextcloud credential mode.\n' >&2
+      return 1
+      ;;
+  esac
+}
+
+read_nextcloud_credential() {
+  NEXTCLOUD_PASSWORD=""
+
+  case "$CREDENTIAL_MODE" in
+    systemd-creds)
+      NEXTCLOUD_PASSWORD="$(systemd-creds decrypt --user --name=nextcloud-password "$NEXTCLOUD_CRED" - 2>/dev/null)" || {
+        printf 'ERROR: could not decrypt Nextcloud credential.\n' >&2
+        return 1
+      }
+      ;;
+    plain-0600)
+      NEXTCLOUD_PASSWORD="$(cat -- "$NEXTCLOUD_CRED")" || {
+        printf 'ERROR: could not read Nextcloud credential.\n' >&2
+        return 1
+      }
+      ;;
+  esac
+
+  if [ -z "$NEXTCLOUD_PASSWORD" ] || has_cr_or_lf "$NEXTCLOUD_PASSWORD"; then
+    unset NEXTCLOUD_PASSWORD
+    printf 'ERROR: invalid Nextcloud credential.\n' >&2
+    return 1
+  fi
+}
+
+nextcloud_curl() {
+  local method="$1" url="$2" upload_path="${3:-}" http_status curl_status
+
+  http_status="$({
+    printf 'user = "%s"\n' "$(curl_config_escape "${NEXTCLOUD_USER}:${NEXTCLOUD_PASSWORD}")"
+    printf 'request = "%s"\n' "$(curl_config_escape "$method")"
+    case "$method" in
+      PROPFIND) printf 'header = "Depth: 0"\n' ;;
+      PUT) printf 'header = "If-None-Match: *"\n' ;;
+    esac
+    printf 'fail\nsilent\nshow-error\noutput = "/dev/null"\n'
+    if [ -n "$upload_path" ]; then
+      printf 'upload-file = "%s"\n' "$(curl_config_escape "$upload_path")"
+    fi
+    printf 'url = "%s"\n' "$(curl_config_escape "$url")"
+    printf 'write-out = "%%{http_code}"\n'
+  } | curl --config -)"
+  curl_status=$?
+  if [ "$curl_status" -ne 0 ]; then
+    return 1
+  fi
+
+  case "${method}:${http_status}" in
+    PROPFIND:207|PUT:200|PUT:201|PUT:204) return 0 ;;
+    *)
+      printf 'ERROR: unexpected WebDAV HTTP status %s for %s.\n' "${http_status:-unknown}" "$method" >&2
+      return 1
+      ;;
+  esac
+}
+
+nextcloud_preflight() {
+  local client_code="$1" encoded_user
+
+  load_nextcloud_config || return 1
+  command -v curl >/dev/null 2>&1 || {
+    printf 'ERROR: curl is required for Nextcloud WebDAV.\n' >&2
+    return 1
+  }
+  read_nextcloud_credential || return 1
+  encoded_user="$(url_encode_nextcloud_user "$NEXTCLOUD_USER")" || {
+    unset NEXTCLOUD_PASSWORD
+    printf 'ERROR: could not URL-encode Nextcloud user.\n' >&2
+    return 1
+  }
+  NEXTCLOUD_REMOTE_DIR="INVENTORY/${client_code}/"
+  NEXTCLOUD_DAV_DIR_URL="${NEXTCLOUD_URL}/remote.php/dav/files/${encoded_user}/${NEXTCLOUD_REMOTE_DIR}"
+
+  if ! nextcloud_curl PROPFIND "$NEXTCLOUD_DAV_DIR_URL"; then
+    unset NEXTCLOUD_PASSWORD
+    return 1
+  fi
+  unset NEXTCLOUD_PASSWORD
+}
+
+nextcloud_upload_report() {
+  local client_code="$1" report_name="$2" report_path="$3" encoded_user report_url
+
+  load_nextcloud_config || return 1
+  read_nextcloud_credential || return 1
+  encoded_user="$(url_encode_nextcloud_user "$NEXTCLOUD_USER")" || {
+    unset NEXTCLOUD_PASSWORD
+    return 1
+  }
+  report_url="${NEXTCLOUD_URL}/remote.php/dav/files/${encoded_user}/INVENTORY/${client_code}/${report_name}"
+
+  if ! nextcloud_curl PUT "$report_url" "$report_path"; then
+    unset NEXTCLOUD_PASSWORD
+    return 1
+  fi
+  if ! nextcloud_curl PROPFIND "$report_url"; then
+    unset NEXTCLOUD_PASSWORD
+    return 1
+  fi
+  unset NEXTCLOUD_PASSWORD
+  return 0
+}
+
+configure_nextcloud() {
+  local url="" user="" password="" encrypted="" recovered="" cred_tmp="" config_tmp="" credential_mode=""
+
+  read -r -p 'Nextcloud URL: ' url || true
+  read -r -p 'Nextcloud technical user: ' user || true
+  read -r -s -p 'Nextcloud App Password: ' password || true
+  printf '\n'
+
+  while [ "${url%/}" != "$url" ]; do url="${url%/}"; done
+  if [ -z "$url" ] || [ -z "$user" ] || [ -z "$password" ] \
+    || has_cr_or_lf "$url" || has_cr_or_lf "$user" || has_cr_or_lf "$password"; then
+    unset password encrypted recovered
+    printf 'ERROR: URL, user and App Password must be non-empty and must not contain CR/LF.\n' >&2
+    return 1
+  fi
+
+  if ! mkdir -p "$CONFIG_DIR" || ! chmod 0700 "$CONFIG_DIR"; then
+    unset password encrypted recovered
+    return 1
+  fi
+  cred_tmp="${CONFIG_DIR}/.nextcloud.cred.tmp.$$"
+  config_tmp="${CONFIG_DIR}/.nextcloud.conf.tmp.$$"
+  credential_mode="plain-0600"
+  if command -v systemd-creds >/dev/null 2>&1; then
+    encrypted="$(printf '%s' "$password" | systemd-creds encrypt --user --name=nextcloud-password - - 2>/dev/null)" || encrypted=""
+    if [ -n "$encrypted" ]; then
+      recovered="$(printf '%s' "$encrypted" | systemd-creds decrypt --user --name=nextcloud-password - - 2>/dev/null)" || recovered=""
+      if [ "$recovered" = "$password" ]; then
+        credential_mode="systemd-creds"
+      else
+        encrypted=""
+      fi
+      unset recovered
+    fi
+  fi
+
+  if [ "$credential_mode" = "systemd-creds" ]; then
+    (umask 077; printf '%s\n' "$encrypted" > "$cred_tmp") && chmod 0600 "$cred_tmp" || {
+      rm -f -- "$cred_tmp" "$config_tmp"
+      unset password encrypted recovered
+      return 1
+    }
+  else
+    (umask 077; printf '%s' "$password" > "$cred_tmp") && chmod 0600 "$cred_tmp" || {
+      rm -f -- "$cred_tmp" "$config_tmp"
+      unset password encrypted recovered
+      return 1
+    }
+  fi
+
+  (umask 077; {
+    printf 'NEXTCLOUD_URL=%s\n' "$url"
+    printf 'NEXTCLOUD_USER=%s\n' "$user"
+    printf 'CREDENTIAL_MODE=%s\n' "$credential_mode"
+  } > "$config_tmp") && chmod 0600 "$config_tmp" || {
+    rm -f -- "$cred_tmp" "$config_tmp"
+    unset password encrypted recovered
+    return 1
+  }
+
+  if ! mv -f -- "$cred_tmp" "$NEXTCLOUD_CRED" || ! mv -f -- "$config_tmp" "$NEXTCLOUD_CONF"; then
+    rm -f -- "$cred_tmp" "$config_tmp"
+    unset password encrypted recovered
+    return 1
+  fi
+  if [ "$credential_mode" = "plain-0600" ]; then
+    printf 'WARNING: user-scoped systemd-creds is unavailable; App Password is protected only by filesystem mode 0600.\n' >&2
+  fi
+  unset password encrypted recovered
+  printf 'Nextcloud WebDAV configuration saved. Credential mode: %s\n' "$credential_mode"
+}
+
+test_nextcloud() {
+  local client_code
+
+  client_code="$(read_client_code)"
+  if [ "$client_code" = "unknown" ]; then
+    printf 'ERROR: valid client_code is unavailable; cannot test Nextcloud WebDAV.\n' >&2
+    return 1
+  fi
+  if ! nextcloud_preflight "$client_code"; then
+    printf 'ERROR: Nextcloud WebDAV preflight failed.\n' >&2
+    return 1
+  fi
+  printf 'URL: %s\nUser: %s\nClient code: %s\nRemote directory: INVENTORY/%s/\nCredential mode: %s\nSUCCESS: Nextcloud WebDAV preflight passed.\n' \
+    "$NEXTCLOUD_URL" "$NEXTCLOUD_USER" "$client_code" "$client_code" "$CREDENTIAL_MODE"
 }
 
 collector_has_output_option() {
@@ -150,8 +423,6 @@ clean_old_inventory_reports() {
     esac
   fi
 
-  find "$reports_real" -maxdepth 1 -type f -name 'inventory_*.json' -exec rm -f -- {} \;
-
   if [ -n "$current_temp_path" ]; then
     find "$reports_real" -maxdepth 1 -type f -name '.inventory_*.json.tmp.*' -exec sh -c '
       current_temp="$1"
@@ -166,7 +437,7 @@ clean_old_inventory_reports() {
 }
 
 collect_report() {
-  local client_code hostname timestamp report_name report_path temp_path log_path
+  local client_code hostname timestamp report_name report_path temp_path log_path nextcloud_ready=0 collision_index=0 nextcloud_state
 
   if [ ! -f "$COLLECTOR" ]; then
     printf 'error: collector not found: %s\n' "$COLLECTOR" >&2
@@ -184,10 +455,40 @@ collect_report() {
   fi
 
   client_code="$(read_client_code)"
+  if [ "$client_code" = "unknown" ]; then
+    printf 'WARNING: valid client_code is unavailable; Nextcloud upload is disabled.\n' >&2
+    printf 'Inventory will be generated locally and preserved.\n' >&2
+  else
+    nextcloud_configuration_state
+    nextcloud_state=$?
+    case "$nextcloud_state" in
+      0)
+        if nextcloud_preflight "$client_code"; then
+          nextcloud_ready=1
+        else
+          printf 'WARNING: Nextcloud WebDAV preflight failed.\n' >&2
+          printf 'Inventory will be generated locally and preserved.\n' >&2
+        fi
+        ;;
+      2)
+        printf 'WARNING: automatic Nextcloud upload is not configured.\n' >&2
+        printf 'Inventory will be generated locally and preserved.\n' >&2
+        ;;
+      *)
+        printf 'WARNING: Nextcloud WebDAV preflight failed.\n' >&2
+        printf 'Inventory will be generated locally and preserved.\n' >&2
+        ;;
+    esac
+  fi
   hostname="$(safe_filename_part "$(hostname 2>/dev/null || printf 'unknown')")"
   timestamp="$(date '+%Y%m%d_%H%M%S')"
   report_name="inventory_${client_code}_${hostname}_${timestamp}.json"
   report_path="${REPORTS_DIR}/${report_name}"
+  while [ -e "$report_path" ]; do
+    collision_index=$((collision_index + 1))
+    report_name="inventory_${client_code}_${hostname}_${timestamp}_${collision_index}.json"
+    report_path="${REPORTS_DIR}/${report_name}"
+  done
   temp_path="${REPORTS_DIR}/.${report_name}.tmp.$$"
   log_path="${LOGS_DIR}/inventory_${timestamp}.log"
 
@@ -222,6 +523,24 @@ collect_report() {
 
   chmod 0600 "$report_path" 2>/dev/null || true
   printf 'Inventory report: %s\n' "$report_path"
+
+  if [ "$nextcloud_ready" = "1" ]; then
+    if nextcloud_upload_report "$client_code" "$report_name" "$report_path"; then
+      printf 'SUCCESS: inventory report uploaded to Nextcloud.\n'
+      printf 'Remote: INVENTORY/%s/%s\n' "$client_code" "$report_name"
+      if rm -f -- "$report_path" && [ ! -e "$report_path" ]; then
+        printf 'Local report removed after verified upload.\n'
+      else
+        printf 'WARNING: inventory upload was verified, but the local report could not be removed.\n' >&2
+        printf 'Local report preserved: %s\n' "$report_path" >&2
+      fi
+    else
+      printf 'WARNING: inventory upload to Nextcloud failed.\n' >&2
+      printf 'Local report preserved: %s\n' "$report_path" >&2
+    fi
+  else
+    printf 'Local report preserved: %s\n' "$report_path" >&2
+  fi
 }
 
 show_latest() {
@@ -267,6 +586,12 @@ case "$command_name" in
     ;;
   version)
     show_version
+    ;;
+  configure-nextcloud)
+    configure_nextcloud
+    ;;
+  test-nextcloud)
+    test_nextcloud
     ;;
   help|-h|--help)
     usage
