@@ -7,7 +7,7 @@ fi
 
 set -euo pipefail 2>/dev/null || set -eu
 
-VERSION="0.1.6"
+VERSION="0.1.7"
 
 MODE="install"
 TARGET_USER="${SUDO_USER:-${USER:-itgo}}"
@@ -226,7 +226,7 @@ path_is_nested_under_any_root() {
 
 find_scannable_app_dirs() {
   local root="${1:?}"
-  find "$root" -maxdepth 4 \( -iname '*_NEW' -o -iname '*_OLD' \) -prune -o -type d -print0 2>/dev/null || true
+  find "$root" -maxdepth 4 \( -path '/srv/BackupLog' -o -iname '*_NEW' -o -iname '*_OLD' \) -prune -o -type d -print0 2>/dev/null || true
 }
 
 mapped_name_for_basename() {
