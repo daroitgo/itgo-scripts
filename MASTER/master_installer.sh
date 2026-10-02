@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.127"
+MASTER_VERSION="1.2.128"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.28"
@@ -999,6 +999,8 @@ FINAL_LOG=""
 MODULE_DECISION=""
 HISTORY_CLEAR_ON_LOGOUT_ENABLED=0
 SUMMARY_ITEMS=()
+# Set to "yes" only after the Docker Engine + Compose v2 runtime is verified.
+DOCKER_RUNTIME_READY=no
 
 start_final_logging_if_possible() {
   [[ -n "${LOG_OTHER:-}" && -d "$LOG_OTHER" ]] || return 0
@@ -2180,6 +2182,27 @@ docker_enable_and_verify() {
   }
 
   echo "[$(ts)] OK: Docker Engine and Docker Compose v2 are working."
+}
+
+# Read-only check of an existing runtime: never installs, enables or starts.
+docker_runtime_readonly_check() {
+  docker --version >/dev/null 2>&1 || {
+    echo "[$(ts)] INFO: docker CLI is missing or not working."
+    return 1
+  }
+  docker compose version >/dev/null 2>&1 || {
+    echo "[$(ts)] INFO: Docker Compose v2 ('docker compose') is not available."
+    return 1
+  }
+  command -v systemctl >/dev/null 2>&1 || {
+    echo "[$(ts)] INFO: systemctl is unavailable; cannot confirm Docker service state."
+    return 1
+  }
+  systemctl is-active --quiet docker || {
+    echo "[$(ts)] INFO: Docker service is not active."
+    return 1
+  }
+  echo "[$(ts)] OK: existing Docker Engine and Docker Compose v2 are working."
 }
 
 ensure_docker_runtime() {
@@ -4841,18 +4864,41 @@ bootstrap_block() {
   ensure_sudo_nopasswd_block || return 1
   ensure_acls_block || return 1
 
+  DOCKER_RUNTIME_READY=no
   if prompt_yn "Sprawdzić / zainstalować Docker Engine + Docker Compose v2?" "Y"; then
-    ensure_docker_runtime || return 1
+    if ensure_docker_runtime; then
+      DOCKER_RUNTIME_READY=yes
+    else
+      echo "[$(ts)] WARNING: Docker setup could not be completed safely."
+      echo "[$(ts)] WARNING: MASTER did not remove or replace existing container packages."
+      if prompt_yn "Kontynuować MASTER bez działającego Docker Engine + Compose v2?" "Y"; then
+        echo "[$(ts)] WARN: continuing MASTER without Docker runtime."
+        add_summary "Docker runtime: BLOCKED/NOT READY (setup failed or refused safely; see log)"
+        add_summary "Docker setup failure accepted; MASTER continued without Docker"
+      else
+        echo "[$(ts)] ERROR: operator stopped MASTER after Docker setup failure."
+        add_summary "Docker runtime: BLOCKED/NOT READY (operator stopped MASTER)"
+        return 1
+      fi
+    fi
   else
     echo "[$(ts)] SKIP: Docker Engine + Docker Compose v2 setup."
+    echo "[$(ts)] INFO: read-only check of an existing Docker runtime (no install, no service changes)."
+    if docker_runtime_readonly_check; then
+      DOCKER_RUNTIME_READY=yes
+      add_summary "Docker runtime: SKIPPED (operator choice); existing Engine + Compose v2 verified read-only"
+    else
+      add_summary "Docker runtime: SKIPPED (operator choice); NOT READY"
+    fi
   fi
 
-  if command -v docker >/dev/null 2>&1; then
+  if [[ "$DOCKER_RUNTIME_READY" == yes ]]; then
     ensure_docker_group_membership || return 1
     docker_login_amms_registry || return 1
   else
-    echo "[$(ts)] SKIP: docker CLI nie istnieje. Pomijam docker group."
-    echo "[$(ts)] SKIP: docker CLI nie istnieje. Pomijam docker login."
+    echo "[$(ts)] SKIP: Docker runtime is not ready. Pomijam docker group."
+    echo "[$(ts)] SKIP: Docker runtime is not ready. Pomijam docker login."
+    add_summary "Docker group/login: SKIP (Docker runtime not ready)"
   fi
 }
 
@@ -5375,7 +5421,7 @@ main() {
   if prompt_yn "BOOTSTRAP: user '$TARGET_USER' + katalogi HOME + (opcjonalnie) sudoers + ACL?" "Y"; then
     if ! bootstrap_block; then
       echo "[$(ts)] ERROR: bootstrap failed; stopping installation before Docker group/login dependent steps."
-      add_summary "Bootstrap: ERROR (Docker runtime or prerequisite failed)"
+      add_summary "Bootstrap: ERROR (prerequisite failed or operator stopped after Docker setup failure)"
       print_summary
       exit 1
     fi
