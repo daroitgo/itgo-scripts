@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.10"
+COLLECTOR_VERSION = "0.1.11"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -1089,20 +1089,23 @@ def psim2_edm_candidate(candidate_path, base_path, warnings):
 
 
 def edm_application_candidates(candidate_path, base_path, warnings):
-    fields = {"base_path": base_path, "matched_hint": "prefix:edm"}
+    candidates = []
     legacy_version = read_edm_env_version(candidate_path)
     if legacy_version is not None:
-        fields["application_version"] = legacy_version
-    candidates = [
-        {
-            "source": "filesystem_allowlist",
-            "source_path": candidate_path,
-            "name": os.path.basename(candidate_path),
-            "candidate_type": "edm",
-            "status": "candidate",
-            "fields": fields,
-        }
-    ]
+        candidates.append(
+            {
+                "source": "filesystem_allowlist",
+                "source_path": candidate_path,
+                "name": os.path.basename(candidate_path),
+                "candidate_type": "edm",
+                "status": "candidate",
+                "fields": {
+                    "base_path": base_path,
+                    "matched_hint": "prefix:edm",
+                    "application_version": legacy_version,
+                },
+            }
+        )
     psim2_candidate = psim2_edm_candidate(candidate_path, base_path, warnings)
     if psim2_candidate is not None:
         candidates.append(psim2_candidate)
