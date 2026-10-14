@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.9"
+COLLECTOR_VERSION = "0.1.10"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -32,6 +32,7 @@ MAX_MPI_ENV_BYTES = 64 * 1024
 MAX_EDM_ENV_BYTES = 64 * 1024
 MAX_APPLICATION_ENV_BYTES = 64 * 1024
 MAX_APPLICATION_COMPOSE_BYTES = 256 * 1024
+MAX_MEMINFO_BYTES = 64 * 1024
 MAX_INTEGRATION_WEBAPPS = 64
 MAX_INTEGRATION_MAVEN_GROUP_DIRS = 32
 MAX_INTEGRATION_MAVEN_ARTIFACT_DIRS = 32
@@ -62,6 +63,7 @@ DOCKER_EXACT_HINTS = {
     "ozr",
     "vitreo",
     "hazelcast",
+    "epn",
 }
 DOCKER_CONTAINS_HINTS = ("amdx", "mpi")
 MPI_ENV_VERSION_PATTERN = re.compile(
@@ -568,8 +570,8 @@ def read_allowlisted_env_values(env_path, allowed_keys):
     return result
 
 
-def read_allowlisted_compose_image_tags(compose_path, allowed_repositories):
-    """Return last active tags for exact allowlisted image repositories."""
+def read_allowlisted_compose_images(compose_path, allowed_repositories):
+    """Return recognized exact repositories and their optional literal tags."""
     if not is_path_file_within_limit(compose_path, MAX_APPLICATION_COMPOSE_BYTES):
         return {}
     contents = read_utf8_text_file(compose_path, MAX_APPLICATION_COMPOSE_BYTES)
@@ -587,17 +589,80 @@ def read_allowlisted_compose_image_tags(compose_path, allowed_repositories):
         image = match.group(1).strip()
         if len(image) >= 2 and image[0] == image[-1] and image[0] in ("\"", chr(39)):
             image = image[1:-1]
-        if not image or "@" in image or chr(36) + "{" in image:
+        if not image:
             continue
         for repository in allowed:
             prefix = repository + ":"
+            if image == repository or image.startswith(repository + "@"):
+                result[repository] = None
+                break
             if not image.startswith(prefix):
                 continue
             tag = image[len(prefix):].strip()
-            if tag and not any(character.isspace() for character in tag):
+            if (
+                tag
+                and chr(36) + "{" not in tag
+                and "@" not in tag
+                and not any(character.isspace() for character in tag)
+            ):
                 result[repository] = tag[:128]
+            else:
+                result[repository] = None
             break
     return result
+
+
+def read_allowlisted_compose_image_tags(compose_path, allowed_repositories):
+    """Return last active literal tags for exact allowlisted image repositories."""
+    images = read_allowlisted_compose_images(compose_path, allowed_repositories)
+    return dict(
+        (repository, tag)
+        for repository, tag in images.items()
+        if tag is not None
+    )
+
+
+def collect_cpu_logical_count(warnings):
+    try:
+        value = os.cpu_count()
+    except (AttributeError, OSError):
+        value = None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        add_warning(
+            warnings,
+            "CPU_COUNT_UNAVAILABLE",
+            "host.cpu_logical_count",
+            "Could not determine the logical CPU count",
+        )
+        return None
+    return value
+
+
+def read_memory_total_bytes(warnings, path="/proc/meminfo"):
+    contents = read_utf8_text_file(path, MAX_MEMINFO_BYTES)
+    if contents is None:
+        add_warning(
+            warnings,
+            "MEMINFO_READ_FAILED",
+            "host.memory_total_bytes",
+            "Could not read /proc/meminfo safely",
+        )
+        return None
+    for line in contents.splitlines():
+        match = re.match(r"^MemTotal:\s*([0-9]+)\s+kB\s*\Z", line)
+        if match is None:
+            continue
+        kilobytes = int(match.group(1))
+        if kilobytes > 0:
+            return kilobytes * 1024
+        break
+    add_warning(
+        warnings,
+        "MEMTOTAL_PARSE_ISSUE",
+        "host.memory_total_bytes",
+        "Could not parse MemTotal from /proc/meminfo",
+    )
+    return None
 
 
 def application_version(kind, version, source_path, source_key):
@@ -962,6 +1027,13 @@ HAZELCAST_COMPONENTS = (
     ("hazelcast", "hazelcast/hazelcast"),
     ("hazelcast-management-center", "hazelcast/management-center"),
 )
+PSIM2_EDM_COMPONENTS = (
+    ("Eureka", "EUREKA_VERSION"),
+    ("API Gateway", "APIGATEWAY_VERSION"),
+    ("Regional EDM Adapter", "REGIONAL_EDM_ADAPTER_VERSION"),
+)
+PSIM2_EPN_REPOSITORY = "amms.asseco.pl/asseco-poz/pi-psim2-epn-provider"
+PSIM2_EREJ_REPOSITORY = "amms.asseco.pl/asseco-poz/pi-psim-2-provider"
 
 
 def application_candidate(name, candidate_path, fields):
@@ -975,12 +1047,143 @@ def application_candidate(name, candidate_path, fields):
     }
 
 
-def special_application_candidates(candidate_path, base_path, candidate_name):
+def psim2_edm_candidate(candidate_path, base_path, warnings):
+    env_path = os.path.join(candidate_path, ".env")
+    source_keys = tuple(source_key for name, source_key in PSIM2_EDM_COMPONENTS)
+    values = read_allowlisted_env_values(env_path, source_keys)
+    if not values:
+        return None
+    components = []
+    for name, source_key in PSIM2_EDM_COMPONENTS:
+        components.append(
+            {
+                "name": name,
+                "version": values.get(source_key),
+                "source_key": source_key,
+                "source_path": env_path,
+            }
+        )
+    if len(values) < len(PSIM2_EDM_COMPONENTS):
+        add_warning(
+            warnings,
+            "PSIM2_EDM_COMPONENTS_INCOMPLETE",
+            "PSIM2 EDM",
+            "One or more PSIM2 EDM component versions are unavailable",
+        )
+    return {
+        "source": "filesystem_allowlist",
+        "source_path": candidate_path,
+        "name": "EDM",
+        "candidate_type": "psim2_edm",
+        "status": "candidate",
+        "fields": {
+            "base_path": base_path,
+            "matched_hint": "psim2_edm_env",
+            "product_identity": {
+                "kind": "psim2_edm",
+                "source_key": "PSIM2_EDM",
+            },
+            "components": components,
+        },
+    }
+
+
+def edm_application_candidates(candidate_path, base_path, warnings):
+    fields = {"base_path": base_path, "matched_hint": "prefix:edm"}
+    legacy_version = read_edm_env_version(candidate_path)
+    if legacy_version is not None:
+        fields["application_version"] = legacy_version
+    candidates = [
+        {
+            "source": "filesystem_allowlist",
+            "source_path": candidate_path,
+            "name": os.path.basename(candidate_path),
+            "candidate_type": "edm",
+            "status": "candidate",
+            "fields": fields,
+        }
+    ]
+    psim2_candidate = psim2_edm_candidate(candidate_path, base_path, warnings)
+    if psim2_candidate is not None:
+        candidates.append(psim2_candidate)
+    return candidates
+
+
+def compose_product_candidate(
+    candidate_name,
+    candidate_path,
+    base_fields,
+    repository,
+    tag,
+    include_product_identity,
+):
+    fields = dict(base_fields)
+    if include_product_identity:
+        fields["product_identity"] = {
+            "kind": "compose_image",
+            "source_key": repository,
+        }
+    if tag is not None:
+        fields["application_version"] = application_version(
+            "compose_image",
+            tag,
+            os.path.join(candidate_path, "docker-compose.yml"),
+            repository,
+        )
+    return application_candidate(candidate_name, candidate_path, fields)
+
+
+def special_application_candidates(candidate_path, base_path, candidate_name, warnings):
     """Return candidates for exact /srv-only version probes, or None if generic."""
     if not is_direct_srv_candidate(candidate_path):
         return None
     lower_name = candidate_name.lower()
     base_fields = {"base_path": base_path, "matched_hint": lower_name}
+
+    if lower_name == "epn":
+        compose_path = os.path.join(candidate_path, "docker-compose.yml")
+        images = read_allowlisted_compose_images(
+            compose_path, (PSIM2_EPN_REPOSITORY,)
+        )
+        if PSIM2_EPN_REPOSITORY not in images:
+            return [application_candidate(candidate_name, candidate_path, base_fields)]
+        return [
+            compose_product_candidate(
+                candidate_name,
+                candidate_path,
+                base_fields,
+                PSIM2_EPN_REPOSITORY,
+                images[PSIM2_EPN_REPOSITORY],
+                True,
+            )
+        ]
+
+    if lower_name == "erej":
+        compose_path = os.path.join(candidate_path, "docker-compose.yml")
+        repositories = (EREJESTRACJA_REPOSITORY, PSIM2_EREJ_REPOSITORY)
+        images = read_allowlisted_compose_images(compose_path, repositories)
+        recognized = [repository for repository in repositories if repository in images]
+        if len(recognized) == 2:
+            add_warning(
+                warnings,
+                "EREJ_PRODUCT_AMBIGUOUS",
+                "EREJ",
+                "Both allowlisted EREJ product repositories are present",
+            )
+            return [application_candidate(candidate_name, candidate_path, base_fields)]
+        if len(recognized) == 1:
+            repository = recognized[0]
+            return [
+                compose_product_candidate(
+                    candidate_name,
+                    candidate_path,
+                    base_fields,
+                    repository,
+                    images[repository],
+                    repository == PSIM2_EREJ_REPOSITORY,
+                )
+            ]
+        return [application_candidate(candidate_name, candidate_path, base_fields)]
 
     if lower_name == "p1adapter":
         env_path = os.path.join(candidate_path, ".env")
@@ -1085,8 +1288,12 @@ def collect_application_candidates(
             ):
                 continue
 
+            if candidate_name.lower() == "edm" and is_direct_srv_candidate(child):
+                candidates.extend(edm_application_candidates(child, base, warnings))
+                continue
+
             special_candidates = special_application_candidates(
-                child, base, candidate_name
+                child, base, candidate_name, warnings
             )
             if special_candidates is not None:
                 candidates.extend(special_candidates)
@@ -1161,6 +1368,8 @@ def collect_report(
         )
 
     itgo_identity = read_itgo_identity(warnings, itgo_identity_path)
+    cpu_logical_count = collect_cpu_logical_count(warnings)
+    memory_total_bytes = read_memory_total_bytes(warnings)
 
     return {
         "report": {
@@ -1178,6 +1387,8 @@ def collect_report(
             "hostname": hostname,
             "kernel": kernel,
             "architecture": architecture,
+            "cpu_logical_count": cpu_logical_count,
+            "memory_total_bytes": memory_total_bytes,
         },
         "runtimes": [probe_command(spec, warnings) for spec in COMMAND_SPECS],
         "application_candidates": collect_application_candidates(

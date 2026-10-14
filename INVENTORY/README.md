@@ -53,6 +53,25 @@ itgo-inv test-nextcloud
 
 `configure-nextcloud` interactively asks for the Nextcloud URL, technical user and App Password. The App Password is never accepted as a CLI argument and is not written to logs. The configuration directory uses mode `0700`. Credential storage prefers user-scoped `systemd-creds`; when it is unavailable, the App Password falls back to a local file protected with mode `0600`.
 
+## Collector scope
+
+The current collector version is 0.1.10. It runs read-only and is compatible with Python 2.7 and Python 3.x.
+
+The host section of the report includes:
+
+- `cpu_logical_count` – number of logical CPUs;
+- `memory_total_bytes` – total memory in bytes.
+
+If either value cannot be read or parsed, the collector does not stop: the field is set to `null` and a warning is added to the report.
+
+Application detection:
+
+- EPN is recognized as an application candidate; PSIM2 EPN is identified only by an exactly allowlisted Compose image repository.
+- EREJ recognizes the existing variant and PSIM2 EREJ. When both allowlisted repositories are present, the collector does not guess the product and reports an ambiguity warning.
+- For EDM installed directly under `/srv`, the collector can additionally recognize PSIM2 EDM and collect the Eureka, API Gateway and Regional EDM Adapter versions.
+
+Data from `.env` and `docker-compose` files is read only from allowlisted keys and image repositories, within the existing file size limits.
+
 ## Optional Nextcloud upload
 
 The remote report path is:
