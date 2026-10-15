@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.11"
+COLLECTOR_VERSION = "0.1.12"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -82,6 +82,10 @@ AMMS_WAR_ENTRY_NAME = "amms-war.war"
 AMMS_BUILD_JSON_ENTRIES = (
     "WEB-INF/classes/mspa/build.json",
     "mspa/build.json",
+)
+AMMS_NON_PRIMARY_DIRECTORY_PATTERN = re.compile(
+    r"^(?:wildfly|wildflyamms)_(?:new|old|backup|bak)\d*$",
+    re.IGNORECASE,
 )
 INTEGRATION_WEBAPPS_RELATIVE_PATH = ("apache-tomcat", "webapps")
 INTEGRATION_MAVEN_RELATIVE_PATH = (
@@ -508,6 +512,10 @@ def is_legacy_application_directory_name(name):
         if token
     ]
     return "old" in tokens
+
+
+def is_non_primary_amms_directory_name(name):
+    return AMMS_NON_PRIMARY_DIRECTORY_PATTERN.fullmatch(name) is not None
 
 
 def match_application_candidate(name):
@@ -1283,7 +1291,9 @@ def collect_application_candidates(
                 continue
 
             candidate_name = os.path.basename(child)
-            if is_legacy_application_directory_name(candidate_name):
+            if is_legacy_application_directory_name(
+                candidate_name
+            ) or is_non_primary_amms_directory_name(candidate_name):
                 continue
             if (
                 candidate_name.lower().startswith("edm")

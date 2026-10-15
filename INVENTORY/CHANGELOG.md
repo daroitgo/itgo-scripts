@@ -14,6 +14,7 @@
 - Extended EDM detection to recognize PSIM2 EDM and collect Eureka, API Gateway and Regional EDM Adapter versions from allowlisted `.env` keys.
 - Kept the bounded, read-only approach to reading host and application data.
 - Updated inventory collector to version 0.1.11 with corrected EDM detection: the legacy EDM candidate is reported only when a legacy application version was actually read, so a PSIM2 EDM installation no longer produces an extra version-less legacy EDM candidate just because its directory matches the `edm` prefix. The PSIM2 EDM candidate is reported as before; the change remains read-only and does not modify application data.
+- Updated inventory collector to version 0.1.12 with corrected AMMS candidate filtering: inactive directories named `wildfly_new`, `wildfly_old`, `wildfly_backup`, `wildfly_bak`, `wildflyamms_new`, `wildflyamms_old`, `wildflyamms_backup` or `wildflyamms_bak`, including variants ending in digits, are skipped when collecting application candidates. Matching is case-insensitive; active `wildfly` / `wildflyamms` directories without these suffixes are handled as before. The change remains read-only.
 
 ## 0.1.3 - 2026-06-30
 

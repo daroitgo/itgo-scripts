@@ -55,7 +55,7 @@ itgo-inv test-nextcloud
 
 ## Collector scope
 
-The current collector version is 0.1.11. It runs read-only and is compatible with Python 2.7 and Python 3.x.
+The current collector version is 0.1.12. It runs read-only and is compatible with Python 2.7 and Python 3.x.
 
 The host section of the report includes:
 
@@ -69,6 +69,7 @@ Application detection:
 - EPN is recognized as an application candidate; PSIM2 EPN is identified only by an exactly allowlisted Compose image repository.
 - EREJ recognizes the existing variant and PSIM2 EREJ. When both allowlisted repositories are present, the collector does not guess the product and reports an ambiguity warning.
 - For EDM installed directly under `/srv`, the collector can additionally recognize PSIM2 EDM and collect the Eureka, API Gateway and Regional EDM Adapter versions. A legacy EDM candidate is emitted only when a legacy application version is available, so a PSIM2 EDM installation does not get an artificial, version-less legacy EDM candidate.
+- AMMS candidates skip inactive archive/auxiliary directories named `wildfly_new`, `wildfly_old`, `wildfly_backup`, `wildfly_bak`, `wildflyamms_new`, `wildflyamms_old`, `wildflyamms_backup` or `wildflyamms_bak`, optionally followed by digits (case-insensitive). Active `wildfly` / `wildflyamms` directories without these suffixes are handled as before.
 
 Data from `.env` and `docker-compose` files is read only from allowlisted keys and image repositories, within the existing file size limits.
 
