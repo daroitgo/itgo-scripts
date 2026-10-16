@@ -55,7 +55,7 @@ itgo-inv test-nextcloud
 
 ## Collector scope
 
-The current collector version is 0.1.12. It runs read-only and is compatible with Python 2.7 and Python 3.x.
+The current collector version is 0.1.13. It runs read-only and is compatible with Python 2.7 and Python 3.x.
 
 The host section of the report includes:
 
@@ -66,10 +66,13 @@ If either value cannot be read or parsed, the collector does not stop: the field
 
 Application detection:
 
+- Application candidates are scanned under the base locations `/srv`, `/usr/local` and `/opt`. Scanning of each base is limited to 1024 direct entries; when the limit is exceeded, the collector adds an `APPLICATION_BASE_CHILD_LIMIT` warning.
 - EPN is recognized as an application candidate; PSIM2 EPN is identified only by an exactly allowlisted Compose image repository.
 - EREJ recognizes the existing variant and PSIM2 EREJ. When both allowlisted repositories are present, the collector does not guess the product and reports an ambiguity warning.
-- For EDM installed directly under `/srv`, the collector can additionally recognize PSIM2 EDM and collect the Eureka, API Gateway and Regional EDM Adapter versions. A legacy EDM candidate is emitted only when a legacy application version is available, so a PSIM2 EDM installation does not get an artificial, version-less legacy EDM candidate.
-- AMMS candidates skip inactive archive/auxiliary directories named `wildfly_new`, `wildfly_old`, `wildfly_backup`, `wildfly_bak`, `wildflyamms_new`, `wildflyamms_old`, `wildflyamms_backup` or `wildflyamms_bak`, optionally followed by digits (case-insensitive). Active `wildfly` / `wildflyamms` directories without these suffixes are handled as before.
+- Directories named `p1erej`, `p1rej`, `p1cer`, `p1ser`, `erej`, `cer` or `ser` are identified as EREJ only after the allowlisted Compose repository `amms.asseco.pl/asseco-poz/pi-p1-erejestracja-provider` is recognized; otherwise they remain plain candidates without forced product identification.
+- MPI and EDM can be recognized within any of the allowed base locations, not only directly under `/srv`.
+- For EDM, the collector can additionally recognize PSIM2 EDM and collect the Eureka, API Gateway and Regional EDM Adapter versions. A legacy EDM candidate is emitted only when a legacy application version is available, so a PSIM2 EDM installation does not get an artificial, version-less legacy EDM candidate.
+- Inactive archive/auxiliary application directories are skipped: names ending in `_new`, `_old`, `_backup` or `_bak`, optionally followed by digits (case-insensitive), e.g. `wildfly_old` or `edm_backup2`. Active directories without these suffixes are handled as before.
 
 Data from `.env` and `docker-compose` files is read only from allowlisted keys and image repositories, within the existing file size limits.
 

@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.12"
+COLLECTOR_VERSION = "0.1.13"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -36,12 +36,13 @@ MAX_MEMINFO_BYTES = 64 * 1024
 MAX_INTEGRATION_WEBAPPS = 64
 MAX_INTEGRATION_MAVEN_GROUP_DIRS = 32
 MAX_INTEGRATION_MAVEN_ARTIFACT_DIRS = 32
+MAX_APPLICATION_BASE_CHILDREN = 1024
 MAX_WARNINGS = 32
 MAX_WARNING_MESSAGE_CHARS = 200
 MAX_HOSTNAME_CHARS = 255
 ITGO_IDENTITY_PATH = "/home/itgo/UTILITY/ITGO-CONFIG/client-identity.json"
 ITGO_CLIENT_CODE_PATTERN = re.compile(r"^[a-z0-9_-]+$")
-APPLICATION_BASE_PATHS = ("/srv", "/opt")
+APPLICATION_BASE_PATHS = ("/srv", "/usr/local", "/opt")
 COMPOSE_FILENAMES = (
     "docker-compose.yml",
     "docker-compose.yaml",
@@ -83,8 +84,8 @@ AMMS_BUILD_JSON_ENTRIES = (
     "WEB-INF/classes/mspa/build.json",
     "mspa/build.json",
 )
-AMMS_NON_PRIMARY_DIRECTORY_PATTERN = re.compile(
-    r"^(?:wildfly|wildflyamms)_(?:new|old|backup|bak)\d*$",
+NON_PRIMARY_APPLICATION_SUFFIX_PATTERN = re.compile(
+    r"_(?:new|old|backup|bak)\d*$",
     re.IGNORECASE,
 )
 INTEGRATION_WEBAPPS_RELATIVE_PATH = ("apache-tomcat", "webapps")
@@ -505,17 +506,8 @@ def probe_command(spec, warnings):
     return item
 
 
-def is_legacy_application_directory_name(name):
-    tokens = [
-        token
-        for token in re.split(r"[^a-z0-9]+", name.lower())
-        if token
-    ]
-    return "old" in tokens
-
-
-def is_non_primary_amms_directory_name(name):
-    return AMMS_NON_PRIMARY_DIRECTORY_PATTERN.fullmatch(name) is not None
+def is_non_primary_application_directory_name(name):
+    return NON_PRIMARY_APPLICATION_SUFFIX_PATTERN.search(name) is not None
 
 
 def match_application_candidate(name):
@@ -547,10 +539,6 @@ def collect_compose_files(candidate_path):
         except OSError:
             continue
     return compose_files
-
-
-def is_direct_srv_candidate(candidate_path):
-    return os.path.basename(os.path.dirname(candidate_path)) == "srv"
 
 
 def read_allowlisted_env_values(env_path, allowed_keys):
@@ -685,8 +673,6 @@ def application_version(kind, version, source_path, source_key):
 
 def read_mpi_env_version(candidate_path):
     """Read the sole allowlisted MPI application version from candidate_path/.env."""
-    if os.path.basename(os.path.dirname(candidate_path)) != "srv":
-        return None
     if not os.path.basename(candidate_path).lower().startswith("mpi"):
         return None
 
@@ -715,8 +701,6 @@ def read_mpi_env_version(candidate_path):
 
 def read_edm_env_version(candidate_path):
     """Read the sole allowlisted EDM application version from candidate_path/.env."""
-    if os.path.basename(os.path.dirname(candidate_path)) != "srv":
-        return None
     if not os.path.basename(candidate_path).lower().startswith("edm"):
         return None
 
@@ -1145,9 +1129,7 @@ def compose_product_candidate(
 
 
 def special_application_candidates(candidate_path, base_path, candidate_name, warnings):
-    """Return candidates for exact /srv-only version probes, or None if generic."""
-    if not is_direct_srv_candidate(candidate_path):
-        return None
+    """Return candidates for exact allowlisted version probes, or None if generic."""
     lower_name = candidate_name.lower()
     base_fields = {"base_path": base_path, "matched_hint": lower_name}
 
@@ -1191,7 +1173,7 @@ def special_application_candidates(candidate_path, base_path, candidate_name, wa
                     base_fields,
                     repository,
                     images[repository],
-                    repository == PSIM2_EREJ_REPOSITORY,
+                True,
                 )
             ]
         return [application_candidate(candidate_name, candidate_path, base_fields)]
@@ -1208,7 +1190,22 @@ def special_application_candidates(candidate_path, base_path, candidate_name, wa
 
     repository = COMPOSE_SINGLE_COMPONENTS.get(lower_name)
     if lower_name in EREJESTRACJA_DIRECTORIES:
-        repository = EREJESTRACJA_REPOSITORY
+        compose_path = os.path.join(candidate_path, "docker-compose.yml")
+        images = read_allowlisted_compose_images(
+            compose_path, (EREJESTRACJA_REPOSITORY,)
+        )
+        if EREJESTRACJA_REPOSITORY not in images:
+            return [application_candidate(candidate_name, candidate_path, base_fields)]
+        return [
+            compose_product_candidate(
+                candidate_name,
+                candidate_path,
+                base_fields,
+                EREJESTRACJA_REPOSITORY,
+                images[EREJESTRACJA_REPOSITORY],
+                True,
+            )
+        ]
     if repository is not None:
         compose_path = os.path.join(candidate_path, "docker-compose.yml")
         tags = read_allowlisted_compose_image_tags(compose_path, (repository,))
@@ -1262,10 +1259,10 @@ def collect_application_candidates(
 ):
     candidates = []
 
-    for base_path in sorted(base_paths):
+    for base_path in base_paths:
         base = base_path
         try:
-            children = [os.path.join(base, name) for name in os.listdir(base)]
+            child_names = sorted(os.listdir(base))
         except OSError as error:
             if error.errno in (errno.EACCES, errno.EPERM):
                 add_warning(
@@ -1283,7 +1280,17 @@ def collect_application_candidates(
                 )
             continue
 
-        for child in sorted(children, key=lambda item: (item, os.path.basename(item))):
+        if len(child_names) > MAX_APPLICATION_BASE_CHILDREN:
+            add_warning(
+                warnings,
+                "APPLICATION_BASE_CHILD_LIMIT",
+                "application_candidates",
+                "Application base child limit reached",
+            )
+            child_names = child_names[:MAX_APPLICATION_BASE_CHILDREN]
+        children = [os.path.join(base, name) for name in child_names]
+
+        for child in children:
             try:
                 if not os.path.isdir(child):
                     continue
@@ -1291,17 +1298,10 @@ def collect_application_candidates(
                 continue
 
             candidate_name = os.path.basename(child)
-            if is_legacy_application_directory_name(
-                candidate_name
-            ) or is_non_primary_amms_directory_name(candidate_name):
-                continue
-            if (
-                candidate_name.lower().startswith("edm")
-                and os.path.basename(base) != "srv"
-            ):
+            if is_non_primary_application_directory_name(candidate_name):
                 continue
 
-            if candidate_name.lower() == "edm" and is_direct_srv_candidate(child):
+            if candidate_name.lower() == "edm":
                 candidates.extend(edm_application_candidates(child, base, warnings))
                 continue
 
