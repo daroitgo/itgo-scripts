@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added automatic inventory through systemd: the installer installs `itgo-inventory.service` (oneshot, runs `itgo-inv collect` as the installation user, not root) and `itgo-inventory.timer`. Fresh installations leave the timer disabled; upgrades preserve the existing timer enable state and configured schedule drop-in.
+- Added `schedule-configure`, `schedule-enable`, `schedule-disable`, `schedule-status` and `schedule-run-now` commands. `schedule-configure` sets a validated daily or weekly schedule, time and randomized delay, stored in `config/schedule.conf`; the default is a persistent (`Persistent=true`) weekly schedule on Sunday at 03:00 with a 30-minute randomized delay.
+- `collect` now uses a non-overlapping `flock` lock (`run/collect.lock`), so the timer and manual runs never collect concurrently.
+- After a successful Nextcloud preflight, `collect` first retries at most 20 pending local reports (oldest first) whose content confirms the exact current `client_code`; a report is still deleted locally only after a verified upload.
 - Added optional inventory upload to Nextcloud through WebDAV, with `configure-nextcloud` and `test-nextcloud` commands.
 - Credentials prefer user-scoped `systemd-creds`, with a `0600` plaintext-file fallback when unavailable.
 - Added WebDAV preflight before collection; local reports are removed only after `PUT` and a confirming `PROPFIND`, and remain local on errors.

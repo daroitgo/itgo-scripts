@@ -23,10 +23,25 @@ IDENTITY_FILE="${ITGO_HOME}/UTILITY/ITGO-CONFIG/client-identity.json"
 CONFIG_DIR="${BASE_DIR}/config"
 NEXTCLOUD_CONF="${CONFIG_DIR}/nextcloud.conf"
 NEXTCLOUD_CRED="${CONFIG_DIR}/nextcloud.cred"
+SCHEDULE_CONF="${CONFIG_DIR}/schedule.conf"
+RUN_DIR="${BASE_DIR}/run"
+COLLECT_LOCK="${RUN_DIR}/collect.lock"
+MAX_PENDING_UPLOADS_PER_RUN=20
+
+SYSTEMD_UNIT_DIR="/etc/systemd/system"
+INVENTORY_SERVICE_UNIT="itgo-inventory.service"
+INVENTORY_TIMER_UNIT="itgo-inventory.timer"
+TIMER_DROPIN_DIR="${SYSTEMD_UNIT_DIR}/${INVENTORY_TIMER_UNIT}.d"
+TIMER_DROPIN_FILE="${TIMER_DROPIN_DIR}/schedule.conf"
+
+DEFAULT_SCHEDULE_MODE="weekly"
+DEFAULT_SCHEDULE_DAY="Sun"
+DEFAULT_SCHEDULE_TIME="03:00"
+DEFAULT_RANDOMIZED_DELAY_MINUTES="30"
 
 usage() {
   cat <<'EOF'
-Usage: itgo-inv [collect|latest|version|configure-nextcloud|test-nextcloud|help]
+Usage: itgo-inv [collect|latest|version|configure-nextcloud|test-nextcloud|schedule-configure|schedule-enable|schedule-disable|schedule-status|schedule-run-now|help]
 
 Commands:
   collect   Generate an offline inventory JSON report
@@ -34,6 +49,11 @@ Commands:
   version   Show module and collector versions
   configure-nextcloud  Configure Nextcloud WebDAV upload
   test-nextcloud       Test configured Nextcloud WebDAV access
+  schedule-configure   Configure the automatic inventory schedule (daily/weekly)
+  schedule-enable      Enable and start the automatic inventory timer
+  schedule-disable     Disable and stop the automatic inventory timer
+  schedule-status      Show the automatic inventory schedule and timer state
+  schedule-run-now     Run the automatic inventory service once now
   help      Show this help
 EOF
 }
@@ -436,6 +456,85 @@ clean_old_inventory_reports() {
   fi
 }
 
+report_matches_client_code() {
+  local report_path="$1" client_code="$2" py_cmd
+
+  py_cmd="$(python_command)" || return 1
+  "$py_cmd" -c 'import io
+import json
+import sys
+try:
+    with io.open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    identity = data.get("itgo_identity") if isinstance(data, dict) else None
+    value = identity.get("client_code") if isinstance(identity, dict) else None
+    sys.exit(0 if value is not None and value == sys.argv[2] else 1)
+except Exception:
+    sys.exit(1)
+' "$report_path" "$client_code" >/dev/null 2>&1
+}
+
+retry_pending_reports() {
+  local client_code="$1" reports_real report_name report_path pending_list pending_count attempted=0
+  local -a pending_names=()
+
+  if ! reports_dir_is_safe; then
+    printf 'WARNING: unsafe inventory reports directory; pending reports are not retried: %s\n' "$REPORTS_DIR" >&2
+    return 0
+  fi
+  reports_real="$(cd "$REPORTS_DIR" 2>/dev/null && pwd -P)" || return 0
+
+  pending_list="$(find "$reports_real" -maxdepth 1 -type f -name "inventory_${client_code}_*.json" -printf '%T@ %f\n' 2>/dev/null | sort -n | awk '{sub(/^[^ ]+ /, ""); print}')"
+  while IFS= read -r report_name; do
+    case "$report_name" in
+      ''|*[!A-Za-z0-9._-]*) continue ;;
+      "inventory_${client_code}_"*.json) ;;
+      *) continue ;;
+    esac
+    report_path="${reports_real}/${report_name}"
+    [ -f "$report_path" ] && [ ! -L "$report_path" ] || continue
+    # The name prefix alone is ambiguous (client_code may contain "_"), so only
+    # reports whose content confirms the current client_code are queued.
+    if ! report_matches_client_code "$report_path" "$client_code"; then
+      printf 'WARNING: report preserved and not retried; its client_code could not be confirmed as %s: %s\n' "$client_code" "$report_path" >&2
+      continue
+    fi
+    pending_names+=("$report_name")
+  done <<< "$pending_list"
+
+  pending_count="${#pending_names[@]}"
+  printf 'Pending inventory reports: %s\n' "$pending_count"
+  if [ "$pending_count" -eq 0 ]; then
+    return 0
+  fi
+  if [ "$pending_count" -gt "$MAX_PENDING_UPLOADS_PER_RUN" ]; then
+    printf 'Retrying at most %s pending reports in this run (oldest first).\n' "$MAX_PENDING_UPLOADS_PER_RUN"
+  fi
+
+  for report_name in "${pending_names[@]}"; do
+    if [ "$attempted" -ge "$MAX_PENDING_UPLOADS_PER_RUN" ]; then
+      break
+    fi
+    attempted=$((attempted + 1))
+    report_path="${reports_real}/${report_name}"
+    printf 'Retrying pending report: %s\n' "$report_name"
+
+    if nextcloud_upload_report "$client_code" "$report_name" "$report_path"; then
+      if rm -f -- "$report_path" && [ ! -e "$report_path" ]; then
+        printf 'SUCCESS: pending inventory report uploaded to Nextcloud and removed locally.\n'
+        printf 'Remote: INVENTORY/%s/%s\n' "$client_code" "$report_name"
+      else
+        printf 'WARNING: pending inventory report upload was verified, but the local report could not be removed.\n' >&2
+        printf 'Local report preserved: %s\n' "$report_path" >&2
+      fi
+    else
+      printf 'WARNING: pending inventory report preserved; upload to Nextcloud failed: %s\n' "$report_path" >&2
+    fi
+  done
+
+  return 0
+}
+
 collect_report() {
   local client_code hostname timestamp report_name report_path temp_path log_path nextcloud_ready=0 collision_index=0 nextcloud_state
 
@@ -465,6 +564,7 @@ collect_report() {
       0)
         if nextcloud_preflight "$client_code"; then
           nextcloud_ready=1
+          retry_pending_reports "$client_code"
         else
           printf 'WARNING: Nextcloud WebDAV preflight failed.\n' >&2
           printf 'Inventory will be generated locally and preserved.\n' >&2
@@ -543,6 +643,465 @@ collect_report() {
   fi
 }
 
+collect_with_lock() {
+  local lock_status
+
+  if ! command -v flock >/dev/null 2>&1; then
+    printf 'WARNING: flock is unavailable; protection against concurrent collect runs is disabled.\n' >&2
+    collect_report
+    return
+  fi
+
+  if ! mkdir -p "$RUN_DIR"; then
+    printf 'error: could not create run directory: %s\n' "$RUN_DIR" >&2
+    return 1
+  fi
+  if [ -L "$COLLECT_LOCK" ]; then
+    printf 'error: refusing to use symlinked collect lock: %s\n' "$COLLECT_LOCK" >&2
+    return 1
+  fi
+  if [ ! -e "$COLLECT_LOCK" ] && ! : >> "$COLLECT_LOCK"; then
+    printf 'error: could not create collect lock: %s\n' "$COLLECT_LOCK" >&2
+    return 1
+  fi
+  if [ ! -f "$COLLECT_LOCK" ] || [ ! -r "$COLLECT_LOCK" ]; then
+    printf 'error: collect lock is not a readable regular file: %s\n' "$COLLECT_LOCK" >&2
+    return 1
+  fi
+
+  {
+    flock -n 9
+    lock_status=$?
+    if [ "$lock_status" -eq 1 ]; then
+      # Another collect holds the lock: a safe skip, not a failure.
+      printf 'SKIP: another inventory collect is already running; this run was skipped.\n'
+      printf 'Lock: %s\n' "$COLLECT_LOCK"
+      return 0
+    elif [ "$lock_status" -ne 0 ]; then
+      printf 'error: could not acquire collect lock: %s\n' "$COLLECT_LOCK" >&2
+      return 1
+    fi
+    collect_report
+  } 9<"$COLLECT_LOCK"
+}
+
+run_privileged() {
+  if [ "$(id -u 2>/dev/null)" = "0" ]; then
+    "$@"
+    return
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    printf 'ERROR: root privileges are required, but sudo is unavailable.\n' >&2
+    return 1
+  fi
+  sudo -- "$@"
+}
+
+require_systemd() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    printf 'ERROR: systemctl is unavailable; automatic inventory scheduling requires systemd.\n' >&2
+    printf 'Manual inventory still works: itgo-inv collect\n' >&2
+    return 1
+  fi
+  if [ ! -d /run/systemd/system ]; then
+    printf 'ERROR: systemd is not running; automatic inventory scheduling is unavailable.\n' >&2
+    printf 'Manual inventory still works: itgo-inv collect\n' >&2
+    return 1
+  fi
+}
+
+require_inventory_units() {
+  if [ ! -f "${SYSTEMD_UNIT_DIR}/${INVENTORY_SERVICE_UNIT}" ] || [ ! -f "${SYSTEMD_UNIT_DIR}/${INVENTORY_TIMER_UNIT}" ]; then
+    printf 'ERROR: %s and %s are not installed in %s; reinstall the INVENTORY module.\n' \
+      "$INVENTORY_SERVICE_UNIT" "$INVENTORY_TIMER_UNIT" "$SYSTEMD_UNIT_DIR" >&2
+    return 1
+  fi
+}
+
+valid_schedule_mode() {
+  case "$1" in
+    daily|weekly) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_schedule_day() {
+  case "$1" in
+    Mon|Tue|Wed|Thu|Fri|Sat|Sun) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_schedule_day() {
+  case "$1" in
+    [Mm][Oo][Nn]) printf 'Mon' ;;
+    [Tt][Uu][Ee]) printf 'Tue' ;;
+    [Ww][Ee][Dd]) printf 'Wed' ;;
+    [Tt][Hh][Uu]) printf 'Thu' ;;
+    [Ff][Rr][Ii]) printf 'Fri' ;;
+    [Ss][Aa][Tt]) printf 'Sat' ;;
+    [Ss][Uu][Nn]) printf 'Sun' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+valid_schedule_time() {
+  [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]
+}
+
+valid_randomized_delay() {
+  [[ "$1" =~ ^[0-9]{1,4}$ ]] && [ "$((10#$1))" -le 1440 ]
+}
+
+load_schedule_config() {
+  local key value mode="" day="" time="" delay=""
+
+  SCHEDULE_MODE=""
+  SCHEDULE_DAY=""
+  SCHEDULE_TIME=""
+  RANDOMIZED_DELAY_MINUTES=""
+
+  [ -e "$SCHEDULE_CONF" ] || return 2
+  if [ ! -f "$SCHEDULE_CONF" ] || [ ! -r "$SCHEDULE_CONF" ]; then
+    printf 'ERROR: schedule configuration is not a readable file: %s\n' "$SCHEDULE_CONF" >&2
+    return 1
+  fi
+
+  while IFS='=' read -r key value || [ -n "$key" ]; do
+    case "$key" in
+      SCHEDULE_MODE) mode="$value" ;;
+      SCHEDULE_DAY) day="$value" ;;
+      SCHEDULE_TIME) time="$value" ;;
+      RANDOMIZED_DELAY_MINUTES) delay="$value" ;;
+      ''|'#'*) ;;
+    esac
+  done < "$SCHEDULE_CONF"
+
+  if ! valid_schedule_mode "$mode" || ! valid_schedule_time "$time" || ! valid_randomized_delay "$delay"; then
+    printf 'ERROR: invalid schedule configuration: %s\n' "$SCHEDULE_CONF" >&2
+    return 1
+  fi
+  if [ "$mode" = "weekly" ] || [ -n "$day" ]; then
+    if ! valid_schedule_day "$day"; then
+      printf 'ERROR: invalid schedule configuration: %s\n' "$SCHEDULE_CONF" >&2
+      return 1
+    fi
+  fi
+
+  SCHEDULE_MODE="$mode"
+  SCHEDULE_DAY="$day"
+  SCHEDULE_TIME="$time"
+  RANDOMIZED_DELAY_MINUTES="$((10#$delay))"
+}
+
+schedule_on_calendar() {
+  local mode="$1" day="$2" time="$3"
+
+  if [ "$mode" = "weekly" ]; then
+    printf '%s *-*-* %s:00' "$day" "$time"
+  else
+    printf '*-*-* %s:00' "$time"
+  fi
+}
+
+schedule_description() {
+  local mode="$1" day="$2" time="$3" delay="$4"
+
+  if [ "$mode" = "weekly" ]; then
+    printf 'weekly, %s at %s, randomized delay %s min' "$day" "$time" "$delay"
+  else
+    printf 'daily at %s, randomized delay %s min' "$time" "$delay"
+  fi
+}
+
+schedule_tx_cleanup() {
+  local path
+
+  for path in "$@"; do
+    [ -n "$path" ] && rm -f -- "$path"
+  done
+  return 0
+}
+
+schedule_conf_owner_and_mode_ok() {
+  local expected_uid actual
+
+  expected_uid="$(stat -c '%u' -- "$CONFIG_DIR" 2>/dev/null)" || return 1
+  actual="$(stat -c '%u %a' -- "$SCHEDULE_CONF" 2>/dev/null)" || return 1
+  [ -n "$expected_uid" ] && [ "$actual" = "${expected_uid} 600" ]
+}
+
+schedule_tx_restore_conf() {
+  local had_config="$1" config_backup="$2"
+
+  if [ "$had_config" = "1" ]; then
+    if ! mv -f -- "$config_backup" "$SCHEDULE_CONF"; then
+      printf 'WARNING: could not restore the previous schedule configuration: %s\n' "$SCHEDULE_CONF" >&2
+      return 1
+    fi
+  elif ! rm -f -- "$SCHEDULE_CONF"; then
+    printf 'WARNING: could not remove the new schedule configuration: %s\n' "$SCHEDULE_CONF" >&2
+    return 1
+  fi
+}
+
+schedule_tx_restore_dropin() {
+  local had_dropin="$1" dropin_backup="$2" had_dropin_dir="$3"
+
+  if [ "$had_dropin" = "1" ]; then
+    if ! run_privileged install -m 0644 -o root -g root "$dropin_backup" "$TIMER_DROPIN_FILE"; then
+      printf 'WARNING: could not restore the previous timer drop-in: %s\n' "$TIMER_DROPIN_FILE" >&2
+      return 1
+    fi
+  else
+    if ! run_privileged rm -f -- "$TIMER_DROPIN_FILE"; then
+      printf 'WARNING: could not remove the new timer drop-in: %s\n' "$TIMER_DROPIN_FILE" >&2
+      return 1
+    fi
+    if [ "$had_dropin_dir" != "1" ]; then
+      run_privileged rmdir -- "$TIMER_DROPIN_DIR" 2>/dev/null || true
+    fi
+  fi
+}
+
+schedule_tx_report_rollback() {
+  if [ "$1" = "0" ]; then
+    printf 'The previous schedule state was restored.\n' >&2
+  else
+    printf 'WARNING: schedule rollback was incomplete; inspect %s and the systemd timer drop-in %s manually.\n' "$SCHEDULE_CONF" "$TIMER_DROPIN_FILE" >&2
+  fi
+}
+
+schedule_configure() {
+  local mode="" day="" time="" delay="" default_mode default_day default_time default_delay
+  local dropin_tmp="" config_tmp="" config_backup="" dropin_backup=""
+  local had_config=0 had_dropin=0 had_dropin_dir=0 rollback_failed=0
+
+  require_systemd || return 1
+  require_inventory_units || return 1
+
+  default_mode="$DEFAULT_SCHEDULE_MODE"
+  default_day="$DEFAULT_SCHEDULE_DAY"
+  default_time="$DEFAULT_SCHEDULE_TIME"
+  default_delay="$DEFAULT_RANDOMIZED_DELAY_MINUTES"
+  if load_schedule_config 2>/dev/null; then
+    default_mode="$SCHEDULE_MODE"
+    [ -n "$SCHEDULE_DAY" ] && default_day="$SCHEDULE_DAY"
+    default_time="$SCHEDULE_TIME"
+    default_delay="$RANDOMIZED_DELAY_MINUTES"
+  fi
+
+  read -r -p "Schedule mode [daily/weekly] (default: ${default_mode}): " mode || true
+  mode="$(printf '%s' "${mode:-$default_mode}" | tr 'A-Z' 'a-z')"
+  if ! valid_schedule_mode "$mode"; then
+    printf 'ERROR: schedule mode must be daily or weekly.\n' >&2
+    return 1
+  fi
+
+  if [ "$mode" = "weekly" ]; then
+    read -r -p "Day of week [Mon Tue Wed Thu Fri Sat Sun] (default: ${default_day}): " day || true
+    day="$(normalize_schedule_day "${day:-$default_day}")"
+    if ! valid_schedule_day "$day"; then
+      printf 'ERROR: day of week must be one of: Mon Tue Wed Thu Fri Sat Sun.\n' >&2
+      return 1
+    fi
+  fi
+
+  read -r -p "Time HH:MM (default: ${default_time}): " time || true
+  time="${time:-$default_time}"
+  if ! valid_schedule_time "$time"; then
+    printf 'ERROR: time must use HH:MM format within 00:00-23:59.\n' >&2
+    return 1
+  fi
+
+  read -r -p "Randomized delay in minutes 0-1440 (default: ${default_delay}): " delay || true
+  delay="${delay:-$default_delay}"
+  if ! valid_randomized_delay "$delay"; then
+    printf 'ERROR: randomized delay must be an integer within 0-1440 minutes.\n' >&2
+    return 1
+  fi
+  delay="$((10#$delay))"
+
+  if ! mkdir -p "$CONFIG_DIR" || ! chmod 0700 "$CONFIG_DIR"; then
+    printf 'ERROR: could not prepare configuration directory: %s\n' "$CONFIG_DIR" >&2
+    return 1
+  fi
+  # schedule.conf and the timer drop-in are updated as one transaction: all new
+  # content and backups of the current state are prepared before any change, and
+  # a failure in a later step restores the previous state.
+  if [ -L "$SCHEDULE_CONF" ] || { [ -e "$SCHEDULE_CONF" ] && [ ! -f "$SCHEDULE_CONF" ]; }; then
+    printf 'ERROR: schedule configuration is not a regular file: %s\n' "$SCHEDULE_CONF" >&2
+    return 1
+  fi
+  if [ -L "$TIMER_DROPIN_FILE" ] || { [ -e "$TIMER_DROPIN_FILE" ] && [ ! -f "$TIMER_DROPIN_FILE" ]; }; then
+    printf 'ERROR: timer drop-in is not a regular file: %s\n' "$TIMER_DROPIN_FILE" >&2
+    return 1
+  fi
+  [ -e "$SCHEDULE_CONF" ] && had_config=1
+  [ -e "$TIMER_DROPIN_FILE" ] && had_dropin=1
+  [ -d "$TIMER_DROPIN_DIR" ] && had_dropin_dir=1
+
+  if ! dropin_tmp="$(mktemp "${CONFIG_DIR}/.schedule-dropin.new.XXXXXX")" \
+    || ! config_tmp="$(mktemp "${CONFIG_DIR}/.schedule-conf.new.XXXXXX")" \
+    || ! config_backup="$(mktemp "${CONFIG_DIR}/.schedule-conf.backup.XXXXXX")" \
+    || ! dropin_backup="$(mktemp "${CONFIG_DIR}/.schedule-dropin.backup.XXXXXX")"; then
+    schedule_tx_cleanup "$dropin_tmp" "$config_tmp" "$config_backup" "$dropin_backup"
+    printf 'ERROR: could not create temporary files in %s; nothing was changed.\n' "$CONFIG_DIR" >&2
+    return 1
+  fi
+
+  if [ "$had_config" = "1" ] && ! cp -p -- "$SCHEDULE_CONF" "$config_backup"; then
+    schedule_tx_cleanup "$dropin_tmp" "$config_tmp" "$config_backup" "$dropin_backup"
+    printf 'ERROR: could not back up %s; nothing was changed.\n' "$SCHEDULE_CONF" >&2
+    return 1
+  fi
+  if [ "$had_dropin" = "1" ] && ! cp -- "$TIMER_DROPIN_FILE" "$dropin_backup"; then
+    schedule_tx_cleanup "$dropin_tmp" "$config_tmp" "$config_backup" "$dropin_backup"
+    printf 'ERROR: could not back up %s; nothing was changed.\n' "$TIMER_DROPIN_FILE" >&2
+    return 1
+  fi
+
+  if ! {
+    printf '[Timer]\n'
+    printf 'OnCalendar=\n'
+    printf 'OnCalendar=%s\n' "$(schedule_on_calendar "$mode" "$day" "$time")"
+    printf 'RandomizedDelaySec=%sm\n' "$delay"
+    printf 'Persistent=true\n'
+  } > "$dropin_tmp" || ! {
+    printf 'SCHEDULE_MODE=%s\n' "$mode"
+    if [ "$mode" = "weekly" ]; then
+      printf 'SCHEDULE_DAY=%s\n' "$day"
+    fi
+    printf 'SCHEDULE_TIME=%s\n' "$time"
+    printf 'RANDOMIZED_DELAY_MINUTES=%s\n' "$delay"
+  } > "$config_tmp" || ! chmod 0600 "$config_tmp"; then
+    schedule_tx_cleanup "$dropin_tmp" "$config_tmp" "$config_backup" "$dropin_backup"
+    printf 'ERROR: could not prepare the new schedule files; nothing was changed.\n' >&2
+    return 1
+  fi
+  if [ "$(id -u 2>/dev/null)" = "0" ] && ! chown --reference="$CONFIG_DIR" -- "$config_tmp"; then
+    schedule_tx_cleanup "$dropin_tmp" "$config_tmp" "$config_backup" "$dropin_backup"
+    printf 'ERROR: could not set the owner of the new schedule configuration; nothing was changed.\n' >&2
+    return 1
+  fi
+
+  if ! mv -f -- "$config_tmp" "$SCHEDULE_CONF" || ! schedule_conf_owner_and_mode_ok; then
+    printf 'ERROR: could not save the schedule configuration with mode 0600 and the owner of %s: %s\n' "$CONFIG_DIR" "$SCHEDULE_CONF" >&2
+    schedule_tx_restore_conf "$had_config" "$config_backup" || rollback_failed=1
+    schedule_tx_report_rollback "$rollback_failed"
+    schedule_tx_cleanup "$dropin_tmp" "$config_tmp" "$config_backup" "$dropin_backup"
+    return 1
+  fi
+
+  if ! run_privileged install -d -m 0755 -o root -g root "$TIMER_DROPIN_DIR" \
+    || ! run_privileged install -m 0644 -o root -g root "$dropin_tmp" "$TIMER_DROPIN_FILE"; then
+    printf 'ERROR: could not install timer drop-in: %s\n' "$TIMER_DROPIN_FILE" >&2
+    schedule_tx_restore_conf "$had_config" "$config_backup" || rollback_failed=1
+    schedule_tx_restore_dropin "$had_dropin" "$dropin_backup" "$had_dropin_dir" || rollback_failed=1
+    schedule_tx_report_rollback "$rollback_failed"
+    schedule_tx_cleanup "$dropin_tmp" "$config_tmp" "$config_backup" "$dropin_backup"
+    return 1
+  fi
+
+  if ! run_privileged systemctl daemon-reload; then
+    printf 'ERROR: systemctl daemon-reload failed; restoring the previous schedule.\n' >&2
+    schedule_tx_restore_conf "$had_config" "$config_backup" || rollback_failed=1
+    schedule_tx_restore_dropin "$had_dropin" "$dropin_backup" "$had_dropin_dir" || rollback_failed=1
+    schedule_tx_report_rollback "$rollback_failed"
+    if ! run_privileged systemctl daemon-reload; then
+      printf 'WARNING: systemctl daemon-reload after rollback also failed; systemd may not see the restored schedule yet.\n' >&2
+    fi
+    schedule_tx_cleanup "$dropin_tmp" "$config_tmp" "$config_backup" "$dropin_backup"
+    return 1
+  fi
+
+  schedule_tx_cleanup "$dropin_tmp" "$config_tmp" "$config_backup" "$dropin_backup"
+
+  printf 'Automatic inventory schedule configured: %s\n' "$(schedule_description "$mode" "$day" "$time" "$delay")"
+  printf 'OnCalendar: %s\n' "$(schedule_on_calendar "$mode" "$day" "$time")"
+  printf 'RandomizedDelaySec: %sm\n' "$delay"
+  printf 'Persistent: true\n'
+  printf 'Configuration: %s\n' "$SCHEDULE_CONF"
+  printf 'Timer drop-in: %s\n' "$TIMER_DROPIN_FILE"
+  printf 'The timer enable state was not changed. Use itgo-inv schedule-enable to turn on automatic inventory.\n'
+}
+
+schedule_enable() {
+  require_systemd || return 1
+  require_inventory_units || return 1
+
+  if ! run_privileged systemctl enable --now "$INVENTORY_TIMER_UNIT"; then
+    printf 'ERROR: could not enable %s.\n' "$INVENTORY_TIMER_UNIT" >&2
+    return 1
+  fi
+  printf 'SUCCESS: automatic inventory enabled (%s).\n' "$INVENTORY_TIMER_UNIT"
+  systemctl list-timers --all --no-pager "$INVENTORY_TIMER_UNIT" 2>/dev/null || true
+}
+
+schedule_disable() {
+  require_systemd || return 1
+
+  if ! run_privileged systemctl disable --now "$INVENTORY_TIMER_UNIT"; then
+    printf 'ERROR: could not disable %s.\n' "$INVENTORY_TIMER_UNIT" >&2
+    return 1
+  fi
+  printf 'SUCCESS: automatic inventory disabled (%s).\n' "$INVENTORY_TIMER_UNIT"
+  printf 'Schedule configuration was preserved; use itgo-inv schedule-enable to turn it on again.\n'
+}
+
+schedule_status() {
+  local config_state enabled_state active_state
+
+  load_schedule_config
+  config_state=$?
+  case "$config_state" in
+    0)
+      printf 'Schedule: %s\n' "$(schedule_description "$SCHEDULE_MODE" "$SCHEDULE_DAY" "$SCHEDULE_TIME" "$RANDOMIZED_DELAY_MINUTES")"
+      printf 'Configuration: %s\n' "$SCHEDULE_CONF"
+      ;;
+    2)
+      printf 'Schedule: %s (default; %s not present)\n' \
+        "$(schedule_description "$DEFAULT_SCHEDULE_MODE" "$DEFAULT_SCHEDULE_DAY" "$DEFAULT_SCHEDULE_TIME" "$DEFAULT_RANDOMIZED_DELAY_MINUTES")" \
+        "$SCHEDULE_CONF"
+      ;;
+    *)
+      printf 'Schedule: configuration is invalid; run itgo-inv schedule-configure\n'
+      ;;
+  esac
+  if [ -f "$TIMER_DROPIN_FILE" ]; then
+    printf 'Timer drop-in: %s\n' "$TIMER_DROPIN_FILE"
+  else
+    printf 'Timer drop-in: not present (unit file defaults apply)\n'
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    printf 'WARNING: systemctl is unavailable; timer state cannot be shown.\n' >&2
+    return 1
+  fi
+
+  enabled_state="$(systemctl is-enabled "$INVENTORY_TIMER_UNIT" 2>/dev/null)" || true
+  active_state="$(systemctl is-active "$INVENTORY_TIMER_UNIT" 2>/dev/null)" || true
+  printf 'Timer enabled: %s\n' "${enabled_state:-unknown}"
+  printf 'Timer active: %s\n' "${active_state:-unknown}"
+  printf '\n'
+  systemctl list-timers --all --no-pager "$INVENTORY_TIMER_UNIT" 2>/dev/null || true
+  printf '\n'
+  systemctl show --no-pager --property=NextElapseUSecRealtime --property=LastTriggerUSec "$INVENTORY_TIMER_UNIT" 2>/dev/null || true
+  systemctl show --no-pager --property=Result --property=ExecMainStatus "$INVENTORY_SERVICE_UNIT" 2>/dev/null || true
+}
+
+schedule_run_now() {
+  require_systemd || return 1
+  require_inventory_units || return 1
+
+  printf 'Starting %s (runs itgo-inv collect)...\n' "$INVENTORY_SERVICE_UNIT"
+  if ! run_privileged systemctl start "$INVENTORY_SERVICE_UNIT"; then
+    printf 'ERROR: %s failed. Check: journalctl -u %s --no-pager\n' "$INVENTORY_SERVICE_UNIT" "$INVENTORY_SERVICE_UNIT" >&2
+    return 1
+  fi
+  printf 'SUCCESS: %s finished. Log: journalctl -u %s --no-pager\n' "$INVENTORY_SERVICE_UNIT" "$INVENTORY_SERVICE_UNIT"
+}
+
 show_latest() {
   local latest
 
@@ -579,7 +1138,7 @@ command_name="${1:-collect}"
 
 case "$command_name" in
   collect)
-    collect_report
+    collect_with_lock
     ;;
   latest)
     show_latest
@@ -592,6 +1151,21 @@ case "$command_name" in
     ;;
   test-nextcloud)
     test_nextcloud
+    ;;
+  schedule-configure)
+    schedule_configure
+    ;;
+  schedule-enable)
+    schedule_enable
+    ;;
+  schedule-disable)
+    schedule_disable
+    ;;
+  schedule-status)
+    schedule_status
+    ;;
+  schedule-run-now)
+    schedule_run_now
     ;;
   help|-h|--help)
     usage

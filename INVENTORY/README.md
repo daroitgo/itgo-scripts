@@ -10,6 +10,7 @@ The public installer places files under:
 - `/home/itgo/UTILITY/INVENTORY/reports`
 - `/home/itgo/UTILITY/INVENTORY/logs`
 - `/home/itgo/UTILITY/INVENTORY/config`
+- `/home/itgo/UTILITY/INVENTORY/run` (collect lock: `run/collect.lock`)
 
 Nextcloud configuration, when enabled, is stored locally as:
 
@@ -17,6 +18,8 @@ Nextcloud configuration, when enabled, is stored locally as:
 - `/home/itgo/UTILITY/INVENTORY/config/nextcloud.cred`
 
 It also creates `/usr/local/bin/itgo-inv` as a symlink to the installed wrapper.
+
+On systemd hosts it also installs the technical units `/etc/systemd/system/itgo-inventory.service` and `/etc/systemd/system/itgo-inventory.timer` (see [Automatic inventory](#automatic-inventory)).
 
 ## Usage
 
@@ -52,6 +55,33 @@ itgo-inv test-nextcloud
 ```
 
 `configure-nextcloud` interactively asks for the Nextcloud URL, technical user and App Password. The App Password is never accepted as a CLI argument and is not written to logs. The configuration directory uses mode `0700`. Credential storage prefers user-scoped `systemd-creds`; when it is unavailable, the App Password falls back to a local file protected with mode `0600`.
+
+`collect` holds an exclusive `flock` lock on `run/collect.lock` for the whole run, so a manual `itgo-inv collect` and the systemd timer never run the collector at the same time; a second run reports that a collect is already in progress and exits without starting the collector. If `flock` is unavailable, `collect` prints a warning and runs without this protection.
+
+## Automatic inventory
+
+Automatic inventory uses a systemd timer that runs the same `itgo-inv collect` as a manual run:
+
+- `itgo-inventory.service` – `Type=oneshot`, runs `/usr/local/bin/itgo-inv collect` as the installation user (`itgo` by default, the installer's `TARGET_USER`), never as root, with `UMask=0077`;
+- `itgo-inventory.timer` – default schedule weekly, Sunday 03:00, `RandomizedDelaySec=30m`, `Persistent=true` (a run missed while the server was off is executed after the next boot).
+
+The timer is **not** enabled during installation. A module upgrade does not change the timer enable state and preserves the configured schedule. If systemd is unavailable, the installer prints a warning and manual `itgo-inv collect` keeps working.
+
+```bash
+itgo-inv schedule-configure
+itgo-inv schedule-enable
+itgo-inv schedule-disable
+itgo-inv schedule-status
+itgo-inv schedule-run-now
+```
+
+- `schedule-configure` – interactively sets `daily` (time, randomized delay) or `weekly` (day `Mon`–`Sun`, time, randomized delay) mode; time uses `HH:MM`, randomized delay is 0–1440 minutes. The canonical configuration is stored in `/home/itgo/UTILITY/INVENTORY/config/schedule.conf` (mode `0600`) and applied as the drop-in `/etc/systemd/system/itgo-inventory.timer.d/schedule.conf`. It does not enable the timer.
+- `schedule-enable` – runs `systemctl enable --now itgo-inventory.timer`.
+- `schedule-disable` – runs `systemctl disable --now itgo-inventory.timer`; the schedule configuration and drop-in are kept.
+- `schedule-status` – read-only; shows the configured (or default) schedule, enabled/active state and the next timer run.
+- `schedule-run-now` – runs `systemctl start itgo-inventory.service` once; the result is in `journalctl -u itgo-inventory.service`.
+
+Commands that change systemd state run directly as root or through `sudo` otherwise.
 
 ## Collector scope
 
@@ -89,14 +119,15 @@ INVENTORY/<client_code>/<report_name>
 For `collect`, INVENTORY:
 
 1. runs a WebDAV preflight when Nextcloud is configured;
-2. generates the local report even if Nextcloud communication fails;
-3. uploads the report after a successful preflight;
-4. confirms the uploaded file with WebDAV `PROPFIND` after `PUT`;
-5. deletes the local report only after confirmed upload;
-6. preserves the local report on any communication or upload failure;
-7. does not automatically delete earlier reports retained after failed uploads;
-8. uses a no-overwrite `PUT` safeguard for an existing remote report;
-9. disables automatic upload when `client_code` is `unknown`.
+2. after a successful preflight and before generating a new report, retries up to 20 pending local reports (`inventory_<client_code>_*.json`, oldest first) of the current `client_code` only; the report content must also carry the same `client_code`;
+3. generates the local report even if Nextcloud communication fails or a pending report retry fails;
+4. uploads the report after a successful preflight;
+5. confirms the uploaded file with WebDAV `PROPFIND` after `PUT`;
+6. deletes the local report – new or pending – only after confirmed upload;
+7. preserves the local report on any communication or upload failure;
+8. does not automatically delete earlier reports retained after failed uploads other than through a confirmed retry upload;
+9. uses a no-overwrite `PUT` safeguard for an existing remote report;
+10. disables automatic upload when `client_code` is `unknown`.
 
 If Nextcloud is not configured, `collect` remains backward-compatible and creates the report locally.
 
