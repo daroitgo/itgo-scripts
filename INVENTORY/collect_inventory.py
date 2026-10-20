@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.13"
+COLLECTOR_VERSION = "0.1.14"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -43,6 +43,7 @@ MAX_HOSTNAME_CHARS = 255
 ITGO_IDENTITY_PATH = "/home/itgo/UTILITY/ITGO-CONFIG/client-identity.json"
 ITGO_CLIENT_CODE_PATTERN = re.compile(r"^[a-z0-9_-]+$")
 APPLICATION_BASE_PATHS = ("/srv", "/usr/local", "/opt")
+PSIM2_EDM_DIRECTORY_NAMES = ("edm", "edm_psim2")
 COMPOSE_FILENAMES = (
     "docker-compose.yml",
     "docker-compose.yaml",
@@ -1065,7 +1066,7 @@ def psim2_edm_candidate(candidate_path, base_path, warnings):
     return {
         "source": "filesystem_allowlist",
         "source_path": candidate_path,
-        "name": "EDM",
+        "name": os.path.basename(candidate_path),
         "candidate_type": "psim2_edm",
         "status": "candidate",
         "fields": {
@@ -1301,7 +1302,7 @@ def collect_application_candidates(
             if is_non_primary_application_directory_name(candidate_name):
                 continue
 
-            if candidate_name.lower() == "edm":
+            if candidate_name.lower() in PSIM2_EDM_DIRECTORY_NAMES:
                 candidates.extend(edm_application_candidates(child, base, warnings))
                 continue
 
