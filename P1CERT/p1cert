@@ -41,6 +41,7 @@ Polecenia:
   verify    alias polecenia audit
   update    dodaj docelowe CA dla obsługiwanych profili P1
   status    pokaż wynik ostatniego audytu
+  ezdrowie  certyfikaty ezdrowie.gov.pl (osobna funkcja; p1cert ezdrowie help)
   version   pokaż wersję modułu
   help      pokaż tę pomoc
 EOF
@@ -52,6 +53,9 @@ case "${1:-help}" in
     ;;
   update)
     exec "$SCRIPT_DIR/p1cert_update.sh" "${@:2}"
+    ;;
+  ezdrowie)
+    exec "$SCRIPT_DIR/p1cert_ezdrowie.sh" "${@:2}"
     ;;
   status)
     if [ -r "$MODULE_DIR/state/p1cert-state" ]; then

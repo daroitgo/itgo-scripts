@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+- Added the separate `p1cert ezdrowie` namespace for operator-approved
+  replacement of local ezdrowie.gov.pl certificates (`/srv`, `/usr/local`,
+  `/opt`) with the source certificate from Nextcloud `P1CERT_EZDROWIE`:
+  `credentials`, `test`, `scan`, `plan`, `run`, `schedule`,
+  `schedule-status` and `schedule-cancel`. Decisions use X.509 data only
+  (validity, fingerprint, NotAfter, ezdrowie.gov.pl identity); the local path
+  and file name are always preserved, every replacement is backed up and
+  verified, and a failed restart rolls back with a single retry.
+  Identity follows TLS semantics: DNS SANs are authoritative and the CN is
+  only a fallback without DNS SAN; `*.ezdrowie.gov.pl` covers exactly one
+  left-most label; the source is selected per local target. DER files must
+  be exactly one certificate (no trailing data).
+- Added the root-owned helper
+  `/usr/local/libexec/itgo-p1cert/p1cert-ezdrowie-helper` with a dedicated
+  `/etc/sudoers.d/itgo-p1cert-ezdrowie` entry and the
+  `itgo-p1cert-ezdrowie.service` unit for the one-shot timer
+  (`Persistent=false`, no catch-up after downtime). The helper offers only
+  `apply`, `apply-systemd` and `apply-compose`: replacement, restart of a
+  unit/compose service it proves to use the certificate, and rollback from
+  its own copy of the old certificate happen in one privileged operation.
+  There is no standalone restart or restore and no restart allowance. The
+  helper fails closed when it, its library or their directories, the target
+  directory, or the scheduler units are not root-controlled, and calls
+  Docker with a clean environment (no `docker compose`). A rollback writes
+  the old certificate back only over the exact bytes it installed; systemd
+  restarts must stay active for a settle period; systemd binding evidence
+  must come from root-controlled directories.
+- `run` reports `PARTIAL` (non-zero exit) when some targets were skipped and
+  `ROLLBACK_RESTART_FAILED` separately from `ROLLBACK`; a scheduled run never
+  acts before the planned time; `plan`/`run`/`schedule` require `flock`;
+  credential mode file and config directory permissions are enforced.
+- The installer now creates `config/` and `backups/` with mode 0700 and no
+  longer changes ownership of `config/` and `backups/` recursively; P1 CA
+  commands (`audit`, `verify`, `update`, `status`) are unchanged.
+- Caller, library and root helper share a contract version (helper API 1,
+  reported by `helper ping`); a missing, older or newer helper is refused.
+  The installer installs system files only into trusted root directories
+  (`mv -f -T`, existing symlinks are never replaced), validates the complete
+  sudoers configuration with revert, verifies `sudo -n` of the helper for the
+  P1CERT user, validates the group name used in the service unit and reports
+  `P1CERT ezdrowie system integration: READY` or `INCOMPLETE`.
+- Added `p1cert_installer_public.sh --uninstall [user]`: disables and
+  removes the one-shot timer, removes the service unit, the sudoers fragment,
+  the root helper and library (directory only when empty), the own
+  `/usr/local/bin/p1cert` link and the P1CERT directory. Only root-owned
+  regular files with the P1CERT markers are removed; anything else is left
+  and reported with a non-zero exit status.
+
 - Added `update --java-only` and `update --with-keystore`. Automatic UPDATE
   now updates host Java cacerts and, when detected, an application JKS/PKCS12
   truststore; PEM/CER server-trust files remain untouched.

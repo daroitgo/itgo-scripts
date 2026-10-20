@@ -2,6 +2,9 @@ p1cert_installer_public.sh
 p1cert
 p1cert_audit.sh
 p1cert_update.sh
+p1cert_ezdrowie.sh
+p1cert_ezdrowie_lib.sh
+p1cert_ezdrowie_helper.sh
 p1cert.version
 certs/p1-production-certs.zip
 certs/README.md
