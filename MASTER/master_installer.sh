@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.133"
+MASTER_VERSION="1.2.134"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.28"
@@ -46,8 +46,8 @@ TSEQ_VERSION="3.12.9"
 DOWNLOADER_APP_VERSION="1.0.9"
 UPGBUILDER_VERSION="0.1.14"
 SERVICEGUARD_VERSION="0.1.7"
-INVENTORY_VERSION="0.1.20"
-P1CERT_VERSION="0.1.9"
+INVENTORY_VERSION="0.1.21"
+P1CERT_VERSION="0.1.10"
 LOGGUARD_VERSION="0.2.4"
 
 MODE="install"
@@ -108,6 +108,16 @@ INVENTORY_LOCAL_DIR="${SOURCE_DIR}/INVENTORY"
 INVENTORY_LOCAL_PATH="${INVENTORY_LOCAL_DIR}/inventory_installer_public.sh"
 P1CERT_LOCAL_DIR="${SOURCE_DIR}/P1CERT"
 P1CERT_LOCAL_PATH="${P1CERT_LOCAL_DIR}/p1cert_installer_public.sh"
+# P1CERT installs a root helper, so its installer is never run from the
+# user-writable TMP_DIR: the payload is staged in a root-only directory below
+# P1CERT_STAGE_PARENT (/run is a root-owned tmpfs) and removed afterwards.
+P1CERT_STAGE_PARENT="/run"
+P1CERT_STAGE_NAME="itgo-p1cert-stage."
+P1CERT_STAGE_TRUSTED_UID=0
+P1CERT_STAGE_DIR=""
+# Set when a module uninstall left something behind; the master then exits
+# non-zero after printing the summary.
+MODULE_UNINSTALL_FAILED=0
 LOGGUARD_LOCAL_DIR="${SOURCE_DIR}/LOGGUARD"
 LOGGUARD_LOCAL_PATH="${LOGGUARD_LOCAL_DIR}/logguard_installer_public.sh"
 UPGBUILDER_LOCAL_MAP="${SOURCE_DIR}/UPGBUILDER/upgbuilder.map"
@@ -393,7 +403,9 @@ module_runtime_packages() {
   case "${1:?}" in
     INVENTORY)      printf '%s\n' curl ;;
     DOWNLOADER_APP) printf '%s\n' curl jq wget ;;
-    P1CERT)         printf '%s\n' unzip openssl ;;
+    # curl: ezdrowie WebDAV; sudo/visudo: ezdrowie root helper integration.
+    # flock comes from util-linux, which is part of every supported base system.
+    P1CERT)         printf '%s\n' unzip openssl curl sudo ;;
     UPGBUILDER)     printf '%s\n' rsync ;;
     *) return 0 ;;
   esac
@@ -2612,55 +2624,194 @@ download_inventory_payload() {
   chown -R "$TARGET_USER:$TARGET_USER" "$out_dir" 2>/dev/null || true
 }
 
+# --- P1CERT root-only staging -------------------------------------------------
+# Trust chain: GitHub HTTPS (or the trusted offline source) -> root wget/cp ->
+# root-only staging below /run -> root runs the installer from the staging ->
+# the installer copies helper/library to root-owned /usr/local/libexec.
+# Nothing in this chain is writable by TARGET_USER.
+
+# True when $1 is a directory (not a symlink) owned by root and not writable
+# by group or others.
+p1cert_stage_dir_trusted() {
+  local dir="${1:?}" meta
+
+  [[ -d "$dir" && ! -L "$dir" ]] || return 1
+  meta="$(stat -c '%u %a' -- "$dir" 2>/dev/null)" || return 1
+  [[ "$meta" =~ ^[0-9]+\ [0-7]+$ ]] || return 1
+  [[ "${meta%% *}" == "$P1CERT_STAGE_TRUSTED_UID" ]] || return 1
+  (( (8#${meta#* } & 8#022) == 0 ))
+}
+
+# True only for a path of the exact form <parent>/itgo-p1cert-stage.<alnum>.
+p1cert_stage_path_ok() {
+  local dir="${1:-}" suffix
+
+  case "$dir" in
+    "$P1CERT_STAGE_PARENT/$P1CERT_STAGE_NAME"?*) ;;
+    *) return 1 ;;
+  esac
+  suffix="${dir#"$P1CERT_STAGE_PARENT/$P1CERT_STAGE_NAME"}"
+  [[ "$suffix" =~ ^[A-Za-z0-9]+$ ]]
+}
+
+# Removes the current staging directory, but only a root-owned, non-symlink
+# directory with the exact staging prefix.
+p1cert_stage_cleanup() {
+  local dir="${P1CERT_STAGE_DIR:-}" owner
+
+  [[ -n "$dir" ]] || return 0
+  P1CERT_STAGE_DIR=""
+  trap - EXIT INT TERM
+  owner="$(stat -c '%u' -- "$dir" 2>/dev/null || true)"
+  if p1cert_stage_path_ok "$dir" && [[ -d "$dir" && ! -L "$dir" && "$owner" == "$P1CERT_STAGE_TRUSTED_UID" ]]; then
+    rm -rf -- "$dir"
+    echo "[$(ts)] OK: P1CERT staging removed: $dir"
+  elif [[ -e "$dir" || -L "$dir" ]]; then
+    echo "[$(ts)] WARN: unexpected P1CERT staging path, not removed: $dir"
+  fi
+}
+
+# Creates a fresh root-only (root:root 0700) staging directory directly below
+# the root-owned /run and arms its cleanup for exit and interruption.
+p1cert_stage_create() {
+  local dir
+
+  p1cert_stage_cleanup
+  if ! p1cert_stage_dir_trusted "$P1CERT_STAGE_PARENT"; then
+    echo "[$(ts)] ERROR: $P1CERT_STAGE_PARENT is not a root-owned directory without group/world write access (or is a symlink); P1CERT staging refused."
+    return 1
+  fi
+  dir="$(umask 077 && mktemp -d "$P1CERT_STAGE_PARENT/${P1CERT_STAGE_NAME}XXXXXX")" || {
+    echo "[$(ts)] ERROR: cannot create the P1CERT staging directory in $P1CERT_STAGE_PARENT."
+    return 1
+  }
+  if ! p1cert_stage_path_ok "$dir"; then
+    echo "[$(ts)] ERROR: unexpected P1CERT staging path: $dir"
+    return 1
+  fi
+  P1CERT_STAGE_DIR="$dir"
+  trap 'p1cert_stage_cleanup' EXIT
+  trap 'p1cert_stage_cleanup; exit 130' INT
+  trap 'p1cert_stage_cleanup; exit 143' TERM
+  if ! chown root:root "$dir" || ! chmod 0700 "$dir" || ! p1cert_stage_dir_trusted "$dir" \
+     || [[ "$(stat -c '%a' -- "$dir" 2>/dev/null)" != 700 ]]; then
+    echo "[$(ts)] ERROR: P1CERT staging directory is not root-only: $dir"
+    p1cert_stage_cleanup
+    return 1
+  fi
+  echo "[$(ts)] OK: P1CERT root-only staging: $dir"
+}
+
+p1cert_payload_item_ok() {
+  local item="${1:-}"
+
+  [[ -n "$item" && "$item" != /* && "$item" != *..* && "$item" != *\\* && "$item" != */ \
+     && "$item" =~ ^[A-Za-z0-9._/-]+$ ]]
+}
+
+# Independent check of a filled staging directory: installer and manifest
+# present, every manifest entry a regular file inside the staging, no
+# symlinks and nothing owned by anyone but root or writable by group/others.
+p1cert_verify_stage() {
+  local dir="${1:?}" item path parent
+
+  [[ -f "$dir/p1cert_installer_public.sh" && ! -L "$dir/p1cert_installer_public.sh" ]] \
+    || { echo "[$(ts)] ERROR: staged P1CERT installer missing or not a regular file."; return 1; }
+  [[ -f "$dir/p1cert.payload" && ! -L "$dir/p1cert.payload" ]] \
+    || { echo "[$(ts)] ERROR: staged p1cert.payload missing or not a regular file."; return 1; }
+  while IFS= read -r item || [[ -n "$item" ]]; do
+    item="${item%$'\r'}"
+    p1cert_payload_item_ok "$item" || { echo "[$(ts)] ERROR: unsafe P1CERT payload path: ${item:-<empty>}"; return 1; }
+    path="$dir/$item"
+    [[ -f "$path" && ! -L "$path" ]] || { echo "[$(ts)] ERROR: staged P1CERT file missing or not a regular file: $item"; return 1; }
+    parent="$(cd -P -- "$(dirname -- "$path")" 2>/dev/null && pwd -P)" || return 1
+    case "$parent/" in
+      "$dir"/*) ;;
+      *) echo "[$(ts)] ERROR: staged P1CERT file outside the staging directory: $item"; return 1 ;;
+    esac
+  done < "$dir/p1cert.payload"
+  if [[ -n "$(find "$dir" \( -type l -o ! -uid "$P1CERT_STAGE_TRUSTED_UID" -o -perm /022 \) -print -quit 2>/dev/null)" ]]; then
+    echo "[$(ts)] ERROR: P1CERT staging contains symlinks, foreign-owned or writable entries."
+    return 1
+  fi
+}
+
+# Fills the root-only staging directory (only P1CERT_STAGE_DIR is accepted)
+# from GitHub (root wget) or from the trusted offline source (root copy).
+# p1cert.payload is the source of truth; files stay root-owned 0600 (the
+# installer is started with "bash", nothing has to be executable).
 download_p1cert_payload() {
   local out_dir="${1:?}"
   local item source_path out_path url payload_file item_dir
 
-  [[ -d "$TMP_DIR" ]] || { echo "[$(ts)] ERROR: missing $TMP_DIR"; return 1; }
-
-  rm -rf "$out_dir"
-  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$out_dir"
+  if [[ -z "$P1CERT_STAGE_DIR" || "$out_dir" != "$P1CERT_STAGE_DIR" ]] \
+     || ! p1cert_stage_path_ok "$out_dir" || ! p1cert_stage_dir_trusted "$out_dir"; then
+    echo "[$(ts)] ERROR: the P1CERT payload may only be staged in the root-only staging directory."
+    return 1
+  fi
 
   payload_file="$out_dir/p1cert.payload"
   if [[ "$OFFLINE_MODE" == "1" ]]; then
     source_path="$P1CERT_LOCAL_DIR/p1cert.payload"
-    [[ -f "$source_path" ]] || { echo "[$(ts)] ERROR: local P1CERT payload manifest missing: $source_path"; return 1; }
-    echo "[$(ts)] COPY(local): $source_path -> $payload_file"
-    cp "$source_path" "$payload_file"
+    [[ -f "$source_path" && ! -L "$source_path" ]] \
+      || { echo "[$(ts)] ERROR: local P1CERT payload manifest missing or not a regular file: $source_path"; return 1; }
+    echo "[$(ts)] COPY(local->root staging): $source_path -> $payload_file"
+    cp -- "$source_path" "$payload_file" || { echo "[$(ts)] ERROR: cannot copy $source_path"; return 1; }
   else
     url="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/p1cert-${P1CERT_VERSION}/P1CERT/p1cert.payload"
-    echo "[$(ts)] DOWNLOAD: $url -> $payload_file"
-    wget -qO "$payload_file" "$url"
+    echo "[$(ts)] DOWNLOAD(root staging): $url -> $payload_file"
+    wget -qO "$payload_file" "$url" || { echo "[$(ts)] ERROR: download failed: $url"; return 1; }
   fi
+  [[ -f "$payload_file" && ! -L "$payload_file" ]] || { echo "[$(ts)] ERROR: staged p1cert.payload is not a regular file."; return 1; }
+  chmod 0600 "$payload_file" || return 1
 
   while IFS= read -r item || [[ -n "$item" ]]; do
     item="${item%$'\r'}"
-    if [[ -z "$item" || "$item" == /* || "$item" == *..* || "$item" == *\\* || "$item" == */ || ! "$item" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    if ! p1cert_payload_item_ok "$item"; then
       echo "[$(ts)] ERROR: unsafe P1CERT payload path: ${item:-<empty>}"
       return 1
     fi
     out_path="$out_dir/$item"
-    item_dir="$(dirname "$out_path")"
-    install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$item_dir"
+    item_dir="$(dirname -- "$out_path")"
+    if [[ "$item_dir" != "$out_dir" ]]; then
+      (umask 077 && mkdir -p -- "$item_dir") || { echo "[$(ts)] ERROR: cannot create $item_dir"; return 1; }
+    fi
+    [[ ! -L "$out_path" ]] || { echo "[$(ts)] ERROR: staged P1CERT path is a symlink: $item"; return 1; }
     if [[ "$OFFLINE_MODE" == "1" ]]; then
       source_path="$P1CERT_LOCAL_DIR/$item"
-      [[ -f "$source_path" ]] || { echo "[$(ts)] ERROR: local source missing: $source_path"; return 1; }
-      echo "[$(ts)] COPY(local): $source_path -> $out_path"
-      cp "$source_path" "$out_path"
+      [[ -f "$source_path" && ! -L "$source_path" ]] \
+        || { echo "[$(ts)] ERROR: local source missing or not a regular file: $source_path"; return 1; }
+      echo "[$(ts)] COPY(local->root staging): $source_path -> $out_path"
+      cp -- "$source_path" "$out_path" || { echo "[$(ts)] ERROR: cannot copy $source_path"; return 1; }
     else
       if [[ "$item" == "p1cert_installer_public.sh" ]]; then
         url="$P1CERT_URL"
       else
         url="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/p1cert-${P1CERT_VERSION}/P1CERT/${item}"
       fi
-      echo "[$(ts)] DOWNLOAD: $url -> $out_path"
-      wget -qO "$out_path" "$url"
+      echo "[$(ts)] DOWNLOAD(root staging): $url -> $out_path"
+      wget -qO "$out_path" "$url" || { echo "[$(ts)] ERROR: download failed: $url"; return 1; }
     fi
+    chmod 0600 "$out_path" || return 1
   done < "$payload_file"
 
-  chmod 0755 "$out_dir/p1cert_installer_public.sh" "$out_dir/p1cert" "$out_dir/p1cert_audit.sh"
-  chmod 0644 "$payload_file" "$out_dir/p1cert.version" "$out_dir/README.md" "$out_dir/CHANGELOG.md"
-  chown -R "$TARGET_USER:$TARGET_USER" "$out_dir" 2>/dev/null || true
+  p1cert_verify_stage "$out_dir"
+}
+
+# Runs the P1CERT installer (install/update, or "--uninstall") as root from a
+# fresh root-only staging directory and removes the staging afterwards.
+run_p1cert_installer_staged() {
+  local rc=0
+
+  p1cert_stage_create || return 1
+  if download_p1cert_payload "$P1CERT_STAGE_DIR"; then
+    run_module_root "$P1CERT_STAGE_DIR/p1cert_installer_public.sh" "$@" || rc=$?
+  else
+    echo "[$(ts)] ERROR: P1CERT payload could not be staged; installer not started."
+    rc=1
+  fi
+  p1cert_stage_cleanup
+  return "$rc"
 }
 
 download_logguard_payload() {
@@ -4791,24 +4942,20 @@ install_inventory_step() {
   fi
 }
 
+# P1CERT is always installed from a root-only staging directory below /run
+# (run_p1cert_installer_staged), never from TMP_DIR.
 install_p1cert_step() {
-  local p1cert_dir="${1:?}"
-  local p1cert_sh="$p1cert_dir/p1cert_installer_public.sh"
-
   if should_install_or_update_module "P1CERT"; then
     if [[ "$MODULE_DECISION" == "install" ]]; then
-      if prompt_yn "KROK: zainstalować P1CERT (read-only audit certyfikatów P1)?" "Y"; then
+      if prompt_yn "KROK: zainstalować P1CERT (audit/update CA P1 + osobne, zatwierdzane przez operatora odnawianie certyfikatów ezdrowie.gov.pl)?" "Y"; then
         ensure_module_runtime_dependencies P1CERT || { echo "[$(ts)] ERROR: runtime dependencies missing; cannot run module."; exit 1; }
         ensure_wget || { echo "[$(ts)] ERROR: wget missing; cannot run module."; exit 1; }
         have_user || { echo "[$(ts)] ERROR: user '$TARGET_USER' missing."; exit 1; }
         ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
         [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
         UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
-        TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
         [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
-        [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
-        download_p1cert_payload "$p1cert_dir"
-        run_module_root "$p1cert_sh" "$TARGET_USER"
+        run_p1cert_installer_staged "$TARGET_USER" || { echo "[$(ts)] ERROR: P1CERT installer failed."; exit 1; }
         echo "[$(ts)] OK: P1CERT done."
       else
         echo "[$(ts)] SKIP: P1CERT."
@@ -4822,11 +4969,8 @@ install_p1cert_step() {
       ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
       [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
       UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
-      TMP_DIR="${TMP_DIR:-$UTILITY_DIR/TMP}"
       [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
-      [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
-      download_p1cert_payload "$p1cert_dir"
-      run_module_root "$p1cert_sh" "$TARGET_USER"
+      run_p1cert_installer_staged "$TARGET_USER" || { echo "[$(ts)] ERROR: P1CERT installer failed."; exit 1; }
       echo "[$(ts)] OK: P1CERT done."
     fi
   fi
@@ -5095,24 +5239,37 @@ uninstall_inventory_step() {
   add_summary "Uninstall: INVENTORY"
 }
 
+# The P1CERT module owns its cleanup (timer, service, sudoers, root helper,
+# command link, P1CERT directory): the current installer is run with
+# --uninstall from a root-only staging directory.  A failure is reported and
+# makes the master exit non-zero; it never reports OK.
 uninstall_p1cert_step() {
-  local app_dir legacy_link
-
   if ! have_user; then
-    echo "[$(ts)] WARN: user '$TARGET_USER' missing. Pomijam P1CERT uninstall."
+    echo "[$(ts)] WARN: user '$TARGET_USER' missing; removing the P1CERT system components anyway."
+  fi
+  if ! ensure_wget; then
+    echo "[$(ts)] ERROR: wget missing; cannot uninstall P1CERT."
+    add_summary "Uninstall: P1CERT ERROR (wget missing)"
+    MODULE_UNINSTALL_FAILED=1
     return 0
   fi
+  if run_p1cert_installer_staged --uninstall "$TARGET_USER"; then
+    echo "[$(ts)] OK: P1CERT uninstall done."
+    add_summary "Uninstall: P1CERT"
+  else
+    echo "[$(ts)] ERROR: P1CERT uninstall incomplete; the remaining items are listed above."
+    add_summary "Uninstall: P1CERT ERROR (incomplete - see the installer output)"
+    MODULE_UNINSTALL_FAILED=1
+  fi
+}
 
-  ITGO_HOME="${ITGO_HOME:-$(resolve_home)}"
-  [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] WARN: cannot resolve home for '$TARGET_USER'. Pomijam P1CERT uninstall."; return 0; }
-
-  app_dir="$ITGO_HOME/UTILITY/P1CERT"
-  legacy_link="/usr/local/bin/p1cert"
-  rm -f "$legacy_link" "${legacy_link}.bak" "${legacy_link}.bak."* 2>/dev/null || true
-  rm -rf "$app_dir" 2>/dev/null || true
-
-  echo "[$(ts)] OK: P1CERT uninstall done."
-  add_summary "Uninstall: P1CERT"
+# Exit status after a module uninstall flow.
+exit_after_module_uninstall() {
+  if [[ "$MODULE_UNINSTALL_FAILED" == "1" ]]; then
+    echo "[$(ts)] ERROR: at least one module uninstall did not complete."
+    exit 1
+  fi
+  exit 0
 }
 
 uninstall_logguard_step() {
@@ -5176,7 +5333,7 @@ section() {
 
 main() {
   local detected_modules="" uninstall_scope="" uninstall_module=""
-  local status_sh cleanup_sh tseq_sh downloader_app_sh upgbuilder_sh serviceguard_sh inventory_dir p1cert_dir logguard_dir
+  local status_sh cleanup_sh tseq_sh downloader_app_sh upgbuilder_sh serviceguard_sh inventory_dir logguard_dir
 
   need_root
   prelog "BEGIN: ITGO Master Installer v$MASTER_VERSION user=$TARGET_USER"
@@ -5283,7 +5440,6 @@ main() {
     upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
     serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
     inventory_dir="$TMP_DIR/INVENTORY"
-    p1cert_dir="$TMP_DIR/P1CERT"
     logguard_dir="$TMP_DIR/LOGGUARD"
 
     section "UPDATE-ONLY - MODUŁY"
@@ -5294,7 +5450,7 @@ main() {
     install_upgbuilder_step "$upgbuilder_sh"
     install_serviceguard_step "$serviceguard_sh"
     install_inventory_step "$inventory_dir"
-    install_p1cert_step "$p1cert_dir"
+    install_p1cert_step
     install_logguard_step "$logguard_dir"
     install_amcs_step
     install_aism_step
@@ -5344,7 +5500,6 @@ main() {
     upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
     serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
     inventory_dir="$TMP_DIR/INVENTORY"
-    p1cert_dir="$TMP_DIR/P1CERT"
     logguard_dir="$TMP_DIR/LOGGUARD"
 
     section "MODULES-ONLY - BRAKUJĄCE MODUŁY"
@@ -5355,7 +5510,7 @@ main() {
     install_upgbuilder_step "$upgbuilder_sh"
     install_serviceguard_step "$serviceguard_sh"
     install_inventory_step "$inventory_dir"
-    install_p1cert_step "$p1cert_dir"
+    install_p1cert_step
     install_logguard_step "$logguard_dir"
 
     cleanup_tmp_installers_no_prompt
@@ -5380,7 +5535,6 @@ main() {
       upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
       serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
       inventory_dir="$TMP_DIR/INVENTORY"
-      p1cert_dir="$TMP_DIR/P1CERT"
       logguard_dir="$TMP_DIR/LOGGUARD"
 
       uninstall_scope="$(prompt_uninstall_scope)"
@@ -5391,7 +5545,7 @@ main() {
         cleanup_tmp_installers_after_uninstall
         purge_master_residual_cleanup_all
         print_summary
-        exit 0
+        exit_after_module_uninstall
       elif [[ "$uninstall_scope" == "single" ]]; then
         add_summary "Wybrany uninstall scope: single"
         uninstall_module="$(prompt_uninstall_module_choice)"
@@ -5402,7 +5556,7 @@ main() {
           run_single_module_uninstall "$uninstall_module" "$status_sh" "$cleanup_sh" "$tseq_sh" "$serviceguard_sh"
           cleanup_tmp_installers_after_uninstall
           print_summary
-          exit 0
+          exit_after_module_uninstall
         fi
       elif [[ "$uninstall_scope" == "master-shell" ]]; then
         add_summary "Wybrany uninstall scope: master-shell"
@@ -5481,7 +5635,6 @@ main() {
   upgbuilder_sh="$TMP_DIR/upgbuilder.sh"
   serviceguard_sh="$TMP_DIR/serviceguard_installer_public.sh"
   inventory_dir="$TMP_DIR/INVENTORY"
-  p1cert_dir="$TMP_DIR/P1CERT"
   logguard_dir="$TMP_DIR/LOGGUARD"
 
   section "SEKCJA 4/9 - MODUŁY CORE"
@@ -5513,7 +5666,7 @@ main() {
   install_upgbuilder_step "$upgbuilder_sh"
   install_serviceguard_step "$serviceguard_sh"
   install_inventory_step "$inventory_dir"
-  install_p1cert_step "$p1cert_dir"
+  install_p1cert_step
   install_logguard_step "$logguard_dir"
 
   section "SEKCJA 6/9 - TOOLS"
