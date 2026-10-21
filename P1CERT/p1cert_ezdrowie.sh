@@ -728,7 +728,8 @@ ez_local_find() {
       logical="${path#"$prefix"}"
       ez_name_matches "${logical##*/}" || continue
       printf '%s\n' "$(ez_printable "$logical")"
-    done < <(find -P "$fsroot" \( -name node_modules -o -name .git \) -prune -o \
+    # OLD directories (any case) are certificate archives: not descended.
+    done < <(find -P "$fsroot" \( -name node_modules -o -name .git -o \( -type d -iname old \) \) -prune -o \
       -type f \( -iname '*.pem' -o -iname '*.crt' -o -iname '*.cer' \) -size -1024k -print0 2>/dev/null)
   done
 }
@@ -783,7 +784,11 @@ ez_collect_local() {
     L_SUBJECT[$i]=''; L_ISSUER[$i]=''; L_CN[$i]=''; L_NAMES[$i]=''; L_VALIDITY[$i]=''
 
     if ! ez_target_path_ok "$path"; then
-      L_REASON[$i]='ścieżka zawiera nieobsługiwane znaki'
+      if ez_path_in_old_dir "$path"; then
+        L_REASON[$i]='katalog archiwum OLD - wyłączony z obsługi ezdrowie'
+      else
+        L_REASON[$i]='ścieżka zawiera nieobsługiwane znaki'
+      fi
       continue
     fi
     ez_fetch_local "$path" "$file"

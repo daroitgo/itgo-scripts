@@ -79,9 +79,31 @@ ez_path_under_roots() {
   return 1
 }
 
-# A certificate target: allowed path whose basename matches the ezdrowie rule.
+# True when any DIRECTORY component of a logical path is exactly "OLD"
+# (case-insensitive).  Such directories are certificate archives (e.g.
+# /srv/CERTYFIKATY/P1/OLD) and never take part in ezdrowie handling.  Only
+# complete components count: /srv/oldcerts/... or a file name containing
+# "old" are not affected.  The last component (file name) is not checked.
+ez_path_in_old_dir() {
+  local rest="${1#/}" part
+
+  while :; do
+    case "$rest" in
+      */*) part="${rest%%/*}"; rest="${rest#*/}" ;;
+      *) return 1 ;;
+    esac
+    case "$part" in
+      [Oo][Ll][Dd]) return 0 ;;
+    esac
+  done
+}
+
+# A certificate target: allowed path whose basename matches the ezdrowie rule
+# and which is not inside an OLD archive directory.  Used by scan, the plan
+# parser and every helper operation on a target.
 ez_target_path_ok() {
   ez_path_under_roots "$1" || return 1
+  ! ez_path_in_old_dir "$1" || return 1
   ez_name_matches "${1##*/}"
 }
 

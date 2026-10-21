@@ -160,6 +160,14 @@ The `ezdrowie` namespace is a deliberate, separate exception to the rules
 above. It only replaces files that
 
 - are located below `/srv`, `/usr/local` or `/opt`,
+- are not inside a certificate archive: any directory component whose
+  complete name is `OLD` (any case, at any depth and independent of the rest
+  of the path, e.g. `/srv/CERTYFIKATY/P1/OLD/` or `/srv/a/b/old/c/`) marks an
+  archive; it is never scanned or planned, and files below it are not
+  eligible for an approved replacement (the plan, the run and the root helper
+  refuse them); names that merely contain "old", such as `/srv/oldcerts/`,
+  `/srv/backup_old/` or the file name `old-ezdrowie.gov.pl-2025.crt`, are not
+  affected,
 - have a `.pem`, `.crt` or `.cer` name that, without the extension,
   lowercased and with `.`, `_` and `-` removed, contains `ezdrowiegovpl`
   (e.g. `ezdrowiegovpl.pem`, `ezdrowie.gov.pl.pem`, `ezdrowie_gov_pl.crt`),

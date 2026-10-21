@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `p1cert ezdrowie`: directories whose complete component name is `OLD`
+  (case-insensitive, at any depth, independent of the rest of the path) are
+  treated as certificate archives. They are pruned from the scan (also in the
+  helper's `find-candidates`), and every target below them is rejected by the
+  shared path rule used by the plan parser and all helper operations, so such
+  certificates are never scanned, planned or replaced. File and directory
+  names that only contain "old" (`oldcerts`, `backup_old`,
+  `old-ezdrowie.gov.pl-2025.crt`) are unchanged.
+
 - Added the separate `p1cert ezdrowie` namespace for operator-approved
   replacement of local ezdrowie.gov.pl certificates (`/srv`, `/usr/local`,
   `/opt`) with the source certificate from Nextcloud `P1CERT_EZDROWIE`:

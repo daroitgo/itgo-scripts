@@ -636,7 +636,8 @@ op_find_candidates() {
       logical="${path#"$HELPER_FS_ROOT"}"
       ez_target_path_ok "$logical" || continue
       printf '%s\n' "$logical"
-    done < <(find -P "$fsroot" \( -name node_modules -o -name .git \) -prune -o \
+    # OLD directories (any case) are certificate archives: not descended.
+    done < <(find -P "$fsroot" \( -name node_modules -o -name .git -o \( -type d -iname old \) \) -prune -o \
       -type f \( -iname '*.pem' -o -iname '*.crt' -o -iname '*.cer' \) -size -1024k -print0 2>/dev/null)
   done
 }
