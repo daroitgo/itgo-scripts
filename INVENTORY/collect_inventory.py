@@ -195,9 +195,7 @@ def read_utf8_text_file(path, maximum_chars):
     try:
         with open(path, "rb") as text_file:
             payload = text_file.read(maximum_chars + 1)
-    except (IOError, OSError):
-        # Python 2.7 raises IOError (not an OSError subclass) for open/read
-        # failures such as an unreadable root-owned compose file.
+    except OSError:
         return None
     if len(payload) > maximum_chars:
         return None
@@ -544,8 +542,8 @@ def collect_compose_files(candidate_path):
     return compose_files
 
 
-def read_allowlisted_env_values(env_path, allowed_keys):
-    """Return last nonempty active values for exact allowlisted .env keys."""
+def read_allowlisted_env_values(env_path, allowed_keys, include_empty=False):
+    """Return last active values for exact allowlisted .env keys."""
     if not is_path_file_within_limit(env_path, MAX_APPLICATION_ENV_BYTES):
         return {}
     contents = read_utf8_text_file(env_path, MAX_APPLICATION_ENV_BYTES)
@@ -564,9 +562,58 @@ def read_allowlisted_env_values(env_path, allowed_keys):
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("\"", chr(39)):
             value = value[1:-1].strip()
-        if value:
+        if value or include_empty:
             result[key] = value[:128]
     return result
+
+
+def resolve_allowlisted_compose_registry(image, registry_values):
+    """Resolve only a leading Compose DOCKER_REGISTRY interpolation."""
+    marker = "${DOCKER_REGISTRY"
+    if not image.startswith(marker):
+        return image
+    closing = image.find("}", len(marker))
+    if closing < 0:
+        return None
+    expression_tail = image[len(marker):closing]
+    operator = None
+    word = ""
+    for candidate_operator in (":-", ":?", ":+", "-", "?", "+"):
+        if expression_tail.startswith(candidate_operator):
+            operator = candidate_operator
+            word = expression_tail[len(candidate_operator):]
+            break
+    if operator is None and expression_tail:
+        return None
+    if len(word) > 128 or any(character in word for character in ("$", "{", "}")):
+        return None
+
+    is_set = "DOCKER_REGISTRY" in registry_values
+    value = registry_values.get("DOCKER_REGISTRY", "")
+    is_nonempty = is_set and bool(value)
+    if operator is None:
+        registry = value if is_set else None
+    elif operator == "-":
+        registry = value if is_set else word
+    elif operator == ":-":
+        registry = value if is_nonempty else word
+    elif operator == "?":
+        registry = value if is_set else None
+    elif operator == ":?":
+        registry = value if is_nonempty else None
+    elif operator == "+":
+        registry = word if is_set else ""
+    else:
+        registry = word if is_nonempty else ""
+
+    if not isinstance(registry, string_types) or not re.match(
+        r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", registry
+    ):
+        return None
+    suffix = image[closing + 1:]
+    if not suffix.startswith("/"):
+        return None
+    return registry + suffix
 
 
 def read_allowlisted_compose_images(compose_path, allowed_repositories):
@@ -576,6 +623,11 @@ def read_allowlisted_compose_images(compose_path, allowed_repositories):
     contents = read_utf8_text_file(compose_path, MAX_APPLICATION_COMPOSE_BYTES)
     if contents is None:
         return {}
+    registry_values = read_allowlisted_env_values(
+        os.path.join(os.path.dirname(compose_path), ".env"),
+        ("DOCKER_REGISTRY",),
+        include_empty=True,
+    )
     allowed = set(allowed_repositories)
     result = {}
     for line in contents.splitlines():
@@ -586,9 +638,18 @@ def read_allowlisted_compose_images(compose_path, allowed_repositories):
         if match is None:
             continue
         image = match.group(1).strip()
+        quote = None
         if len(image) >= 2 and image[0] == image[-1] and image[0] in ("\"", chr(39)):
+            quote = image[0]
             image = image[1:-1]
         if not image:
+            continue
+        image = (
+            None
+            if quote == chr(39) and image.startswith("${DOCKER_REGISTRY")
+            else resolve_allowlisted_compose_registry(image, registry_values)
+        )
+        if image is None:
             continue
         for repository in allowed:
             prefix = repository + ":"
