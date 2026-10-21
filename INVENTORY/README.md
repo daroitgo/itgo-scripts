@@ -85,7 +85,7 @@ Commands that change systemd state run directly as root or through `sudo` otherw
 
 ## Collector scope
 
-The current collector version is 0.1.13. It runs read-only and is compatible with Python 2.7 and Python 3.x.
+The current collector version is 0.1.15. It runs read-only and is compatible with Python 2.7 and Python 3.x.
 
 The host section of the report includes:
 
@@ -102,6 +102,14 @@ Application detection:
 - Directories named `p1erej`, `p1rej`, `p1cer`, `p1ser`, `erej`, `cer` or `ser` are identified as EREJ only after the allowlisted Compose repository `amms.asseco.pl/asseco-poz/pi-p1-erejestracja-provider` is recognized; otherwise they remain plain candidates without forced product identification.
 - MPI and EDM can be recognized within any of the allowed base locations, not only directly under `/srv`.
 - For EDM, the collector can additionally recognize PSIM2 EDM and collect the Eureka, API Gateway and Regional EDM Adapter versions. A legacy EDM candidate is emitted only when a legacy application version is available, so a PSIM2 EDM installation does not get an artificial, version-less legacy EDM candidate.
+- PSIM2 EDM directories are also recognized under the name `edm_psim2`. Every candidate keeps the real directory name; no name such as `EDM` is forced.
+- Regional Compose products are classified first by exactly allowlisted image repositories found in the directory's `docker-compose.yml`, `docker-compose.yaml`, `compose.yml` or `compose.yaml` (not by the directory name):
+  - PSIM2 EDM: the complete set `amms.asseco.pl/asseco-poz/eureka`, `amms.asseco.pl/asseco-poz/api-gateway` and `amms.asseco.pl/asseco-poz/regional-edm-adapter`; component versions come from the allowlisted `.env` keys `EUREKA_VERSION`, `APIGATEWAY_VERSION` and `REGIONAL_EDM_ADAPTER_VERSION`;
+  - MSWiA EDM: `amms.asseco.pl/asseco-poz/regional-edm-adapter` alone (without Eureka and API Gateway); the version is the literal image tag, otherwise the `.env` key `REGIONAL_EDM_ADAPTER_VERSION`;
+  - PSIM2 EPN `amms.asseco.pl/asseco-poz/pi-psim2-epn-provider`, PSIM2 EREJ `amms.asseco.pl/asseco-poz/pi-psim-2-provider`, MSWiA eAnalizy `amms.asseco.pl/asseco-poz/pi-mswia-eanalizy` and MSWiA eRej `amms.asseco.pl/asseco-poz/pi-mswia-provider`: the version is the literal image tag;
+  - the existing (central) EREJ repository `amms.asseco.pl/asseco-poz/pi-p1-erejestracja-provider` on its own keeps the previous EREJ handling.
+- The collector does not guess a product: an incomplete PSIM2 EDM set (e.g. Eureka or API Gateway without the full set), several known products in one directory, or the central EREJ together with a regional product produce a `COMPOSE_PRODUCT_AMBIGUOUS` warning (`EREJ_PRODUCT_AMBIGUOUS` for both EREJ repositories in `erej`) and a candidate with `matched_hint` `compose_signature_unresolved`, without product identity or version.
+- A reported version always points to the file it was read from: `application_version.source_path` is the Compose file containing the recognized image tag, or the `.env` file for `.env` values.
 - Inactive archive/auxiliary application directories are skipped: names ending in `_new`, `_old`, `_backup` or `_bak`, optionally followed by digits (case-insensitive), e.g. `wildfly_old` or `edm_backup2`. Active directories without these suffixes are handled as before.
 
 Data from `.env` and `docker-compose` files is read only from allowlisted keys and image repositories, within the existing file size limits.

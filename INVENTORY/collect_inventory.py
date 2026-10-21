@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.14"
+COLLECTOR_VERSION = "0.1.15"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -195,7 +195,9 @@ def read_utf8_text_file(path, maximum_chars):
     try:
         with open(path, "rb") as text_file:
             payload = text_file.read(maximum_chars + 1)
-    except OSError:
+    except (IOError, OSError):
+        # Python 2.7 raises IOError (not an OSError subclass) for open/read
+        # failures such as an unreadable root-owned compose file.
         return None
     if len(payload) > maximum_chars:
         return None
@@ -1025,8 +1027,22 @@ PSIM2_EDM_COMPONENTS = (
     ("API Gateway", "APIGATEWAY_VERSION"),
     ("Regional EDM Adapter", "REGIONAL_EDM_ADAPTER_VERSION"),
 )
+PSIM2_EDM_REPOSITORIES = (
+    "amms.asseco.pl/asseco-poz/eureka",
+    "amms.asseco.pl/asseco-poz/api-gateway",
+    "amms.asseco.pl/asseco-poz/regional-edm-adapter",
+)
 PSIM2_EPN_REPOSITORY = "amms.asseco.pl/asseco-poz/pi-psim2-epn-provider"
 PSIM2_EREJ_REPOSITORY = "amms.asseco.pl/asseco-poz/pi-psim-2-provider"
+MSWIA_EANALIZY_REPOSITORY = "amms.asseco.pl/asseco-poz/pi-mswia-eanalizy"
+MSWIA_EREJ_REPOSITORY = "amms.asseco.pl/asseco-poz/pi-mswia-provider"
+KNOWN_REGIONAL_COMPOSE_REPOSITORIES = PSIM2_EDM_REPOSITORIES + (
+    PSIM2_EPN_REPOSITORY,
+    PSIM2_EREJ_REPOSITORY,
+    MSWIA_EANALIZY_REPOSITORY,
+    MSWIA_EREJ_REPOSITORY,
+    EREJESTRACJA_REPOSITORY,
+)
 
 
 def application_candidate(name, candidate_path, fields):
@@ -1040,12 +1056,10 @@ def application_candidate(name, candidate_path, fields):
     }
 
 
-def psim2_edm_candidate(candidate_path, base_path, warnings):
+def psim2_edm_candidate(candidate_path, base_path, warnings, compose_files):
     env_path = os.path.join(candidate_path, ".env")
     source_keys = tuple(source_key for name, source_key in PSIM2_EDM_COMPONENTS)
     values = read_allowlisted_env_values(env_path, source_keys)
-    if not values:
-        return None
     components = []
     for name, source_key in PSIM2_EDM_COMPONENTS:
         components.append(
@@ -1071,7 +1085,8 @@ def psim2_edm_candidate(candidate_path, base_path, warnings):
         "status": "candidate",
         "fields": {
             "base_path": base_path,
-            "matched_hint": "psim2_edm_env",
+            "matched_hint": "psim2_edm_compose",
+            "compose_files": compose_files,
             "product_identity": {
                 "kind": "psim2_edm",
                 "source_key": "PSIM2_EDM",
@@ -1081,7 +1096,7 @@ def psim2_edm_candidate(candidate_path, base_path, warnings):
     }
 
 
-def edm_application_candidates(candidate_path, base_path, warnings):
+def legacy_edm_application_candidates(candidate_path, base_path):
     candidates = []
     legacy_version = read_edm_env_version(candidate_path)
     if legacy_version is not None:
@@ -1099,9 +1114,6 @@ def edm_application_candidates(candidate_path, base_path, warnings):
                 },
             }
         )
-    psim2_candidate = psim2_edm_candidate(candidate_path, base_path, warnings)
-    if psim2_candidate is not None:
-        candidates.append(psim2_candidate)
     return candidates
 
 
@@ -1111,6 +1123,7 @@ def compose_product_candidate(
     base_fields,
     repository,
     tag,
+    compose_path,
     include_product_identity,
 ):
     fields = dict(base_fields)
@@ -1123,10 +1136,166 @@ def compose_product_candidate(
         fields["application_version"] = application_version(
             "compose_image",
             tag,
-            os.path.join(candidate_path, "docker-compose.yml"),
+            compose_path,
             repository,
         )
     return application_candidate(candidate_name, candidate_path, fields)
+
+
+def read_known_regional_compose_images(candidate_path):
+    """Read only allowlisted image repositories from supported Compose files."""
+    compose_files = collect_compose_files(candidate_path)
+    images = {}
+    source_paths = {}
+    for compose_path in compose_files:
+        found = read_allowlisted_compose_images(
+            compose_path, KNOWN_REGIONAL_COMPOSE_REPOSITORIES
+        )
+        for repository, tag in found.items():
+            if repository not in images or (images[repository] is None and tag is not None):
+                images[repository] = tag
+                source_paths[repository] = compose_path
+    return compose_files, images, source_paths
+
+
+def mswia_edm_candidate(
+    candidate_path,
+    base_path,
+    compose_files,
+    image_tag,
+    image_source_path,
+):
+    env_path = os.path.join(candidate_path, ".env")
+    env_values = read_allowlisted_env_values(
+        env_path, ("REGIONAL_EDM_ADAPTER_VERSION",)
+    )
+    version = image_tag or env_values.get("REGIONAL_EDM_ADAPTER_VERSION")
+    version_source_path = image_source_path if image_tag is not None else env_path
+    fields = {
+        "base_path": base_path,
+        "matched_hint": "mswia_edm_compose",
+        "compose_files": compose_files,
+        "product_identity": {
+            "kind": "mswia_edm",
+            "source_key": "MSWIA_EDM",
+        },
+    }
+    if version is not None:
+        fields["application_version"] = application_version(
+            "mswia_edm", version, version_source_path, "MSWIA_EDM"
+        )
+    return {
+        "source": "filesystem_allowlist",
+        "source_path": candidate_path,
+        "name": os.path.basename(candidate_path),
+        "candidate_type": "mswia_edm",
+        "status": "candidate",
+        "fields": fields,
+    }
+
+
+def known_regional_compose_candidates(
+    candidate_path, base_path, candidate_name, warnings
+):
+    """Classify bounded, allowlisted regional Compose image signatures first."""
+    compose_files, images, source_paths = read_known_regional_compose_images(
+        candidate_path
+    )
+    if not images:
+        return None
+
+    present = set(images)
+    if present == set((EREJESTRACJA_REPOSITORY,)):
+        return None
+    edm_repositories = set(PSIM2_EDM_REPOSITORIES)
+    present_edm = present.intersection(edm_repositories)
+    regional_adapter = PSIM2_EDM_REPOSITORIES[2]
+    recognized = []
+    partial_edm = False
+
+    if present_edm == edm_repositories:
+        recognized.append("psim2_edm")
+    elif present_edm == set((regional_adapter,)):
+        recognized.append("mswia_edm")
+    elif present_edm:
+        partial_edm = True
+
+    provider_repositories = (
+        PSIM2_EPN_REPOSITORY,
+        PSIM2_EREJ_REPOSITORY,
+        MSWIA_EANALIZY_REPOSITORY,
+        MSWIA_EREJ_REPOSITORY,
+    )
+    recognized.extend(
+        repository for repository in provider_repositories if repository in present
+    )
+    central_erej_conflict = (
+        EREJESTRACJA_REPOSITORY in present and bool(recognized)
+    )
+
+    if partial_edm or len(recognized) != 1 or central_erej_conflict:
+        warning_code = "COMPOSE_PRODUCT_AMBIGUOUS"
+        warning_subject = candidate_name
+        warning_message = "Known Compose image signatures do not identify one product"
+        if (
+            candidate_name.lower() == "erej"
+            and set(recognized) == set((PSIM2_EREJ_REPOSITORY,))
+            and EREJESTRACJA_REPOSITORY in present
+            and not partial_edm
+        ):
+            warning_code = "EREJ_PRODUCT_AMBIGUOUS"
+            warning_subject = "EREJ"
+            warning_message = "Both allowlisted EREJ product repositories are present"
+        add_warning(
+            warnings,
+            warning_code,
+            warning_subject,
+            warning_message,
+        )
+        return [
+            application_candidate(
+                candidate_name,
+                candidate_path,
+                {
+                    "base_path": base_path,
+                    "matched_hint": "compose_signature_unresolved",
+                    "compose_files": compose_files,
+                },
+            )
+        ]
+
+    identity = recognized[0]
+    if identity == "psim2_edm":
+        return [
+            psim2_edm_candidate(candidate_path, base_path, warnings, compose_files)
+        ]
+    if identity == "mswia_edm":
+        return [
+            mswia_edm_candidate(
+                candidate_path,
+                base_path,
+                compose_files,
+                images[regional_adapter],
+                source_paths[regional_adapter],
+            )
+        ]
+
+    base_fields = {
+        "base_path": base_path,
+        "matched_hint": "compose_image",
+        "compose_files": compose_files,
+    }
+    return [
+        compose_product_candidate(
+            candidate_name,
+            candidate_path,
+            base_fields,
+            identity,
+            images[identity],
+            source_paths[identity],
+            True,
+        )
+    ]
 
 
 def special_application_candidates(candidate_path, base_path, candidate_name, warnings):
@@ -1148,6 +1317,7 @@ def special_application_candidates(candidate_path, base_path, candidate_name, wa
                 base_fields,
                 PSIM2_EPN_REPOSITORY,
                 images[PSIM2_EPN_REPOSITORY],
+                compose_path,
                 True,
             )
         ]
@@ -1174,7 +1344,8 @@ def special_application_candidates(candidate_path, base_path, candidate_name, wa
                     base_fields,
                     repository,
                     images[repository],
-                True,
+                    compose_path,
+                    True,
                 )
             ]
         return [application_candidate(candidate_name, candidate_path, base_fields)]
@@ -1204,6 +1375,7 @@ def special_application_candidates(candidate_path, base_path, candidate_name, wa
                 base_fields,
                 EREJESTRACJA_REPOSITORY,
                 images[EREJESTRACJA_REPOSITORY],
+                compose_path,
                 True,
             )
         ]
@@ -1302,8 +1474,17 @@ def collect_application_candidates(
             if is_non_primary_application_directory_name(candidate_name):
                 continue
 
+            regional_candidates = known_regional_compose_candidates(
+                child, base, candidate_name, warnings
+            )
+            if regional_candidates is not None:
+                if candidate_name.lower().startswith("edm"):
+                    candidates.extend(legacy_edm_application_candidates(child, base))
+                candidates.extend(regional_candidates)
+                continue
+
             if candidate_name.lower() in PSIM2_EDM_DIRECTORY_NAMES:
-                candidates.extend(edm_application_candidates(child, base, warnings))
+                candidates.extend(legacy_edm_application_candidates(child, base))
                 continue
 
             special_candidates = special_application_candidates(
