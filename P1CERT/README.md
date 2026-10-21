@@ -171,9 +171,9 @@ above. It only replaces files that
 - have a `.pem`, `.crt` or `.cer` name that, without the extension,
   lowercased and with `.`, `_` and `-` removed, contains `ezdrowiegovpl`
   (e.g. `ezdrowiegovpl.pem`, `ezdrowie.gov.pl.pem`, `ezdrowie_gov_pl.crt`),
-- contain exactly one X.509 certificate (no private key, no bundle, no other
-  PEM block, no data after a DER certificate) with an ezdrowie.gov.pl
-  identity,
+- contain either exactly one X.509 certificate (PEM or DER, no data after a
+  DER certificate) or a valid PEM certificate chain (see below), never a
+  private key or another PEM block, with an ezdrowie.gov.pl identity,
 - were explicitly approved by an operator in `p1cert ezdrowie plan`.
 
 The source is the Nextcloud WebDAV folder `P1CERT_EZDROWIE` of user `itgonc`
@@ -220,15 +220,47 @@ the URL, user, remote folder, credential mode and `SUCCESS`/`ERROR`.
 Read-only. Searches `/srv/`, `/usr/local/` and `/opt/` without following
 symlinks, validates every candidate with `openssl x509` and prints the full
 path, the exact file name, SHA-256 fingerprint, Subject, Issuer, Not Before,
-Not After and validity status. Files that are not a single certificate are
-listed as skipped. Unreadable files are read through the helper when it is
-installed.
+Not After and validity status (for a PEM chain: of its leaf, plus the number
+of certificates). Files that are neither a single certificate nor a valid
+PEM chain are listed as skipped with the reason. Unreadable files are read
+through the helper when it is installed.
+
+#### PEM certificate chains
+
+A local or source file may be a PEM bundle such as `ezdrowieGovPl.cer` or
+`ezdrowiegovpl_2026.pem` (leaf, intermediate CA, root CA). It is accepted
+only as a real chain:
+
+- at least 2 and at most 10 `CERTIFICATE` blocks and nothing else (no
+  private key, CRL, parameters or other PEM block; well-formed markers),
+- every block is a valid X.509 certificate, none repeated,
+- the first certificate is the leaf: not a CA, not self-signed,
+- every following certificate is a CA and the issuer of the previous one,
+  proven by name and cryptographically (`openssl verify` with only that CA
+  as trust anchor, `-partial_chain`, no system trust store, at a time inside
+  both validity periods - works with OpenSSL 1.0.2 and 3.x),
+- intermediates are not self-signed and the last certificate is the
+  self-signed root that terminates the chain.
+
+Concatenated independent certificates (e.g. two leaf certificates), a leaf
+with an unrelated CA, a wrong order, a missing root or a forged/damaged
+intermediate are rejected with the concrete reason.
+
+For a chain, every decision - identity, fingerprint, NotBefore/NotAfter,
+"newer than" and the plan fingerprints - uses the leaf. The replacement,
+however, writes the complete verified source file byte for byte
+(intermediates and root included) and the post-write verification checks the
+leaf fingerprint and the SHA-256 of the whole file. A chain is only written
+into a PEM target (never converted to DER), and a local chain is never
+replaced by a single certificate; a single PEM target may receive a chain.
+The chain length may change.
 
 ### plan
 
 1. runs the scan,
 2. downloads every `.pem`/`.crt`/`.cer` from `P1CERT_EZDROWIE` to a private
-   temporary directory and validates it (X.509, NotBefore <= now < NotAfter,
+   temporary directory and validates it (single X.509 or valid PEM chain
+   whose leaf is checked: NotBefore <= now < NotAfter,
    fingerprint, ezdrowie.gov.pl identity, not a CA, not self-signed, not a
    non-production name such as `isus.ezdrowie.gov.pl`); the remote file name,
    modification time and Nextcloud timestamps are ignored; remote entries
@@ -297,9 +329,23 @@ the helper would refuse to replace it (manual replacement required).
 
 The accepted plan is stored in `state/ezdrowie-plan` (0600) as plain
 `KEY=VALUE` lines. It is parsed strictly, never sourced, and records for each
-target the exact path, the local fingerprint and NotAfter at acceptance time,
-the approved source fingerprint and the approved restart (`none`, a systemd
-unit, or a compose project directory plus service).
+target the exact path, the local (leaf) fingerprint and NotAfter at
+acceptance time, the SHA-256 of the exact bytes of the whole local file, the
+approved source (leaf) fingerprint and NotAfter, the SHA-256 of the exact
+bytes of the whole source file and the approved restart (`none`, a systemd
+unit, or a compose project directory plus service):
+
+```text
+PLAN_VERSION=2
+TARGET=<path>|<local-fp>|<local-notafter>|<local-file-sha256>|<source-fp>|<source-notafter>|<source-file-sha256>|<none|systemd|compose>|<unit|project|->|<service|->
+```
+
+The operator therefore approves exact files, not only leaf certificates:
+any later change of the local or the source file - another intermediate or
+root in a chain, other line endings, a leaf delivered without its chain -
+requires a new plan, also when the leaf certificate is identical. Plans of
+the previous format (`PLAN_VERSION=1`) are rejected; after the upgrade run
+`p1cert ezdrowie plan` again.
 
 ### run
 
@@ -307,7 +353,10 @@ Executes only the accepted plan. For each target it reads the current source
 from Nextcloud and validates it again, re-reads the local certificate, and:
 
 - skips the target if the local fingerprint differs from the plan (a new plan
-  is required) or the source differs from the approved source,
+  is required) or the source differs from the approved source, and also when
+  the SHA-256 of the whole local file or of the whole source file differs
+  from the plan ("file changed since the accepted plan"; a new plan is
+  required),
 - reports NO CHANGE if the local file is already identical or not older,
 - otherwise backs up the old file to
   `backups/ezdrowie/<timestamp>/` (copy plus a manifest with original path and
@@ -315,13 +364,20 @@ from Nextcloud and validates it again, re-reads the local certificate, and:
   context and timestamp; existing backups are never overwritten),
 - calls exactly one helper operation for the target: `apply` (no restart
   approved), `apply-systemd` or `apply-compose` (approved restart), with the
-  target path, the old fingerprint and the new fingerprint from the plan.
+  target path, the old and new fingerprints and the old-file and source-file
+  SHA-256 from the plan. The helper checks the exact bytes again inside its
+  own operation: the stdin bytes must match the source digest before they are
+  interpreted, its root-private copy of the current target must match the
+  old digest, and the target is compared with those same bytes once more
+  right before the atomic rename. A change at any point after the plan is
+  therefore never overwritten or installed.
 
 Inside that single privileged operation the helper replaces the file (same
 path and file name as before - the remote file name is irrelevant -, same
 encoding PEM/DER, owner, group, mode and SELinux context, temporary file in
-the same directory, atomic rename), verifies it again (X.509, fingerprint,
-exact bytes) and, for an approved restart, proves the unit/service relation
+the same directory, atomic rename; a PEM chain is written unchanged, byte for
+byte), verifies it again (X.509 or complete chain, leaf fingerprint, exact
+bytes of the whole file) and, for an approved restart, proves the unit/service relation
 again and restarts only that unit (`systemctl restart <unit>`) or only the
 verified containers of that compose service (`docker restart <ids>`, never
 the whole project). A systemd restart counts as successful only when the
@@ -404,12 +460,21 @@ root-owned helper is a separate security boundary and implements only:
 ping
 find-candidates
 read           <cert-path>
-apply          <cert-path> <expected-old-sha256> <expected-new-sha256>
-apply-systemd  <cert-path> <expected-old-sha256> <expected-new-sha256> <unit.service>
-apply-compose  <cert-path> <expected-old-sha256> <expected-new-sha256> <project-dir> <service>
+apply          <cert-path> <old-fp> <new-fp> <old-file-sha256> <new-source-sha256>
+apply-systemd  <cert-path> <old-fp> <new-fp> <old-file-sha256> <new-source-sha256> <unit.service>
+apply-compose  <cert-path> <old-fp> <new-fp> <old-file-sha256> <new-source-sha256> <project-dir> <service>
 schedule       <YYYY-MM-DD> <HH:MM>
 schedule-cancel
 ```
+
+`<old-fp>`/`<new-fp>` are leaf fingerprints; `<old-file-sha256>` and
+`<new-source-sha256>` are the SHA-256 (64 lowercase hex) of the exact current
+target file and of the exact stdin bytes approved in the plan. For a single
+certificate the source digest binds the file passed on stdin; the helper may
+still re-encode it to the target's PEM/DER format. A PEM chain is written
+unchanged, so the installed file has exactly the source digest. The
+caller <-> helper <-> library contract is API version 2; any other version on
+either side is refused before any certificate operation.
 
 The new certificate is passed on stdin. There is no standalone restart,
 restore or install operation and no restart "allowance": a restart exists
@@ -427,8 +492,10 @@ group/world writable. It then re-validates every argument on its own:
 - target: allowed roots and file-name rule, no symlink in the path, regular
   file with a single hard link; the target directory is pinned as working
   directory and must be owned by root and not writable by group/others,
-- certificates: exactly one certificate, expected new fingerprint, expected
-  current fingerprint, validity, later NotAfter, identity rules above,
+- certificates: exactly one certificate or a valid PEM chain (rules above,
+  leaf used for all checks), expected new fingerprint, expected current
+  fingerprint, validity, later NotAfter, identity rules above; a chain only
+  into a PEM target and never a single certificate over a chain,
 - systemd: valid unit name, deny-list, loaded unit from `/etc/systemd/system`,
   `/usr/lib/systemd/system` or `/lib/systemd/system`; unit, drop-in and
   environment files used as evidence must be root-owned, not group/world

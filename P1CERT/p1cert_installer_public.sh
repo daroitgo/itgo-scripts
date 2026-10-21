@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Caller <-> root helper contract version expected from "helper ping".  Must
 # match HELPER_API_VERSION in p1cert_ezdrowie_helper.sh and EZ_HELPER_API in
 # p1cert_ezdrowie.sh (this is not the P1CERT release version).
-EZ_HELPER_API=1
+EZ_HELPER_API=2
 
 # Test fixtures may mirror the system paths below a prefix and use their own
 # uid/gid as "root"; always empty/0 when the installer is executed.

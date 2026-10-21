@@ -14,11 +14,17 @@
 #   ping
 #   find-candidates
 #   read           <cert-path>
-#   apply          <cert-path> <expected-old-sha256> <expected-new-sha256>
-#   apply-systemd  <cert-path> <expected-old-sha256> <expected-new-sha256> <unit.service>
-#   apply-compose  <cert-path> <expected-old-sha256> <expected-new-sha256> <project-dir> <service>
+#   apply          <cert-path> <old-fp> <new-fp> <old-file-sha256> <new-source-sha256>
+#   apply-systemd  <cert-path> <old-fp> <new-fp> <old-file-sha256> <new-source-sha256> <unit.service>
+#   apply-compose  <cert-path> <old-fp> <new-fp> <old-file-sha256> <new-source-sha256> <project-dir> <service>
 #   schedule       <YYYY-MM-DD> <HH:MM>
 #   schedule-cancel
+#
+# <old-fp>/<new-fp> are the SHA-256 fingerprints (OpenSSL notation) of the
+# current and the new leaf certificate.  <old-file-sha256> is the SHA-256 of
+# the exact bytes of the current target file and <new-source-sha256> that of
+# the exact bytes given on stdin, both as approved in the plan; any other
+# bytes are refused.
 #
 # The new certificate is read from stdin by the apply operations.  A restart
 # exists only as part of apply-systemd/apply-compose: one privileged operation
@@ -31,7 +37,7 @@
 #   0 UPDATED | UPDATED_RESTARTED | NO_CHANGE
 #   1 FAILED                   internal error, target not changed
 #   2 REFUSED                  invalid request/target/certificate/binding, target not changed
-#   3 REFUSED                  current fingerprint differs from expected, target not changed
+#   3 REFUSED                  current fingerprint or file bytes differ from expected, target not changed
 #   4 RESTORED                 replacement undone before any restart (verification
 #                              failed or service binding changed), previous certificate verified
 #   5 ROLLBACK                 restart failed, previous certificate restored and verified,
@@ -52,7 +58,8 @@ export LC_ALL
 
 # Caller <-> helper contract version (not the P1CERT release version).
 # Reported by "ping"; the caller and the installer require an exact match.
-HELPER_API_VERSION=1
+# 2: PEM certificate chains and the old/new file SHA-256 apply arguments.
+HELPER_API_VERSION=2
 
 HELPER_DIR=/usr/local/libexec/itgo-p1cert
 HELPER_SELF="$HELPER_DIR/p1cert-ezdrowie-helper"
@@ -295,9 +302,23 @@ helper_enter_target_dir() {
   }
 }
 
-# Writes a certificate in the given format to a file.
+# helper_render_cert <in> <in-format> <in-count> <out-format> <out>
+# Writes the inspected new certificate file in the target's format:
+#   - a single certificate is re-encoded by OpenSSL (PEM <-> DER),
+#   - a verified PEM chain (count > 1) is copied byte for byte, and only into
+#     a PEM target ("openssl x509" would keep the first certificate only);
+#     a chain is never converted to DER.
 helper_render_cert() {
-  openssl x509 -inform "$2" -in "$1" -outform "$3" -out "$4" 2>/dev/null
+  local in="$1" in_format="$2" in_count="$3" out_format="$4" out="$5"
+
+  case "$in_count" in
+    1) openssl x509 -inform "$in_format" -in "$in" -outform "$out_format" -out "$out" 2>/dev/null ;;
+    [2-9]|[1-9][0-9])
+      [ "$in_format" = PEM ] && [ "$out_format" = PEM ] || return 1
+      cat -- "$in" > "$out"
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 # Atomically replaces T_NAME inside the pinned directory with the content of
@@ -344,7 +365,8 @@ helper_atomic_replace() {
   fi
 }
 
-# Verifies the file on disk: single certificate, fingerprint and exact bytes.
+# Verifies the file on disk: a valid single certificate or complete chain,
+# the leaf fingerprint and the exact bytes of the whole file.
 helper_verify_disk() {
   local fp="$1" digest="$2"
 
@@ -655,21 +677,26 @@ op_read() {
   ez_cert_inspect "$HELPER_TMP/read"
   rc=$?
   [ "$rc" -eq 0 ] || {
-    helper_fail "target is not a single X.509 certificate without private key (code $rc): $target"
+    helper_fail "target is neither a single X.509 certificate nor a valid PEM certificate chain without private key (code $rc${EZC_REASON:+: $EZC_REASON}): $target"
     return 2
   }
   cat -- "$HELPER_TMP/read"
 }
 
-# helper_apply <none|systemd|compose> <cert-path> <old-fp> <new-fp> [unit | project service]
+# helper_apply <none|systemd|compose> <cert-path> <old-fp> <new-fp>
+#              <old-file-sha256> <new-source-sha256> [unit | project service]
 helper_apply() {
-  local expected_old expected_new now rc reason meta
+  local expected_old expected_new expected_old_digest expected_new_digest source_digest now rc reason meta
 
   A_KIND="$1"; A_TARGET="$2"; A_UNIT=""; A_PROJECT=""; A_SERVICE=""; A_IDS=""; A_REASON=""
   expected_old="$(helper_norm_fp "$3")"
   expected_new="$(helper_norm_fp "$4")"
+  expected_old_digest="$5"
+  expected_new_digest="$6"
   ez_fp_ok "$expected_old" && ez_fp_ok "$expected_new" || helper_refuse 2 'invalid expected fingerprint' || return
   [ "$expected_old" != "$expected_new" ] || helper_refuse 2 'expected old and new fingerprints are identical' || return
+  ez_digest_ok "$expected_old_digest" && ez_digest_ok "$expected_new_digest" ||
+    helper_refuse 2 'invalid expected file SHA-256 (64 lowercase hex characters required)' || return
   helper_lock || helper_refuse 1 'cannot serialize the operation' || return
 
   # 1. The restart target and its relation to this certificate are proven
@@ -677,7 +704,7 @@ helper_apply() {
   case "$A_KIND" in
     none) ;;
     systemd)
-      A_UNIT="$5"
+      A_UNIT="$7"
       ez_unit_name_ok "$A_UNIT" || helper_refuse 2 "invalid unit name: $A_UNIT" || return
       ! ez_unit_denied "$A_UNIT" || helper_refuse 2 "unit is not allowed: $A_UNIT" || return
       helper_systemd_ready || helper_refuse 1 'systemd unavailable' || return
@@ -685,7 +712,7 @@ helper_apply() {
       helper_systemd_bound "$A_TARGET" "$A_UNIT" || helper_refuse 2 "unit $A_UNIT is not bound to $A_TARGET" || return
       ;;
     compose)
-      A_PROJECT="$5"; A_SERVICE="$6"
+      A_PROJECT="$7"; A_SERVICE="$8"
       helper_compose_project_ok "$A_PROJECT" || helper_refuse 2 "invalid compose project directory: $A_PROJECT" || return
       ez_compose_service_ok "$A_SERVICE" || helper_refuse 2 "invalid compose service name: $A_SERVICE" || return
       helper_docker_ready || helper_refuse 1 'Docker unavailable' || return
@@ -704,9 +731,14 @@ helper_apply() {
   now="$(date -u '+%s')"
 
   helper_read_stdin_cert "$HELPER_TMP/new.in" || helper_refuse 2 'invalid certificate on stdin' || return
+  # Exactly the approved source bytes, checked before they are interpreted.
+  source_digest="$(ez_file_digest "$HELPER_TMP/new.in")"
+  ez_digest_ok "$source_digest" || helper_refuse 1 'cannot compute a valid SHA-256 of the new source file' || return
+  [ "$source_digest" = "$expected_new_digest" ] ||
+    helper_refuse 2 "new source file SHA-256 $source_digest differs from the approved $expected_new_digest" || return
   ez_cert_inspect "$HELPER_TMP/new.in"
   rc=$?
-  [ "$rc" -eq 0 ] || helper_refuse 2 "new certificate is not exactly one X.509 certificate (code $rc)" || return
+  [ "$rc" -eq 0 ] || helper_refuse 2 "new certificate is neither a single X.509 certificate nor a valid PEM certificate chain (code $rc${EZC_REASON:+: $EZC_REASON})" || return
   ez_cert_save NEW
   [ "$NEW_FP" = "$expected_new" ] || helper_refuse 2 "new certificate fingerprint $NEW_FP differs from the expected $expected_new" || return
 
@@ -722,12 +754,18 @@ EOF
   # The exact bytes of the current certificate are kept in the root-private
   # temporary directory of this operation; they are the only rollback source.
   cat -- "$T_NAME" > "$HELPER_TMP/old" 2>/dev/null || helper_refuse 2 'cannot read current certificate' || return
-  ez_cert_inspect "$HELPER_TMP/old"
-  rc=$?
-  [ "$rc" -eq 0 ] || helper_refuse 2 "current file is not exactly one X.509 certificate (code $rc)" || return
-  ez_cert_save OLD
   OLD_DIGEST="$(ez_file_digest "$HELPER_TMP/old")"
   ez_digest_ok "$OLD_DIGEST" || helper_refuse 1 'cannot compute a valid SHA-256 of the current certificate' || return
+  # The exact current bytes must be the ones approved in the plan (any change
+  # of a chain's intermediates/root, line endings, ... included), checked on
+  # this root-private copy before it is interpreted.  OLD_DIGEST is also what
+  # helper_atomic_replace re-checks on the target right before the rename.
+  [ "$OLD_DIGEST" = "$expected_old_digest" ] ||
+    helper_refuse 3 "current file SHA-256 changed (expected $expected_old_digest, found $OLD_DIGEST)" || return
+  ez_cert_inspect "$HELPER_TMP/old"
+  rc=$?
+  [ "$rc" -eq 0 ] || helper_refuse 2 "current file is neither a single X.509 certificate nor a valid PEM certificate chain (code $rc${EZC_REASON:+: $EZC_REASON})" || return
+  ez_cert_save OLD
 
   if [ "$OLD_FP" = "$NEW_FP" ]; then
     printf 'RESULT=NO_CHANGE\nFP=%s\n' "$OLD_FP"
@@ -741,14 +779,25 @@ EOF
   reason="$(ez_identity_compatible "$OLD_CN" "$OLD_NAMES" "$NEW_NAMES" "$NEW_IS_CA" "$NEW_SELF_SIGNED")" ||
     helper_refuse 2 "identity check failed: $reason" || return
 
-  # Keep the encoding of the existing file (PEM stays PEM, DER stays DER).
-  helper_render_cert "$HELPER_TMP/new.in" "$NEW_FORMAT" "$OLD_FORMAT" "$HELPER_TMP/new.out" ||
+  # A chain only replaces a PEM target and a chain is never reduced to a
+  # single certificate (decisions above concern the leaf only).
+  reason="$(ez_replacement_format_ok "$OLD_FORMAT" "$OLD_COUNT" "$NEW_FORMAT" "$NEW_COUNT")" ||
+    helper_refuse 2 "certificate file format check failed (current $OLD_FORMAT/$OLD_COUNT, new $NEW_FORMAT/$NEW_COUNT): $reason" || return
+
+  # Keep the encoding of the existing file (PEM stays PEM, DER stays DER); a
+  # verified PEM chain is written byte for byte.
+  helper_render_cert "$HELPER_TMP/new.in" "$NEW_FORMAT" "$NEW_COUNT" "$OLD_FORMAT" "$HELPER_TMP/new.out" ||
     helper_refuse 1 'cannot encode new certificate' || return
-  ez_cert_inspect "$HELPER_TMP/new.out" && [ "$EZC_FP" = "$NEW_FP" ] ||
+  ez_cert_inspect "$HELPER_TMP/new.out" && [ "$EZC_FP" = "$NEW_FP" ] && [ "$EZC_COUNT" = "$NEW_COUNT" ] ||
     helper_refuse 1 'encoded certificate verification failed' || return
   NEW_DIGEST="$(ez_file_digest "$HELPER_TMP/new.out")"
   ez_digest_ok "$NEW_DIGEST" && [ "$NEW_DIGEST" != "$OLD_DIGEST" ] ||
     helper_refuse 1 'cannot compute a valid SHA-256 of the new certificate' || return
+  # A chain is written unchanged: the rendered bytes are the approved source.
+  # (A single certificate may be re-encoded to the target's PEM/DER format.)
+  if [ "$NEW_COUNT" -gt 1 ] && [ "$NEW_DIGEST" != "$source_digest" ]; then
+    helper_refuse 1 'certificate chain was not preserved byte for byte' || return
+  fi
 
   # 3. Transaction.  From here on the operation is completed (including any
   #    rollback) even if the caller disconnects.
@@ -879,9 +928,9 @@ helper_dispatch() {
     ping:0) op_ping ;;
     find-candidates:0) op_find_candidates ;;
     read:1) op_read "$1" ;;
-    apply:3) helper_apply none "$1" "$2" "$3" ;;
-    apply-systemd:4) helper_apply systemd "$1" "$2" "$3" "$4" ;;
-    apply-compose:5) helper_apply compose "$1" "$2" "$3" "$4" "$5" ;;
+    apply:5) helper_apply none "$1" "$2" "$3" "$4" "$5" ;;
+    apply-systemd:6) helper_apply systemd "$1" "$2" "$3" "$4" "$5" "$6" ;;
+    apply-compose:7) helper_apply compose "$1" "$2" "$3" "$4" "$5" "$6" "$7" ;;
     schedule:2) op_schedule "$1" "$2" ;;
     schedule-cancel:0) op_schedule_cancel ;;
     *)

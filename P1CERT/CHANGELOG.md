@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- `p1cert ezdrowie`: valid PEM certificate chains are supported (e.g.
+  `ezdrowieGovPl.cer` and `ezdrowiegovpl_2026.pem`: leaf, intermediate CA,
+  root CA) in scan, source collection, plan, run, backup and the root
+  helper. A chain is accepted only when it contains nothing but
+  `CERTIFICATE` blocks, starts with a non-CA, non-self-signed leaf, every
+  following certificate is a CA that issued the previous one (name and
+  signature verified with `openssl verify -partial_chain` against that CA
+  only, OpenSSL 1.0.2 and 3.x) and it ends with the self-signed root;
+  concatenated independent certificates, unrelated CAs, a wrong order, a
+  missing root or forged/damaged intermediates are rejected with a reason.
+  All decisions use the leaf; the complete verified chain is installed byte
+  for byte, verified by leaf fingerprint and whole-file SHA-256, and rolled
+  back to the exact previous bytes. A chain is never converted to DER and a
+  local chain is never replaced by a single certificate. Single PEM/DER
+  certificates are handled as before.
+- `p1cert ezdrowie`: the operator-approved plan (`PLAN_VERSION=2`) binds the
+  exact SHA-256 of the whole local file and of the whole source file, in
+  addition to the leaf fingerprints. `run` skips a target whose local or
+  source file changed in any byte since the plan (e.g. another intermediate
+  or root with the same leaf, other line endings); a new plan is required.
+  Plans with `PLAN_VERSION=1` are rejected - create a new plan after the
+  upgrade.
+- Helper contract API 2 (helper, library, caller and installer):
+  `apply`/`apply-systemd`/`apply-compose` take the approved old-file and
+  new-source SHA-256 as arguments. The helper verifies the stdin bytes
+  before inspecting them, verifies its root-private copy of the current
+  target before any change, and the existing check right before the atomic
+  rename uses the same bytes, so a change after the plan or between the
+  caller's checks and the helper is never overwritten or installed. Helper,
+  library or caller of API 1 next to API 2 components refuse to work
+  (partial upgrade), before any certificate operation.
 - `p1cert ezdrowie`: directories whose complete component name is `OLD`
   (case-insensitive, at any depth, independent of the rest of the path) are
   treated as certificate archives. They are pruned from the scan (also in the

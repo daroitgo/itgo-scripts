@@ -12,10 +12,15 @@
 # Contract version between p1cert_ezdrowie.sh, this library and the root
 # helper (not the P1CERT release version).  The helper and the caller refuse
 # a library with a different value.
-EZ_LIB_API=1
+# 2: PEM certificate chains; helper apply operations carry the SHA-256 of the
+# exact old target and new source files (plan version 2).  An API 1 helper
+# left with this library (interrupted upgrade) refuses to run.
+EZ_LIB_API=2
 
 EZ_ALLOWED_ROOTS='/srv /usr/local /opt'
 EZ_MAX_CERT_BYTES=65536
+# Upper bound for the number of certificates in one PEM chain file.
+EZ_MAX_CHAIN_CERTS=10
 EZ_IDENTITY_DOMAIN='ezdrowie.gov.pl'
 
 # Lowercase without depending on bash 4 case modification (OL7 ships bash 4.2,
@@ -350,21 +355,166 @@ ez_x509_text_san_dns() {
     }'
 }
 
-# Inspects exactly one X.509 certificate.  Sets EZC_* variables:
+# SHA-256 fingerprint (OpenSSL notation) of the first certificate of a file.
+ez_x509_fp() {
+  LC_ALL=C openssl x509 -inform "$2" -in "$1" -noout -fingerprint -sha256 2>/dev/null |
+    awk -F= '{ field=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", field); if (tolower(field) == "sha256 fingerprint") { print toupper($2); exit } }'
+}
+
+# Prints one single-valued "openssl x509" field: subject_hash, issuer_hash,
+# startdate or enddate (value only, without a "notBefore=" style prefix).
+ez_x509_value() {
+  LC_ALL=C openssl x509 -in "$1" -noout "-$2" 2>/dev/null | head -n 1 | sed 's/^[A-Za-z]*=//'
+}
+
+ez_x509_is_ca() {
+  LC_ALL=C openssl x509 -in "$1" -noout -text 2>/dev/null | grep -q 'CA:TRUE'
+}
+
+# ez_x509_signed_by <subject.pem> <issuer.pem> <epoch> <empty-dir>
+# Cryptographic proof that <issuer> issued <subject>: "openssl verify" with
+# <issuer> as the ONLY trust anchor (-partial_chain, an empty -CApath instead
+# of the system directory and, on OpenSSL 3, no default store), evaluated at
+# a time inside both validity periods.  Works with OpenSSL 1.0.2 and 3.x.
+ez_x509_signed_by() {
+  local subject="$1" issuer="$2" at="$3" capath="$4" major out
+
+  ez_epoch_ok "$at" || return 1
+  major="$(openssl version 2>/dev/null | awk '{ split($2, v, "."); print v[1] + 0; exit }')"
+  case "$major" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  if [ "$major" -ge 3 ]; then
+    out="$(LC_ALL=C openssl verify -CAfile "$issuer" -CApath "$capath" -no-CAstore \
+      -partial_chain -attime "$at" "$subject" 2>/dev/null)" || return 1
+  else
+    out="$(LC_ALL=C openssl verify -CAfile "$issuer" -CApath "$capath" \
+      -partial_chain -attime "$at" "$subject" 2>/dev/null)" || return 1
+  fi
+  [ "$out" = "$subject: OK" ]
+}
+
+# Validates a PEM file with EZC_COUNT (>1) CERTIFICATE blocks as a real
+# certificate chain and splits it into $EZC_WORK/cert-<n>.pem:
+#   - only well-formed CERTIFICATE blocks (no nested/unterminated block),
+#   - every block is a parsable X.509 certificate, no duplicates,
+#   - certificate 1 is the end-entity (leaf): not a CA, not self-issued,
+#   - certificates 2..n are CAs; each one is the issuer of the previous one,
+#     proven by name (canonical hash) and by its signature,
+#   - certificates 2..n-1 are not self-issued; certificate n is the
+#     self-issued root that terminates the chain.
+# Sets EZC_REASON on failure.  Returns 0, 1 (internal error), 2 (malformed
+# PEM structure) or 5 (not a valid chain).
+ez_pem_chain_check() {
+  local file="$1" n i cert prev="" fp seen=" " sh ih nb na ca
+  local p_ih="" p_nb=0 p_na=0 lo hi
+
+  EZC_WORK="$(mktemp -d "${TMPDIR:-/tmp}/p1cert-ezc.XXXXXX" 2>/dev/null)" || {
+    EZC_WORK=""
+    EZC_REASON='nie można utworzyć katalogu tymczasowego'
+    return 1
+  }
+  mkdir -- "$EZC_WORK/capath" || return 1
+  # Marker lines must be exact; text outside blocks is ignored (as by OpenSSL).
+  n="$(LC_ALL=C awk -v prefix="$EZC_WORK/cert-" '
+    { line = $0; sub(/[ \t\r]+$/, "", line) }
+    index(line, "-----BEGIN") > 0 {
+      if (inblk || line != "-----BEGIN CERTIFICATE-----") { bad = 1; exit }
+      n++; inblk = 1; out = prefix n ".pem"; print line > out; next
+    }
+    index(line, "-----END") > 0 {
+      if (!inblk || line != "-----END CERTIFICATE-----") { bad = 1; exit }
+      print line > out; close(out); inblk = 0; next
+    }
+    inblk { print line > out }
+    END { if (bad || inblk) exit 1; print n + 0 }' "$file")" || {
+    EZC_REASON='niepoprawna struktura bloków PEM'
+    return 2
+  }
+  [ "$n" = "$EZC_COUNT" ] || { EZC_REASON='niepoprawna struktura bloków PEM'; return 2; }
+  [ "$n" -le "$EZ_MAX_CHAIN_CERTS" ] || {
+    EZC_REASON="łańcuch zawiera więcej niż $EZ_MAX_CHAIN_CERTS certyfikatów"
+    return 5
+  }
+
+  i=1
+  while [ "$i" -le "$n" ]; do
+    cert="$EZC_WORK/cert-$i.pem"
+    fp="$(ez_x509_fp "$cert" PEM)"
+    sh="$(ez_x509_value "$cert" subject_hash)"
+    ih="$(ez_x509_value "$cert" issuer_hash)"
+    nb="$(ez_to_epoch "$(ez_x509_value "$cert" startdate)")"
+    na="$(ez_to_epoch "$(ez_x509_value "$cert" enddate)")"
+    if ! ez_fp_ok "$fp" || [ -z "$sh" ] || [ -z "$ih" ] || ! ez_epoch_ok "$nb" || ! ez_epoch_ok "$na"; then
+      EZC_REASON="certyfikat $i w pliku nie jest poprawnym certyfikatem X.509"
+      return 5
+    fi
+    case "$seen" in
+      *" $fp "*) EZC_REASON="certyfikat $i powtarza się w pliku"; return 5 ;;
+    esac
+    seen="$seen$fp "
+    ca=no
+    ! ez_x509_is_ca "$cert" || ca=yes
+
+    if [ "$i" -eq 1 ]; then
+      [ "$ca" = no ] || { EZC_REASON='pierwszy certyfikat jest certyfikatem CA (wymagany certyfikat końcowy jako pierwszy)'; return 5; }
+      [ "$sh" != "$ih" ] || { EZC_REASON='pierwszy certyfikat jest samopodpisany'; return 5; }
+    else
+      [ "$ca" = yes ] || { EZC_REASON="certyfikat $i nie jest certyfikatem CA (np. drugi certyfikat końcowy)"; return 5; }
+      [ "$p_ih" = "$sh" ] || { EZC_REASON="certyfikat $i nie jest wystawcą certyfikatu $((i - 1)) (niezgodna nazwa)"; return 5; }
+      if [ "$i" -lt "$n" ]; then
+        [ "$sh" != "$ih" ] || { EZC_REASON="certyfikat $i jest samopodpisany, a nie jest ostatni"; return 5; }
+      else
+        [ "$sh" = "$ih" ] || { EZC_REASON='ostatni certyfikat nie jest certyfikatem głównym (root) kończącym łańcuch'; return 5; }
+      fi
+      lo="$p_nb"; [ "$nb" -le "$lo" ] || lo="$nb"
+      hi="$p_na"; [ "$na" -ge "$hi" ] || hi="$na"
+      [ "$lo" -lt "$hi" ] || { EZC_REASON="okresy ważności certyfikatów $((i - 1)) i $i są rozłączne"; return 5; }
+      ez_x509_signed_by "$prev" "$cert" $((lo + (hi - lo) / 2)) "$EZC_WORK/capath" || {
+        EZC_REASON="podpis certyfikatu $((i - 1)) nie weryfikuje się kluczem certyfikatu $i"
+        return 5
+      }
+    fi
+    prev="$cert"; p_ih="$ih"; p_nb="$nb"; p_na="$na"
+    i=$((i + 1))
+  done
+  return 0
+}
+
+# Inspects a certificate file: exactly one X.509 certificate (PEM or DER) or
+# a valid PEM certificate chain (leaf -> intermediate CA(s) -> root, see
+# ez_pem_chain_check).  Sets EZC_* variables; for a chain they describe the
+# FIRST certificate (the leaf), only EZC_COUNT counts the whole file:
 #   EZC_SAN_DNS      syntactically valid DNS SAN entries,
 #   EZC_HAS_DNS_SAN  yes when the certificate has at least one DNS SAN entry
 #                    (valid or not),
 #   EZC_NAMES        the authoritative identity names: the DNS SANs when any
-#                    exist, otherwise the CN (legacy fallback only).
-# Return codes: 0 valid certificate, 1 not a certificate/unreadable,
-# 2 more than one certificate or trailing data, 3 private key material
-# present, 4 too large.
+#                    exist, otherwise the CN (legacy fallback only),
+#   EZC_REASON       detail of a rejected chain (may be empty).
+# Return codes: 0 valid certificate or chain, 1 not a certificate/unreadable,
+# 2 PEM block other than CERTIFICATE, malformed PEM structure or data after a
+# DER certificate, 3 private key material present, 4 too large, 5 several
+# certificates that do not form a valid chain.
 ez_cert_inspect() {
-  local file="$1" inform data text san name san_names="" size begin_count orig_digest rt_digest rc
+  local rc
+
+  EZC_WORK=""
+  ez_cert_inspect_file "$1"
+  rc=$?
+  if [ -n "$EZC_WORK" ]; then
+    rm -rf -- "$EZC_WORK"
+  fi
+  EZC_WORK=""
+  return "$rc"
+}
+
+ez_cert_inspect_file() {
+  local file="$1" src="$1" inform data text san name san_names="" size begin_count orig_digest rt_digest rc
 
   EZC_FORMAT=""; EZC_COUNT=0; EZC_FP=""; EZC_SUBJECT=""; EZC_ISSUER=""
   EZC_NOT_BEFORE=""; EZC_NOT_AFTER=""; EZC_NB_EPOCH=""; EZC_NA_EPOCH=""
   EZC_CN=""; EZC_SAN_DNS=""; EZC_HAS_DNS_SAN=no; EZC_NAMES=""; EZC_IS_CA=no; EZC_SELF_SIGNED=no
+  EZC_REASON=""
 
   [ -f "$file" ] && [ -r "$file" ] || return 1
   size="$(ez_file_size "$file")"
@@ -380,16 +530,23 @@ ez_cert_inspect() {
     inform=PEM
     EZC_FORMAT=PEM
     EZC_COUNT="$(LC_ALL=C grep -a -c -- '-----BEGIN CERTIFICATE-----' "$file")"
-    [ "$EZC_COUNT" = 1 ] || return 2
-    # No other PEM block (parameters, CRL, second certificate in any form).
-    [ "$begin_count" = 1 ] || return 2
+    # No other PEM block (parameters, CRL, key or anything else).
+    [ "$begin_count" = "$EZC_COUNT" ] || {
+      EZC_REASON='plik zawiera blok PEM inny niż CERTIFICATE'
+      return 2
+    }
+    if [ "$EZC_COUNT" -gt 1 ]; then
+      ez_pem_chain_check "$file" || return
+      # Every EZC_* value below describes the leaf.
+      src="$EZC_WORK/cert-1.pem"
+    fi
   else
     [ "$begin_count" = 0 ] || return 1
     inform=DER
     EZC_FORMAT=DER
   fi
 
-  data="$(LC_ALL=C openssl x509 -inform "$inform" -in "$file" -noout -fingerprint -sha256 -subject -issuer -startdate -enddate 2>/dev/null)" || return 1
+  data="$(LC_ALL=C openssl x509 -inform "$inform" -in "$src" -noout -fingerprint -sha256 -subject -issuer -startdate -enddate 2>/dev/null)" || return 1
 
   if [ "$inform" = DER ]; then
     # OpenSSL reads one DER object and silently ignores anything after it.
@@ -414,11 +571,11 @@ ez_cert_inspect() {
   ez_epoch_ok "$EZC_NB_EPOCH" && ez_epoch_ok "$EZC_NA_EPOCH" || return 1
 
   # multiline name output is stable across OpenSSL 1.0.x (OL7) and 3.x.
-  EZC_CN="$(LC_ALL=C openssl x509 -inform "$inform" -in "$file" -noout -subject -nameopt multiline 2>/dev/null |
+  EZC_CN="$(LC_ALL=C openssl x509 -inform "$inform" -in "$src" -noout -subject -nameopt multiline 2>/dev/null |
     awk '/^[[:space:]]+commonName[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]+$/, ""); print; exit }')"
   EZC_CN="$(ez_lower "$EZC_CN")"
 
-  text="$(LC_ALL=C openssl x509 -inform "$inform" -in "$file" -noout -text 2>/dev/null)" || return 1
+  text="$(LC_ALL=C openssl x509 -inform "$inform" -in "$src" -noout -text 2>/dev/null)" || return 1
   san="$(printf '%s\n' "$text" | ez_x509_text_san_dns)"
   rc=$?
   [ "$rc" -eq 0 ] || return 1
@@ -549,6 +706,35 @@ ez_identity_compatible() {
   fi
   if ! ez_names_cover "$remote_names" "$primary"; then
     printf 'certyfikat źródłowy nie obejmuje tożsamości %s' "$primary"
+    return 1
+  fi
+  return 0
+}
+
+# Decides whether a file with <new_format> <new_count> certificates may
+# replace a file with <old_format> <old_count> (EZC_FORMAT / EZC_COUNT of
+# inspected files):
+#   - a chain (count > 1) is written unchanged and only into a PEM target;
+#     it is never converted to DER,
+#   - a target that holds a chain is never reduced to a single certificate.
+# The chain length itself may change.  Prints a reason and returns non-zero
+# if the replacement is not acceptable.
+ez_replacement_format_ok() {
+  local old_format="$1" old_count="$2" new_format="$3" new_count="$4"
+
+  case "$old_count:$new_count" in
+    *[!0-9:]*|:*|*:) printf 'nieznana liczba certyfikatów'; return 1 ;;
+  esac
+  if [ "$new_count" -gt 1 ] && [ "$new_format" != PEM ]; then
+    printf 'łańcuch certyfikatów musi być w formacie PEM'
+    return 1
+  fi
+  if [ "$new_count" -gt 1 ] && [ "$old_format" != PEM ]; then
+    printf 'źródło jest łańcuchem PEM, a plik docelowy ma format %s - konwersja łańcucha nie jest obsługiwana' "$old_format"
+    return 1
+  fi
+  if [ "$old_count" -gt 1 ] && [ "$new_count" -le 1 ]; then
+    printf 'plik docelowy zawiera łańcuch %s certyfikatów, a źródło pojedynczy certyfikat - łańcuch nie zostanie usunięty' "$old_count"
     return 1
   fi
   return 0

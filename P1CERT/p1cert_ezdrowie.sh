@@ -6,7 +6,8 @@
 # This namespace is a deliberate, separate exception to the read-only/CA-only
 # rules of `p1cert audit|update`.  It only touches files that:
 #   - live below /srv, /usr/local or /opt and are named like ezdrowie.gov.pl,
-#   - contain exactly one X.509 certificate with an ezdrowie.gov.pl identity,
+#   - contain one X.509 certificate or a valid PEM certificate chain (leaf ->
+#     intermediate CA(s) -> root) whose leaf has an ezdrowie.gov.pl identity,
 #   - were explicitly approved by an operator in `p1cert ezdrowie plan`.
 #
 # The script runs unprivileged.  Privileged steps go through a root-owned
@@ -58,8 +59,8 @@ ez_set_module_dir "$MODULE_DIR"
 
 EZ_HELPER='/usr/local/libexec/itgo-p1cert/p1cert-ezdrowie-helper'
 # Exact caller <-> helper contract version required from "helper ping" (not
-# the P1CERT release version).
-EZ_HELPER_API=1
+# the P1CERT release version).  2: PEM chains, apply with old/new file SHA-256.
+EZ_HELPER_API=2
 EZ_SERVICE_UNIT='itgo-p1cert-ezdrowie.service'
 EZ_TIMER_UNIT='itgo-p1cert-ezdrowie.timer'
 # Owner required for target directories (the helper refuses to work in a
@@ -552,6 +553,7 @@ ez_fetch_remote() {
   R_COUNT=0
   R_NAME=(); R_FILE=(); R_STATE=(); R_REASON=(); R_FP=(); R_NA=(); R_NB=()
   R_NOT_AFTER=(); R_NOT_BEFORE=(); R_SUBJECT=(); R_ISSUER=(); R_CN=(); R_NAMES=(); R_IS_CA=(); R_SELF=()
+  R_FMT=(); R_NCERT=()
 
   ez_tmpdir || return 1
   command -v curl >/dev/null 2>&1 || { ez_err 'curl jest wymagany.'; return 1; }
@@ -601,6 +603,7 @@ ez_fetch_remote() {
     R_NAME[$i]="$display"; R_FILE[$i]="$file"; R_STATE[$i]=INVALID; R_REASON[$i]=''
     R_FP[$i]=''; R_NA[$i]=0; R_NB[$i]=0; R_NOT_AFTER[$i]=''; R_NOT_BEFORE[$i]=''
     R_SUBJECT[$i]=''; R_ISSUER[$i]=''; R_CN[$i]=''; R_NAMES[$i]=''; R_IS_CA[$i]=no; R_SELF[$i]=no
+    R_FMT[$i]=''; R_NCERT[$i]=0
     R_COUNT=$((R_COUNT + 1))
 
     if ! ez_curl GET "$origin$href" "$file"; then
@@ -611,11 +614,13 @@ ez_fetch_remote() {
     rc=$?
     case "$rc" in
       0) ;;
-      2) R_REASON[$i]='plik zawiera więcej niż jeden certyfikat'; continue ;;
+      2) R_REASON[$i]="plik zawiera dane inne niż certyfikaty (${EZC_REASON:-dodatkowy blok PEM lub dane po certyfikacie DER})"; continue ;;
       3) R_REASON[$i]='plik zawiera klucz prywatny'; continue ;;
       4) R_REASON[$i]='plik jest zbyt duży'; continue ;;
+      5) R_REASON[$i]="plik zawiera kilka certyfikatów, które nie tworzą prawidłowego łańcucha PEM (${EZC_REASON:-brak szczegółów})"; continue ;;
       *) R_REASON[$i]='plik nie jest poprawnym certyfikatem X.509'; continue ;;
     esac
+    R_FMT[$i]="$EZC_FORMAT"; R_NCERT[$i]="$EZC_COUNT"
     R_FP[$i]="$EZC_FP"; R_NA[$i]="$EZC_NA_EPOCH"; R_NB[$i]="$EZC_NB_EPOCH"
     R_NOT_AFTER[$i]="$EZC_NOT_AFTER"; R_NOT_BEFORE[$i]="$EZC_NOT_BEFORE"
     R_SUBJECT[$i]="$EZC_SUBJECT"; R_ISSUER[$i]="$EZC_ISSUER"; R_CN[$i]="$EZC_CN"; R_NAMES[$i]="$EZC_NAMES"
@@ -644,7 +649,7 @@ EOF
   i=0
   while [ "$i" -lt "$R_COUNT" ]; do
     if [ "${R_STATE[$i]}" = VALID ]; then
-      ez_log "remote ${R_NAME[$i]} VALID fp=${R_FP[$i]} notAfter=${R_NOT_AFTER[$i]}"
+      ez_log "remote ${R_NAME[$i]} VALID fp=${R_FP[$i]} notAfter=${R_NOT_AFTER[$i]} certificates=${R_NCERT[$i]}"
     else
       ez_log "remote ${R_NAME[$i]} INVALID: ${R_REASON[$i]}"
     fi
@@ -664,7 +669,11 @@ ez_print_remote() {
   while [ "$i" -lt "$R_COUNT" ]; do
     printf '  - %s: ' "${R_NAME[$i]}"
     if [ "${R_STATE[$i]}" = VALID ]; then
-      printf 'POPRAWNY, NotAfter %s, SHA-256 %s\n' "${R_NOT_AFTER[$i]}" "${R_FP[$i]}"
+      printf 'POPRAWNY, NotAfter %s, SHA-256 %s' "${R_NOT_AFTER[$i]}" "${R_FP[$i]}"
+      if [ "${R_NCERT[$i]}" -gt 1 ]; then
+        printf ' (łańcuch PEM: %s certyfikaty; dane certyfikatu końcowego)' "${R_NCERT[$i]}"
+      fi
+      printf '\n'
     else
       printf 'ODRZUCONY (%s)\n' "${R_REASON[$i]}"
     fi
@@ -768,6 +777,7 @@ ez_collect_local() {
   L_COUNT=0
   L_PATH=(); L_STATE=(); L_REASON=(); L_FILE=(); L_FP=(); L_NA=(); L_NB=()
   L_NOT_AFTER=(); L_NOT_BEFORE=(); L_SUBJECT=(); L_ISSUER=(); L_CN=(); L_NAMES=(); L_VALIDITY=()
+  L_FMT=(); L_NCERT=()
   ez_tmpdir || return 1
   now="$(date -u '+%s')"
   # Resolve helper availability once in this shell (the candidate list is
@@ -782,6 +792,7 @@ ez_collect_local() {
     L_PATH[$i]="$path"; L_STATE[$i]=INVALID; L_REASON[$i]=''; L_FILE[$i]="$file"
     L_FP[$i]=''; L_NA[$i]=0; L_NB[$i]=0; L_NOT_AFTER[$i]=''; L_NOT_BEFORE[$i]=''
     L_SUBJECT[$i]=''; L_ISSUER[$i]=''; L_CN[$i]=''; L_NAMES[$i]=''; L_VALIDITY[$i]=''
+    L_FMT[$i]=''; L_NCERT[$i]=0
 
     if ! ez_target_path_ok "$path"; then
       if ez_path_in_old_dir "$path"; then
@@ -802,9 +813,10 @@ ez_collect_local() {
     rc=$?
     case "$rc" in
       0) ;;
-      2) L_REASON[$i]='plik zawiera więcej niż jeden certyfikat (bundle) - obsługa ręczna'; rm -f -- "$file"; continue ;;
+      2) L_REASON[$i]="plik zawiera dane inne niż certyfikaty (${EZC_REASON:-dodatkowy blok PEM lub dane po certyfikacie DER}) - obsługa ręczna"; rm -f -- "$file"; continue ;;
       3) L_REASON[$i]='plik zawiera klucz prywatny - pominięto'; rm -f -- "$file"; continue ;;
       4) L_REASON[$i]='plik jest zbyt duży'; rm -f -- "$file"; continue ;;
+      5) L_REASON[$i]="plik zawiera kilka certyfikatów, które nie tworzą prawidłowego łańcucha PEM (${EZC_REASON:-brak szczegółów}) - obsługa ręczna"; rm -f -- "$file"; continue ;;
       *) L_REASON[$i]='plik nie jest poprawnym certyfikatem X.509'; rm -f -- "$file"; continue ;;
     esac
     L_STATE[$i]=OK
@@ -812,6 +824,7 @@ ez_collect_local() {
     L_NOT_AFTER[$i]="$EZC_NOT_AFTER"; L_NOT_BEFORE[$i]="$EZC_NOT_BEFORE"
     L_SUBJECT[$i]="$EZC_SUBJECT"; L_ISSUER[$i]="$EZC_ISSUER"; L_CN[$i]="$EZC_CN"; L_NAMES[$i]="$EZC_NAMES"
     L_VALIDITY[$i]="$(ez_validity_status "$EZC_NB_EPOCH" "$EZC_NA_EPOCH" "$now")"
+    L_FMT[$i]="$EZC_FORMAT"; L_NCERT[$i]="$EZC_COUNT"
   done <<EOF
 $(ez_candidate_paths)
 EOF
@@ -819,7 +832,7 @@ EOF
   i=0
   while [ "$i" -lt "$L_COUNT" ]; do
     if [ "${L_STATE[$i]}" = OK ]; then
-      ez_log "local ${L_PATH[$i]} fp=${L_FP[$i]} notAfter=${L_NOT_AFTER[$i]} status=${L_VALIDITY[$i]}"
+      ez_log "local ${L_PATH[$i]} fp=${L_FP[$i]} notAfter=${L_NOT_AFTER[$i]} status=${L_VALIDITY[$i]} certificates=${L_NCERT[$i]}"
     else
       ez_log "local ${L_PATH[$i]} skipped: ${L_REASON[$i]}"
     fi
@@ -845,6 +858,9 @@ ez_print_local() {
       printf '    Not Before:  %s\n' "${L_NOT_BEFORE[$i]}"
       printf '    Not After:   %s\n' "${L_NOT_AFTER[$i]}"
       printf '    Status:      %s\n' "$(ez_status_label "${L_VALIDITY[$i]}")"
+      if [ "${L_NCERT[$i]}" -gt 1 ]; then
+        printf '    Łańcuch:     PEM, %s certyfikaty (powyższe dane dotyczą certyfikatu końcowego)\n' "${L_NCERT[$i]}"
+      fi
     else
       printf '    Status:      POMINIĘTO (%s)\n' "${L_REASON[$i]}"
     fi
@@ -1129,17 +1145,26 @@ ez_restart_label() {
 # Plan
 # ---------------------------------------------------------------------------
 
-# Parses one TARGET record without eval.  Appends to P_* arrays.
+# Parses one TARGET record (plan version 2) without eval:
+#   path|local-leaf-fp|local-notafter|local-file-sha256|
+#   source-leaf-fp|source-notafter|source-file-sha256|kind|a|b
+# The *-file-sha256 values are the SHA-256 of the exact bytes of the whole
+# local file and of the whole source file approved by the operator.
+# Appends to P_* arrays.
 ez_plan_parse_target() {
-  local path lfp lna rfp rna kind a b extra i
+  local path lfp lna ldg rfp rna rdg kind a b separators i
 
-  IFS='|' read -r path lfp lna rfp rna kind a b extra <<EOF
+  # Exactly 10 fields = exactly 9 separators.  "read" alone cannot tell a
+  # trailing empty field ("...|-|") from none, so count them first.
+  separators="${1//[!|]/}"
+  [ "${#separators}" -eq 9 ] || return 1
+  IFS='|' read -r path lfp lna ldg rfp rna rdg kind a b <<EOF
 $1
 EOF
-  [ -z "$extra" ] || return 1
   ez_target_path_ok "$path" || return 1
   ez_fp_ok "$lfp" && ez_fp_ok "$rfp" || return 1
   ez_epoch_ok "$lna" && ez_epoch_ok "$rna" || return 1
+  ez_digest_ok "$ldg" && ez_digest_ok "$rdg" || return 1
   [ "$lfp" != "$rfp" ] || return 1
   case "$kind" in
     none) [ "$a" = - ] && [ "$b" = - ] || return 1 ;;
@@ -1152,8 +1177,8 @@ EOF
     [ "${P_PATH[$i]}" != "$path" ] || return 1
     i=$((i + 1))
   done
-  P_PATH[$P_COUNT]="$path"; P_LFP[$P_COUNT]="$lfp"; P_LNA[$P_COUNT]="$lna"
-  P_RFP[$P_COUNT]="$rfp"; P_RNA[$P_COUNT]="$rna"
+  P_PATH[$P_COUNT]="$path"; P_LFP[$P_COUNT]="$lfp"; P_LNA[$P_COUNT]="$lna"; P_LDG[$P_COUNT]="$ldg"
+  P_RFP[$P_COUNT]="$rfp"; P_RNA[$P_COUNT]="$rna"; P_RDG[$P_COUNT]="$rdg"
   P_KIND[$P_COUNT]="$kind"; P_A[$P_COUNT]="$a"; P_B[$P_COUNT]="$b"
   P_COUNT=$((P_COUNT + 1))
 }
@@ -1167,7 +1192,7 @@ ez_plan_load() {
   rc=$?
   if [ "$rc" -ne 0 ]; then
     P_COUNT=0; P_ID=""
-    P_PATH=(); P_LFP=(); P_LNA=(); P_RFP=(); P_RNA=(); P_KIND=(); P_A=(); P_B=()
+    P_PATH=(); P_LFP=(); P_LNA=(); P_LDG=(); P_RFP=(); P_RNA=(); P_RDG=(); P_KIND=(); P_A=(); P_B=()
   fi
   return "$rc"
 }
@@ -1176,7 +1201,7 @@ ez_plan_load_records() {
   local file="$1" line key value version=""
 
   P_COUNT=0; P_ID=""; P_CREATED_AT=""; P_CREATED_BY=""
-  P_PATH=(); P_LFP=(); P_LNA=(); P_RFP=(); P_RNA=(); P_KIND=(); P_A=(); P_B=()
+  P_PATH=(); P_LFP=(); P_LNA=(); P_LDG=(); P_RFP=(); P_RNA=(); P_RDG=(); P_KIND=(); P_A=(); P_B=()
   [ -e "$file" ] || [ -L "$file" ] || return 2
   if [ -L "$file" ] || [ ! -f "$file" ] || ! ez_file_owner_ok "$file"; then
     return 1
@@ -1190,7 +1215,7 @@ ez_plan_load_records() {
     key="${line%%=*}"
     value="${line#*=}"
     case "$key" in
-      PLAN_VERSION) [ "$value" = 1 ] || return 1; version=1 ;;
+      PLAN_VERSION) [ "$value" = 2 ] || return 1; version=2 ;;
       PLAN_ID)
         printf '%s\n' "$value" | grep -E -q '^[0-9]{14}-[0-9]+$' || return 1
         P_ID="$value"
@@ -1207,7 +1232,7 @@ ez_plan_load_records() {
       *) return 1 ;;
     esac
   done < "$file"
-  [ "$version" = 1 ] && [ -n "$P_ID" ] || return 1
+  [ "$version" = 2 ] && [ -n "$P_ID" ] || return 1
   return 0
 }
 
@@ -1219,7 +1244,7 @@ ez_plan_load_reported() {
   case "$rc" in
     0) return 0 ;;
     2) ez_err "brak zaakceptowanego planu ($EZ_PLAN_FILE). Uruchom: p1cert ezdrowie plan" ;;
-    *) ez_err "plan $EZ_PLAN_FILE jest nieprawidłowy; utwórz nowy: p1cert ezdrowie plan" ;;
+    *) ez_err "plan $EZ_PLAN_FILE jest nieprawidłowy lub ma starszy format (wymagany PLAN_VERSION=2); utwórz nowy: p1cert ezdrowie plan" ;;
   esac
   return "$rc"
 }
@@ -1237,8 +1262,8 @@ ez_plan_print() {
 }
 
 ez_plan() {
-  local i r decision approved=0 candidates=0 choice kind a b n issuer_note
-  local -a A_PATH=() A_LFP=() A_LNA=() A_RFP=() A_RNA=() A_KIND=() A_A=() A_B=()
+  local i r decision approved=0 candidates=0 choice kind a b n issuer_note reason ldg rdg
+  local -a A_PATH=() A_LFP=() A_LNA=() A_LDG=() A_RFP=() A_RNA=() A_RDG=() A_KIND=() A_A=() A_B=()
 
   ez_log_open plan || return 1
   if ! ez_is_tty; then
@@ -1274,8 +1299,24 @@ ez_plan() {
       SKIP_WARNING) ez_warn "SKIP ${L_PATH[$i]}: $SEL_REASON"; i=$((i + 1)); continue ;;
       NO_CHANGE) ez_say "  NO CHANGE  ${L_PATH[$i]} (źródło: ${R_NAME[$r]}, NotAfter ${R_NOT_AFTER[$r]})"; i=$((i + 1)); continue ;;
     esac
+    # Same rule as the root helper: a chain only into a PEM target, a local
+    # chain is never reduced to a single certificate.
+    if ! reason="$(ez_replacement_format_ok "${L_FMT[$i]}" "${L_NCERT[$i]}" "${R_FMT[$r]}" "${R_NCERT[$r]}")"; then
+      ez_warn "SKIP ${L_PATH[$i]}: $reason (źródło: ${R_NAME[$r]}) - wymagana podmiana ręczna."
+      i=$((i + 1))
+      continue
+    fi
     if ! ez_dir_safe "$(fs_path "${L_PATH[$i]%/*}")" "$EZ_TRUSTED_UID"; then
       ez_warn "SKIP ${L_PATH[$i]}: katalog docelowy nie należy do root albo jest zapisywalny dla grupy/innych; helper odmówi podmiany - wymagana podmiana ręczna."
+      i=$((i + 1))
+      continue
+    fi
+    # The approval binds the exact bytes of both whole files (not only the
+    # leaf): the local copy inspected above and the downloaded source.
+    ldg="$(ez_file_digest "${L_FILE[$i]}")"
+    rdg="$(ez_file_digest "${R_FILE[$r]}")"
+    if ! ez_digest_ok "$ldg" || ! ez_digest_ok "$rdg"; then
+      ez_warn "SKIP ${L_PATH[$i]}: nie można obliczyć SHA-256 pliku lokalnego lub źródłowego."
       i=$((i + 1))
       continue
     fi
@@ -1293,6 +1334,12 @@ ez_plan() {
     printf '  Nowy SHA-256:       %s\n' "${R_FP[$r]}"
     printf '  Nowy Subject:       %s\n' "$(ez_printable "${R_SUBJECT[$r]}")"
     printf '  Nowy Issuer:        %s\n' "$(ez_printable "${R_ISSUER[$r]}")"
+    printf '  SHA-256 pliku lok.: %s\n' "$ldg"
+    printf '  SHA-256 pliku źr.:  %s\n' "$rdg"
+    if [ "${L_NCERT[$i]}" -gt 1 ] || [ "${R_NCERT[$r]}" -gt 1 ]; then
+      printf '  Łańcuch PEM:        obecnie %s, nowy %s certyfikat(y); decyzja dotyczy certyfikatu końcowego, zapisany zostanie cały zweryfikowany plik źródłowy\n' \
+        "${L_NCERT[$i]}" "${R_NCERT[$r]}"
+    fi
     if [ -n "$issuer_note" ]; then
       printf '  UWAGA: wystawca nowego certyfikatu różni się od obecnego.\n'
       ez_log "issuer change for ${L_PATH[$i]}"
@@ -1346,7 +1393,8 @@ ez_plan() {
     fi
     ez_say "  zaakceptowano: ${L_PATH[$i]} restart=$(ez_restart_label "$kind" "$a" "$b")"
     A_PATH[$approved]="${L_PATH[$i]}"; A_LFP[$approved]="${L_FP[$i]}"; A_LNA[$approved]="${L_NA[$i]}"
-    A_RFP[$approved]="${R_FP[$r]}"; A_RNA[$approved]="${R_NA[$r]}"
+    A_LDG[$approved]="$ldg"
+    A_RFP[$approved]="${R_FP[$r]}"; A_RNA[$approved]="${R_NA[$r]}"; A_RDG[$approved]="$rdg"
     A_KIND[$approved]="$kind"; A_A[$approved]="$a"; A_B[$approved]="$b"
     approved=$((approved + 1))
     i=$((i + 1))
@@ -1361,15 +1409,16 @@ ez_plan() {
   ez_prepare_dir "$STATE_DIR" 0755 || return 1
   {
     printf '# P1CERT ezdrowie plan - generated by "p1cert ezdrowie plan". Do not edit.\n'
-    printf 'PLAN_VERSION=1\n'
+    printf 'PLAN_VERSION=2\n'
     printf 'PLAN_ID=%s-%s\n' "$(date '+%Y%m%d%H%M%S')" "$$"
     printf 'CREATED_AT=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
     printf 'CREATED_BY=%s\n' "$(printf '%s' "$(id -un 2>/dev/null)" | tr -c 'A-Za-z0-9._-' '_')"
     printf 'HOST=%s\n' "$(printf '%s' "$(hostname 2>/dev/null)" | tr -c 'A-Za-z0-9._-' '_')"
     n=0
     while [ "$n" -lt "$approved" ]; do
-      printf 'TARGET=%s|%s|%s|%s|%s|%s|%s|%s\n' \
-        "${A_PATH[$n]}" "${A_LFP[$n]}" "${A_LNA[$n]}" "${A_RFP[$n]}" "${A_RNA[$n]}" "${A_KIND[$n]}" "${A_A[$n]}" "${A_B[$n]}"
+      printf 'TARGET=%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        "${A_PATH[$n]}" "${A_LFP[$n]}" "${A_LNA[$n]}" "${A_LDG[$n]}" \
+        "${A_RFP[$n]}" "${A_RNA[$n]}" "${A_RDG[$n]}" "${A_KIND[$n]}" "${A_A[$n]}" "${A_B[$n]}"
       n=$((n + 1))
     done
   } | ez_write_atomic "$EZ_PLAN_FILE" || {
@@ -1453,14 +1502,16 @@ ez_set_result() {
 # restart approved), "apply-systemd" or "apply-compose".  The helper replaces
 # the certificate, restarts only the approved unit/service after proving its
 # relation to the certificate and rolls back from its own copy of the old
-# certificate if the restart fails.  Prints the helper RESULT value.
+# certificate if the restart fails.  The plan's SHA-256 of the exact old target
+# file and of the exact source file are passed along; the helper refuses any
+# other bytes.  Prints the helper RESULT value.
 ez_helper_apply() {
   local i="$1" old_fp="$2" new_fp="$3" new_file="$4" out rc
 
   case "${P_KIND[$i]}" in
-    none) out="$(ez_helper_run apply "${P_PATH[$i]}" "$old_fp" "$new_fp" < "$new_file")" ;;
-    systemd) out="$(ez_helper_run apply-systemd "${P_PATH[$i]}" "$old_fp" "$new_fp" "${P_A[$i]}" < "$new_file")" ;;
-    compose) out="$(ez_helper_run apply-compose "${P_PATH[$i]}" "$old_fp" "$new_fp" "${P_A[$i]}" "${P_B[$i]}" < "$new_file")" ;;
+    none) out="$(ez_helper_run apply "${P_PATH[$i]}" "$old_fp" "$new_fp" "${P_LDG[$i]}" "${P_RDG[$i]}" < "$new_file")" ;;
+    systemd) out="$(ez_helper_run apply-systemd "${P_PATH[$i]}" "$old_fp" "$new_fp" "${P_LDG[$i]}" "${P_RDG[$i]}" "${P_A[$i]}" < "$new_file")" ;;
+    compose) out="$(ez_helper_run apply-compose "${P_PATH[$i]}" "$old_fp" "$new_fp" "${P_LDG[$i]}" "${P_RDG[$i]}" "${P_A[$i]}" "${P_B[$i]}" < "$new_file")" ;;
     *) return 2 ;;
   esac
   rc=$?
@@ -1470,7 +1521,7 @@ ez_helper_apply() {
 }
 
 ez_replace_one() {
-  local i="$1" r rc copy decision result label
+  local i="$1" r rc copy decision result label reason
 
   copy="$EZ_TMP/run-local-$i.cert"
   if ! ez_fetch_local "${P_PATH[$i]}" "$copy" || ! ez_cert_inspect "$copy"; then
@@ -1501,12 +1552,27 @@ ez_replace_one() {
     ez_set_result "$i" SKIP 'source certificate differs from the accepted plan; create a new plan'
     return 0
   fi
+  # The plan approved exact files, not only leaf certificates: any other byte
+  # (intermediate/root of a chain, line endings, ...) requires a new plan.
+  # The helper checks both digests again inside its own operation.
+  if [ "$(ez_file_digest "$copy")" != "${P_LDG[$i]}" ]; then
+    ez_set_result "$i" SKIP 'local certificate file changed since the accepted plan (SHA-256 of the whole file differs); create a new plan'
+    return 0
+  fi
+  if [ "$(ez_file_digest "${R_FILE[$r]}")" != "${P_RDG[$i]}" ]; then
+    ez_set_result "$i" SKIP 'source certificate file changed since the accepted plan (SHA-256 of the whole file differs); create a new plan'
+    return 0
+  fi
   decision="$(ez_decide VALID "$CUR_FP" "$CUR_NA_EPOCH" "${R_FP[$r]}" "${R_NA[$r]}")"
   if [ "$decision" != UPDATE ]; then
     ez_set_result "$i" NO_CHANGE 'local certificate is not older than source'
     return 0
   fi
-  ez_log "decision UPDATE ${P_PATH[$i]} old=$CUR_FP new=${R_FP[$r]}"
+  if ! reason="$(ez_replacement_format_ok "$CUR_FORMAT" "$CUR_COUNT" "${R_FMT[$r]}" "${R_NCERT[$r]}")"; then
+    ez_set_result "$i" SKIP "certificate file format not replaceable automatically: $reason"
+    return 0
+  fi
+  ez_log "decision UPDATE ${P_PATH[$i]} old=$CUR_FP new=${R_FP[$r]} certificates=$CUR_COUNT->${R_NCERT[$r]}"
 
   # Audit/operator backup.  The helper never uses it: its rollback source is
   # its own copy of the old certificate read inside the same operation.
@@ -1523,7 +1589,7 @@ ez_replace_one() {
     0:UPDATED|0:UPDATED_RESTARTED) ;;
     0:NO_CHANGE) ez_set_result "$i" NO_CHANGE 'helper: certificate already identical to source'; return 0 ;;
     2:*) ez_set_result "$i" REFUSED "helper refused (validation or unconfirmed service relation); certificate not replaced"; return 0 ;;
-    3:*) ez_set_result "$i" SKIP 'helper precondition changed; certificate not replaced'; return 0 ;;
+    3:*) ez_set_result "$i" SKIP 'helper precondition changed (fingerprint or exact file bytes differ from the accepted plan); certificate not replaced'; return 0 ;;
     4:*) ez_set_result "$i" ERROR 'replacement undone by helper before restart (verification or service relation failed); previous certificate restored'; return 0 ;;
     5:*) ez_set_result "$i" ROLLBACK "$label failed; previous certificate restored; restart with previous certificate succeeded"; return 0 ;;
     6:*) ez_set_result "$i" ROLLBACK_RESTART_FAILED "$label failed; previous certificate restored and verified, but the application/service still did not start correctly with it - manual intervention required"; return 0 ;;
@@ -1533,8 +1599,11 @@ ez_replace_one() {
 
   # Independent verification of the file on disk.
   copy="$EZ_TMP/run-verify-$i.cert"
+  # A chain is written byte for byte: the whole file must equal the source.
   if ! ez_fetch_local "${P_PATH[$i]}" "$copy" || ! ez_cert_inspect "$copy" ||
-     [ "$EZC_FP" != "${R_FP[$r]}" ] || [ "$EZC_NA_EPOCH" != "${R_NA[$r]}" ]; then
+     [ "$EZC_FP" != "${R_FP[$r]}" ] || [ "$EZC_NA_EPOCH" != "${R_NA[$r]}" ] ||
+     [ "$EZC_COUNT" != "${R_NCERT[$r]}" ] ||
+     { [ "${R_NCERT[$r]}" -gt 1 ] && [ "$(ez_file_digest "$copy")" != "$(ez_file_digest "${R_FILE[$r]}")" ]; }; then
     ez_set_result "$i" ERROR 'helper reported success but the file on disk does not match the source - manual check required'
     return 0
   fi
