@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.15"
+COLLECTOR_VERSION = "0.1.16"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -1255,10 +1255,10 @@ def mswia_edm_candidate(
     }
 
 
-def known_regional_compose_candidates(
+def classify_known_regional_compose(
     candidate_path, base_path, candidate_name, warnings
 ):
-    """Classify bounded, allowlisted regional Compose image signatures first."""
+    """Return the resolution state and candidates for known Compose signatures."""
     compose_files, images, source_paths = read_known_regional_compose_images(
         candidate_path
     )
@@ -1313,50 +1313,60 @@ def known_regional_compose_candidates(
             warning_subject,
             warning_message,
         )
-        return [
-            application_candidate(
-                candidate_name,
-                candidate_path,
-                {
-                    "base_path": base_path,
-                    "matched_hint": "compose_signature_unresolved",
-                    "compose_files": compose_files,
-                },
-            )
-        ]
+        return (
+            "unresolved",
+            [
+                application_candidate(
+                    candidate_name,
+                    candidate_path,
+                    {
+                        "base_path": base_path,
+                        "matched_hint": "compose_signature_unresolved",
+                        "compose_files": compose_files,
+                    },
+                )
+            ],
+        )
 
     identity = recognized[0]
     if identity == "psim2_edm":
-        return [
-            psim2_edm_candidate(candidate_path, base_path, warnings, compose_files)
-        ]
+        return (
+            "recognized",
+            [psim2_edm_candidate(candidate_path, base_path, warnings, compose_files)],
+        )
     if identity == "mswia_edm":
-        return [
-            mswia_edm_candidate(
-                candidate_path,
-                base_path,
-                compose_files,
-                images[regional_adapter],
-                source_paths[regional_adapter],
-            )
-        ]
+        return (
+            "recognized",
+            [
+                mswia_edm_candidate(
+                    candidate_path,
+                    base_path,
+                    compose_files,
+                    images[regional_adapter],
+                    source_paths[regional_adapter],
+                )
+            ],
+        )
 
     base_fields = {
         "base_path": base_path,
         "matched_hint": "compose_image",
         "compose_files": compose_files,
     }
-    return [
-        compose_product_candidate(
-            candidate_name,
-            candidate_path,
-            base_fields,
-            identity,
-            images[identity],
-            source_paths[identity],
-            True,
-        )
-    ]
+    return (
+        "recognized",
+        [
+            compose_product_candidate(
+                candidate_name,
+                candidate_path,
+                base_fields,
+                identity,
+                images[identity],
+                source_paths[identity],
+                True,
+            )
+        ],
+    )
 
 
 def special_application_candidates(candidate_path, base_path, candidate_name, warnings):
@@ -1535,14 +1545,31 @@ def collect_application_candidates(
             if is_non_primary_application_directory_name(candidate_name):
                 continue
 
-            regional_candidates = known_regional_compose_candidates(
+            regional_detection = classify_known_regional_compose(
                 child, base, candidate_name, warnings
             )
-            if regional_candidates is not None:
+            unresolved_regional_candidates = None
+            if regional_detection is not None:
+                regional_resolution, regional_candidates = regional_detection
+                if regional_resolution == "unresolved":
+                    unresolved_regional_candidates = regional_candidates
+                else:
+                    if candidate_name.lower().startswith("edm"):
+                        candidates.extend(legacy_edm_application_candidates(child, base))
+                    candidates.extend(regional_candidates)
+                    continue
+
+            if unresolved_regional_candidates is not None:
                 if candidate_name.lower().startswith("edm"):
-                    candidates.extend(legacy_edm_application_candidates(child, base))
-                candidates.extend(regional_candidates)
-                continue
+                    legacy_edm_candidates = legacy_edm_application_candidates(
+                        child, base
+                    )
+                    if legacy_edm_candidates:
+                        candidates.extend(legacy_edm_candidates)
+                        continue
+                if not candidate_name.lower().startswith("mpi"):
+                    candidates.extend(unresolved_regional_candidates)
+                    continue
 
             if candidate_name.lower() in PSIM2_EDM_DIRECTORY_NAMES:
                 candidates.extend(legacy_edm_application_candidates(child, base))
