@@ -59,7 +59,10 @@ export LC_ALL
 # Caller <-> helper contract version (not the P1CERT release version).
 # Reported by "ping"; the caller and the installer require an exact match.
 # 2: PEM certificate chains and the old/new file SHA-256 apply arguments.
-HELPER_API_VERSION=2
+# 3: target directory policy of the library (ez_target_dir_ok: root or
+#    operator owned, group-writable for root/operator group) and the
+#    descriptor/inode bound replacement; API 2 components are incompatible.
+HELPER_API_VERSION=3
 
 HELPER_DIR=/usr/local/libexec/itgo-p1cert
 HELPER_SELF="$HELPER_DIR/p1cert-ezdrowie-helper"
@@ -83,7 +86,9 @@ HELPER_SETTLE_SECONDS=3
 
 # Per-operation state.
 A_KIND=""; A_TARGET=""; A_UNIT=""; A_PROJECT=""; A_SERVICE=""; A_IDS=""; A_REASON=""
-T_NAME=""; T_UID=""; T_GID=""; T_MODE=""; OLD_DIGEST=""; NEW_DIGEST=""
+T_NAME=""; T_ID=""; T_UID=""; T_GID=""; T_MODE=""; T_CONTEXT=""; OLD_DIGEST=""; NEW_DIGEST=""; NEW_ID=""
+# Replacement being prepared (open as fd 9) and the file last installed.
+TMP_NAME=""; TMP_ID=""; INSTALLED_ID=""
 
 helper_fail() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -273,13 +278,73 @@ helper_check_target() {
   }
 }
 
+# helper_entry_meta [-L] <path>
+# One stat of <path> (lstat; with -L the file it resolves to).  Succeeds only
+# for a regular file with exactly one hard link and sets E_ID ("dev:ino"),
+# E_UID, E_GID and E_MODE.
+helper_entry_meta() {
+  local follow="" meta dev ino links raw
+
+  if [ "$1" = -L ]; then
+    follow=-L
+    shift
+  fi
+  E_ID=""; E_UID=""; E_GID=""; E_MODE=""
+  meta="$(stat $follow -c '%d %i %h %f %u %g %a' -- "$1" 2>/dev/null)" || return 1
+  read -r dev ino links raw E_UID E_GID E_MODE <<EOF
+$meta
+EOF
+  case "$dev:$ino:$links:$E_UID:$E_GID:$E_MODE" in
+    *[!0-9:]*|:*|*::*|*:) return 1 ;;
+  esac
+  # %f is the raw st_mode in hex: S_IFREG is 0x8000.
+  case "$raw" in
+    8[0-9a-f][0-9a-f][0-9a-f]) ;;
+    *) return 1 ;;
+  esac
+  [ "$links" = 1 ] || return 1
+  E_ID="$dev:$ino"
+}
+
+# Prints the identity of a regular, single-link directory entry (never
+# follows a symlink); nothing for anything else.
+helper_entry_id() {
+  helper_entry_meta "$1" && printf '%s' "$E_ID"
+}
+
+# Identity of the replacement open as fd 9 (resolved through /proc, not by
+# its name).
+helper_temp_fd_id() {
+  helper_entry_meta -L /proc/self/fd/9 && printf '%s' "$E_ID"
+}
+
+# helper_read_entry <name> <expected-id> <root-private-destination>
+# Copies a file of the pinned directory without following a symlink
+# (O_NOFOLLOW), blocking on a FIFO (O_NONBLOCK) or acquiring a terminal
+# (O_NOCTTY).  The entry must be the expected regular single-link file right
+# before and right after the copy.  At most twice EZ_MAX_CERT_BYTES are
+# copied; larger files are rejected by the inspection anyway.
+helper_read_entry() {
+  local name="$1" id="$2" out="$3"
+
+  [ -n "$id" ] && [ "$(helper_entry_id "$name")" = "$id" ] || return 1
+  dd if="$name" of="$out" iflag=nofollow,nonblock,noctty bs="$EZ_MAX_CERT_BYTES" count=2 2>/dev/null || return 1
+  [ "$(helper_entry_id "$name")" = "$id" ]
+}
+
+helper_selinux_enabled() {
+  command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled
+}
+
+# SELinux context of a directory entry itself (lgetfilecon, no symlink).
+helper_entry_context() {
+  stat -c '%C' -- "$1" 2>/dev/null
+}
+
 # Pins the target directory as the working directory and verifies that it
-# still is the expected path and that only root can change its entries.  All
-# later file operations are relative to this pinned directory.  A directory
-# owned by another user or writable by group/others is refused: an
-# unprivileged user could swap entries (symlinks, hard links) between the
-# helper's checks and its root operations.
-helper_enter_target_dir() {
+# still is the expected path and that the target in it is a regular,
+# single-link file.  All later file operations are relative to it.
+helper_pin_target_dir() {
   local target="$1" dir
 
   dir="$(helper_fs "${target%/*}")"
@@ -291,15 +356,52 @@ helper_enter_target_dir() {
     helper_fail "target directory changed during validation: ${target%/*}"
     return 1
   }
-  helper_node_trusted . d || {
-    helper_fail "target directory must be owned by root and not writable by group/others (replace manually): ${target%/*}"
-    return 1
-  }
   T_NAME="${target##*/}"
-  [ -f "$T_NAME" ] && [ ! -L "$T_NAME" ] && [ "$(helper_link_count "$T_NAME")" = 1 ] || {
+  [ -n "$(helper_entry_id "$T_NAME")" ] || {
     helper_fail "target changed during validation: $target"
     return 1
   }
+}
+
+# Pins the target directory (above) for a replacement and applies the
+# directory policy (ez_target_dir_ok): owned by root or by the operator, the
+# P1CERT user that called the helper through sudo (SUDO_UID/SUDO_GID, set by
+# sudo itself, also for the scheduled run), group write only for the root or
+# the operator group, never world writable.  The owner and group members of
+# such a directory can replace any entry in it at any time, so the helper
+# never writes, chowns or chmods anything there by name (see
+# helper_atomic_replace), reads only with O_NOFOLLOW and binds every step to
+# the identity (device:inode) of the file it checked.  Records identity,
+# owner, group, mode and SELinux context of the target.
+helper_enter_target_dir() {
+  local target="$1" op_uid="${SUDO_UID:-}" op_gid="${SUDO_GID:-}"
+
+  helper_pin_target_dir "$target" || return 1
+  case "$op_uid:$op_gid" in
+    *[!0-9:]*|:*|*:) op_uid=""; op_gid="" ;;
+  esac
+  ez_target_dir_ok . "$HELPER_TRUSTED_UID" "$HELPER_TRUSTED_GID" "$op_uid" "$op_gid" || {
+    helper_fail "target directory must be owned by root or by the P1CERT user, writable only by its owner and the root or P1CERT group, never by others (replace manually): ${target%/*}"
+    return 1
+  }
+  helper_entry_meta "$T_NAME" || {
+    helper_fail "target changed during validation: $target"
+    return 1
+  }
+  T_ID="$E_ID"; T_UID="$E_UID"; T_GID="$E_GID"; T_MODE="$E_MODE"; T_CONTEXT=""
+  if helper_selinux_enabled; then
+    T_CONTEXT="$(helper_entry_context "$T_NAME")"
+    case "$T_CONTEXT" in
+      ''|*[!A-Za-z0-9_.:,-]*)
+        helper_fail "cannot read the SELinux context of the target: $target"
+        return 1
+        ;;
+    esac
+    [ "$(helper_entry_id "$T_NAME")" = "$T_ID" ] || {
+      helper_fail "target changed during validation: $target"
+      return 1
+    }
+  fi
 }
 
 # helper_render_cert <in> <in-format> <in-count> <out-format> <out>
@@ -321,68 +423,123 @@ helper_render_cert() {
   esac
 }
 
-# Atomically replaces T_NAME inside the pinned directory with the content of
-# $1, applying the original owner, group and mode (and SELinux context).  $2
-# (mandatory) is the SHA-256 of the exact bytes the target must still contain
-# right before the rename; anything else (including a change made by someone
-# else) is never overwritten.
-helper_atomic_replace() {
-  local content="$1" expect="$2" tmp
+# Creates the replacement in the pinned directory and keeps it open as fd 9.
+# The name is unpredictable (128 bits from /dev/urandom) and the file is
+# created with O_CREAT|O_EXCL (bash noclobber), so fd 9 is always a new,
+# empty file of this operation and never an existing file, symlink or
+# device.  Sets TMP_NAME and TMP_ID.
+helper_temp_create() {
+  local rnd rc
 
-  ez_digest_ok "$expect" || {
-    helper_fail 'no valid expected digest of the current target; nothing replaced'
+  TMP_NAME=""; TMP_ID=""
+  rnd="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  case "$rnd" in
+    ''|*[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#rnd}" -eq 32 ] || return 1
+  set -C
+  { exec 9> ".p1cert-ezdrowie.$rnd"; } 2>/dev/null
+  rc=$?
+  set +C
+  [ "$rc" -eq 0 ] || return 1
+  TMP_NAME=".p1cert-ezdrowie.$rnd"
+  TMP_ID="$(helper_temp_fd_id)"
+  [ -n "$TMP_ID" ] && [ "$(helper_entry_id "$TMP_NAME")" = "$TMP_ID" ] || {
+    helper_temp_drop
     return 1
   }
-  tmp="$(mktemp ./.p1cert-ezdrowie.XXXXXX)" || {
+}
+
+# Closes fd 9 and removes the temporary name (unlinking a name never touches
+# the file another name or symlink in its place points to).
+helper_temp_drop() {
+  exec 9>&-
+  [ -z "$TMP_NAME" ] || rm -f -- "$TMP_NAME"
+  TMP_NAME=""; TMP_ID=""
+}
+
+# helper_atomic_replace <content> <expected-sha256> <expected-id>
+# Atomically replaces T_NAME inside the pinned directory with the content of
+# <content>, applying the original owner, group and mode (and SELinux
+# context).  Content, owner, group, mode and context are applied only through
+# fd 9 (/proc/self/fd/9), never through the temporary name, which the owner or
+# group of the directory could replace with a symlink or hard link at any
+# time.  The pre-rename validation requires the target to still be the same
+# file (<expected-id>, dev:ino) with exactly the bytes <expected-sha256>, and
+# the temporary name to still be the prepared file; a change detected there
+# (including one made by someone else) is refused and not overwritten.  The
+# final mv/rename itself is pathname-based and leaves the narrow final race
+# window described in the README.  Sets INSTALLED_ID.
+helper_atomic_replace() {
+  local content="$1" expect="$2" expect_id="$3"
+
+  INSTALLED_ID=""
+  ez_digest_ok "$expect" && [ -n "$expect_id" ] || {
+    helper_fail 'no valid expected digest or identity of the current target; nothing replaced'
+    return 1
+  }
+  helper_temp_create || {
     helper_fail 'cannot create temporary file next to target'
     return 1
   }
-  if ! cat -- "$content" > "$tmp" ||
-     ! chown -- "$T_UID:$T_GID" "$tmp" ||
-     ! chmod -- "$T_MODE" "$tmp"; then
-    rm -f -- "$tmp"
+  if ! cat -- "$content" >&9 ||
+     ! chown -- "$T_UID:$T_GID" /proc/self/fd/9 ||
+     ! chmod -- "$T_MODE" /proc/self/fd/9; then
+    helper_temp_drop
     helper_fail 'cannot prepare replacement file with original owner/group/mode'
     return 1
   fi
-  if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
-    if ! chcon --reference="$T_NAME" -- "$tmp" 2>/dev/null; then
-      rm -f -- "$tmp"
+  if helper_selinux_enabled; then
+    if [ -z "$T_CONTEXT" ] || ! chcon -- "$T_CONTEXT" /proc/self/fd/9 2>/dev/null; then
+      helper_temp_drop
       helper_fail 'cannot copy SELinux context to replacement file'
       return 1
     fi
   fi
-  if [ ! -f "$T_NAME" ] || [ -L "$T_NAME" ] || [ "$(helper_link_count "$T_NAME")" != 1 ] ||
-     [ "$(ez_file_digest "$T_NAME")" != "$expect" ]; then
-    rm -f -- "$tmp"
+  if ! helper_read_entry "$T_NAME" "$expect_id" "$HELPER_TMP/current" ||
+     [ "$(ez_file_digest "$HELPER_TMP/current")" != "$expect" ]; then
+    helper_temp_drop
     helper_fail 'target does not contain the expected bytes; nothing replaced'
     return 1
   fi
+  if [ "$(helper_temp_fd_id)" != "$TMP_ID" ] || [ "$(helper_entry_id "$TMP_NAME")" != "$TMP_ID" ]; then
+    helper_temp_drop
+    helper_fail 'temporary file was replaced in the target directory; nothing replaced'
+    return 1
+  fi
   # -T: never move into a directory that appeared under the target name.
-  if ! mv -f -T -- "$tmp" "$T_NAME"; then
-    rm -f -- "$tmp"
+  if ! mv -f -T -- "$TMP_NAME" "$T_NAME"; then
+    helper_temp_drop
     helper_fail 'atomic rename failed'
     return 1
   fi
+  exec 9>&-
+  INSTALLED_ID="$TMP_ID"
+  TMP_NAME=""; TMP_ID=""
 }
 
-# Verifies the file on disk: a valid single certificate or complete chain,
-# the leaf fingerprint and the exact bytes of the whole file.
+# Verifies the file on disk: still the file installed by this operation
+# (<id>), a valid single certificate or complete chain, the leaf fingerprint
+# and the exact bytes of the whole file.
 helper_verify_disk() {
-  local fp="$1" digest="$2"
+  local fp="$1" digest="$2" id="$3"
 
   ez_digest_ok "$digest" &&
-    cat -- "$T_NAME" > "$HELPER_TMP/verify" 2>/dev/null &&
+    helper_read_entry "$T_NAME" "$id" "$HELPER_TMP/verify" &&
     ez_cert_inspect "$HELPER_TMP/verify" &&
     [ "$EZC_FP" = "$fp" ] &&
     [ "$(ez_file_digest "$HELPER_TMP/verify")" = "$digest" ]
 }
 
 # Puts back the exact previous certificate read by this operation, but only
-# while the target still contains exactly the certificate this operation
-# installed (NEW_DIGEST).  A later change by anybody else is never
-# overwritten: the rollback then fails (ROLLBACK_FAILED, manual action).
+# when the pre-rollback validation still sees the file this operation
+# installed (NEW_ID) with exactly its bytes (NEW_DIGEST).  A change detected
+# by that validation is not overwritten: the rollback then fails
+# (ROLLBACK_FAILED, manual action).  The same narrow final race window
+# between the last validation and the pathname-based rename remains.
 helper_restore_old() {
-  helper_atomic_replace "$HELPER_TMP/old" "$NEW_DIGEST" && helper_verify_disk "$OLD_FP" "$OLD_DIGEST"
+  helper_atomic_replace "$HELPER_TMP/old" "$NEW_DIGEST" "$NEW_ID" &&
+    helper_verify_disk "$OLD_FP" "$OLD_DIGEST" "$INSTALLED_ID"
 }
 
 # Undoes a replacement before any restart happened.
@@ -665,12 +822,13 @@ op_find_candidates() {
 }
 
 op_read() {
-  local target="$1" fs rc
+  local target="$1" rc
 
   helper_check_target "$target" || return 2
   helper_tmpdir || return 1
-  fs="$(helper_fs "$target")"
-  cat -- "$fs" > "$HELPER_TMP/read" 2>/dev/null || {
+  # Reading needs no directory policy, but never follows a symlink swapped in.
+  helper_pin_target_dir "$target" || return 2
+  helper_read_entry "$T_NAME" "$(helper_entry_id "$T_NAME")" "$HELPER_TMP/read" || {
     helper_fail "cannot read target: $target"
     return 1
   }
@@ -686,7 +844,7 @@ op_read() {
 # helper_apply <none|systemd|compose> <cert-path> <old-fp> <new-fp>
 #              <old-file-sha256> <new-source-sha256> [unit | project service]
 helper_apply() {
-  local expected_old expected_new expected_old_digest expected_new_digest source_digest now rc reason meta
+  local expected_old expected_new expected_old_digest expected_new_digest source_digest now rc reason
 
   A_KIND="$1"; A_TARGET="$2"; A_UNIT=""; A_PROJECT=""; A_SERVICE=""; A_IDS=""; A_REASON=""
   expected_old="$(helper_norm_fp "$3")"
@@ -742,18 +900,12 @@ helper_apply() {
   ez_cert_save NEW
   [ "$NEW_FP" = "$expected_new" ] || helper_refuse 2 "new certificate fingerprint $NEW_FP differs from the expected $expected_new" || return
 
+  # Pins the directory and records identity, owner, group, mode and context.
   helper_enter_target_dir "$A_TARGET" || helper_refuse 2 'unsafe target directory' || return
-  meta="$(stat -c '%u %g %a' -- "$T_NAME" 2>/dev/null)" || helper_refuse 2 'cannot read target metadata' || return
-  read -r T_UID T_GID T_MODE <<EOF
-$meta
-EOF
-  case "$T_UID:$T_GID:$T_MODE" in
-    *[!0-9:]*|:*|*::*|*:) helper_refuse 2 'unexpected target metadata' || return ;;
-  esac
 
   # The exact bytes of the current certificate are kept in the root-private
   # temporary directory of this operation; they are the only rollback source.
-  cat -- "$T_NAME" > "$HELPER_TMP/old" 2>/dev/null || helper_refuse 2 'cannot read current certificate' || return
+  helper_read_entry "$T_NAME" "$T_ID" "$HELPER_TMP/old" || helper_refuse 2 'cannot read current certificate' || return
   OLD_DIGEST="$(ez_file_digest "$HELPER_TMP/old")"
   ez_digest_ok "$OLD_DIGEST" || helper_refuse 1 'cannot compute a valid SHA-256 of the current certificate' || return
   # The exact current bytes must be the ones approved in the plan (any change
@@ -802,11 +954,12 @@ EOF
   # 3. Transaction.  From here on the operation is completed (including any
   #    rollback) even if the caller disconnects.
   trap '' HUP INT TERM PIPE
-  if ! helper_atomic_replace "$HELPER_TMP/new.out" "$OLD_DIGEST"; then
+  if ! helper_atomic_replace "$HELPER_TMP/new.out" "$OLD_DIGEST" "$T_ID"; then
     printf 'RESULT=FAILED\n'
     return 1
   fi
-  if ! helper_verify_disk "$NEW_FP" "$NEW_DIGEST"; then
+  NEW_ID="$INSTALLED_ID"
+  if ! helper_verify_disk "$NEW_FP" "$NEW_DIGEST" "$NEW_ID"; then
     helper_undo 'post-install verification failed'
     return
   fi

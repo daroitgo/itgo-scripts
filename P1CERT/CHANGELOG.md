@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- `p1cert ezdrowie`: certificate target directories may be owned by root or
+  by the P1CERT user (the sudo caller, also for the scheduled run) and may be
+  group-writable for the `root` group or the P1CERT user's group (e.g.
+  `/srv/CERTYFIKATY` as `root:root 775` or `itgo:itgo 775`). World-writable
+  directories, directories of other users and foreign writable groups are
+  still refused (plan SKIP, helper REFUSED). `fs.protected_hardlinks=1` is
+  recommended hardening, not a requirement. To stay safe in such
+  directories, the helper now creates the replacement with `O_CREAT|O_EXCL`
+  under an unpredictable name and applies content, owner, group, mode and
+  SELinux context only through its open descriptor (`/proc/self/fd`), so
+  these privileged operations cannot be redirected to a swapped-in inode.
+  Targets are read only with `O_NOFOLLOW`/`O_NONBLOCK`; the pre-rename
+  checks, the verification and the rollback are bound to the device:inode
+  checked before, and a swap detected by them makes the operation fail
+  (nothing renamed, or rollback refused). The final `mv -f -T` is a
+  pathname-based rename without compare-and-swap, so a narrow window
+  remains between the last target check and the rename: a user who can
+  already modify the directory can, in that window, have a concurrent change
+  of their own overwritten or make the operation fail (DoS). This is not a
+  privilege escalation. `read` no longer follows a symlink swapped in after
+  validation.
+- Helper contract API 3 (helper, library, caller and installer): the helper
+  depends on the library's target directory policy (`ez_target_dir_ok`) and
+  the descriptor/inode bound replacement. Operations, arguments and results
+  are unchanged, but an API 2 helper, library or caller next to API 3
+  components refuses to work (partial upgrade); re-run the installer.
 - `p1cert ezdrowie`: valid PEM certificate chains are supported (e.g.
   `ezdrowieGovPl.cer` and `ezdrowiegovpl_2026.pem`: leaf, intermediate CA,
   root CA) in scan, source collection, plan, run, backup and the root
@@ -30,7 +56,9 @@
   before inspecting them, verifies its root-private copy of the current
   target before any change, and the existing check right before the atomic
   rename uses the same bytes, so a change after the plan or between the
-  caller's checks and the helper is never overwritten or installed. Helper,
+  caller's checks and the helper is detected and not installed (except for
+  the narrow final window between that check and the pathname-based
+  rename, see the target directory entry above). Helper,
   library or caller of API 1 next to API 2 components refuse to work
   (partial upgrade), before any certificate operation.
 - `p1cert ezdrowie`: directories whose complete component name is `OLD`

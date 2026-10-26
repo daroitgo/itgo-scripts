@@ -13,9 +13,12 @@
 # helper (not the P1CERT release version).  The helper and the caller refuse
 # a library with a different value.
 # 2: PEM certificate chains; helper apply operations carry the SHA-256 of the
-# exact old target and new source files (plan version 2).  An API 1 helper
-# left with this library (interrupted upgrade) refuses to run.
-EZ_LIB_API=2
+# exact old target and new source files (plan version 2).
+# 3: ez_target_dir_ok (root or operator owned target directories, group write
+# for the root or operator group) used by the helper's descriptor/inode bound
+# replacement.  A helper of API 1 or 2 left with this library (interrupted
+# upgrade) refuses to run.
+EZ_LIB_API=3
 
 EZ_ALLOWED_ROOTS='/srv /usr/local /opt'
 EZ_MAX_CERT_BYTES=65536
@@ -145,6 +148,41 @@ ez_dir_safe() {
     *[!0-9:]*|:*|*:) return 1 ;;
   esac
   [ "$owner" = "$uid" ] && [ $((8#$mode & 8#022)) -eq 0 ]
+}
+
+# ez_target_dir_ok <dir> <trusted-uid> <trusted-gid> [<operator-uid> <operator-gid>]
+# Policy for a directory in which the root helper replaces a certificate:
+#   - a real directory, not a symlink,
+#   - owned by the trusted uid (root) or by the operator (the P1CERT user that
+#     calls the helper through sudo, also for the scheduled run),
+#   - never writable by others,
+#   - writable by its group only when that group is the trusted group (root)
+#     or the operator's group.
+# Without an operator only the trusted uid may own it.
+ez_target_dir_ok() {
+  local dir="$1" tuid="$2" tgid="$3" ouid="${4:-}" ogid="${5:-}" meta owner group mode
+
+  case "$tuid:$tgid" in
+    *[!0-9:]*|:*|*::*|*:) return 1 ;;
+  esac
+  case "$ouid:$ogid" in
+    :) ;;
+    *[!0-9:]*|:*|*::*|*:) return 1 ;;
+  esac
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+  meta="$(stat -c '%u %g %a' -- "$dir" 2>/dev/null)" || return 1
+  read -r owner group mode <<EOF
+$meta
+EOF
+  case "$owner:$group:$mode" in
+    *[!0-9:]*|:*|*::*|*:) return 1 ;;
+  esac
+  [ "$owner" = "$tuid" ] || { [ -n "$ouid" ] && [ "$owner" = "$ouid" ]; } || return 1
+  [ $((8#$mode & 8#002)) -eq 0 ] || return 1
+  if [ $((8#$mode & 8#020)) -ne 0 ]; then
+    [ "$group" = "$tgid" ] || { [ -n "$ogid" ] && [ "$group" = "$ogid" ]; } || return 1
+  fi
+  return 0
 }
 
 ez_unit_name_ok() {

@@ -60,12 +60,16 @@ ez_set_module_dir "$MODULE_DIR"
 EZ_HELPER='/usr/local/libexec/itgo-p1cert/p1cert-ezdrowie-helper'
 # Exact caller <-> helper contract version required from "helper ping" (not
 # the P1CERT release version).  2: PEM chains, apply with old/new file SHA-256.
-EZ_HELPER_API=2
+# 3: root/operator owned, group-writable target directories (ez_target_dir_ok)
+# with descriptor/inode bound replacement; an API 2 helper is refused.
+EZ_HELPER_API=3
 EZ_SERVICE_UNIT='itgo-p1cert-ezdrowie.service'
 EZ_TIMER_UNIT='itgo-p1cert-ezdrowie.timer'
-# Owner required for target directories (the helper refuses to work in a
-# directory another user could modify).  Tests may override it.
+# Trusted owner/group of target directories besides the P1CERT user itself
+# (see ez_target_dir_ok; the helper applies the same rule).  Tests may
+# override them.
 EZ_TRUSTED_UID=0
+EZ_TRUSTED_GID=0
 # A scheduled run acts only from the planned time up to this many seconds
 # later; earlier (clock jump) or later (delayed start) it does nothing.
 EZ_SCHEDULE_GRACE_SECONDS=900
@@ -1306,8 +1310,9 @@ ez_plan() {
       i=$((i + 1))
       continue
     fi
-    if ! ez_dir_safe "$(fs_path "${L_PATH[$i]%/*}")" "$EZ_TRUSTED_UID"; then
-      ez_warn "SKIP ${L_PATH[$i]}: katalog docelowy nie należy do root albo jest zapisywalny dla grupy/innych; helper odmówi podmiany - wymagana podmiana ręczna."
+    # The helper is called by this user through sudo, so it is the operator.
+    if ! ez_target_dir_ok "$(fs_path "${L_PATH[$i]%/*}")" "$EZ_TRUSTED_UID" "$EZ_TRUSTED_GID" "$(id -u)" "$(id -g)"; then
+      ez_warn "SKIP ${L_PATH[$i]}: katalog docelowy nie należy do root ani do użytkownika P1CERT, jest zapisywalny dla innych albo dla grupy innej niż root/grupa użytkownika P1CERT; helper odmówi podmiany - wymagana podmiana ręczna."
       i=$((i + 1))
       continue
     fi

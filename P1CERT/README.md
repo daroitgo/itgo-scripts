@@ -51,9 +51,10 @@ All system files are written to a temporary file in the target directory,
 set to `root:root` and the final mode and renamed with `mv -f -T`.
 
 Caller, library and helper share a contract version (`HELPER API`, currently
-`1`; independent of the P1CERT version). `helper ping` prints `HELPER=OK`
-and `API_VERSION=1`; `p1cert ezdrowie` and the installer accept only exactly
-this version, and the helper refuses a root library with another version.
+`3`; independent of the P1CERT version). `helper ping` prints `HELPER=OK`
+and `API_VERSION=3`; `p1cert ezdrowie` and the installer accept only exactly
+this version, and the helper refuses a root library with another version
+(API 1 and 2 components of earlier releases are incompatible).
 After a partial upgrade (new scripts, old helper) `run`/`schedule` therefore
 stop with "uprzywilejowany helper ma niezgodną wersję API" instead of using
 an incompatible helper.
@@ -369,8 +370,9 @@ from Nextcloud and validates it again, re-reads the local certificate, and:
   own operation: the stdin bytes must match the source digest before they are
   interpreted, its root-private copy of the current target must match the
   old digest, and the target is compared with those same bytes once more
-  right before the atomic rename. A change at any point after the plan is
-  therefore never overwritten or installed.
+  right before the atomic rename. A change after the plan is therefore
+  detected and refused, up to that last check; the rename itself is
+  pathname-based and leaves a narrow final window (see Limitations).
 
 Inside that single privileged operation the helper replaces the file (same
 path and file name as before - the remote file name is irrelevant -, same
@@ -473,7 +475,7 @@ target file and of the exact stdin bytes approved in the plan. For a single
 certificate the source digest binds the file passed on stdin; the helper may
 still re-encode it to the target's PEM/DER format. A PEM chain is written
 unchanged, so the installed file has exactly the source digest. The
-caller <-> helper <-> library contract is API version 2; any other version on
+caller <-> helper <-> library contract is API version 3; any other version on
 either side is refused before any certificate operation.
 
 The new certificate is passed on stdin. There is no standalone restart,
@@ -491,7 +493,23 @@ group/world writable. It then re-validates every argument on its own:
 
 - target: allowed roots and file-name rule, no symlink in the path, regular
   file with a single hard link; the target directory is pinned as working
-  directory and must be owned by root and not writable by group/others,
+  directory and must be owned by root or by the P1CERT user that called the
+  helper through sudo (`SUDO_UID`, also for the scheduled run), may be
+  writable by its group only when that group is `root` or the P1CERT user's
+  group (`SUDO_GID`), and must never be writable by others (e.g.
+  `root:root 775` and `itgo:itgo 775` are accepted, `777` is refused). In a
+  directory that a non-root user can modify, the privileged operations on
+  the temporary file (content write, chown, chmod, chcon) are performed only
+  through the helper's own `O_EXCL` descriptor, never through a name; the
+  target pre-check, the verification and the rollback use the device:inode
+  identity checked before. The final `mv`/rename is still pathname-based:
+  the portable Bash/coreutils implementation has no compare-and-swap
+  rename, so a minimal final race window remains between the last target
+  check and the rename. It concerns only a principal that can already change
+  entries in that directory and cannot redirect a root write, chown, chmod
+  or chcon to another file. `fs.protected_hardlinks` is therefore not
+  required; `fs.protected_hardlinks=1` (default on the supported
+  distributions) is still recommended as optional system hardening,
 - certificates: exactly one certificate or a valid PEM chain (rules above,
   leaf used for all checks), expected new fingerprint, expected current
   fingerprint, validity, later NotAfter, identity rules above; a chain only
@@ -549,14 +567,32 @@ this is accepted.
 
 ### Limitations
 
-- The helper is written in Bash and cannot use `openat`/`O_NOFOLLOW`. It
-  therefore refuses target directories that a non-root user could modify
-  (where symlink, hard-link or rename races would be possible) and works only
-  relative to the pinned target directory. Parent directories above the
-  target directory are only checked for symlinks; the operation itself does
-  not depend on them after the directory is pinned.
-- Targets in directories owned by an application user (or group/world
-  writable) are skipped and must be replaced manually.
+- The helper is written in Bash and cannot use `openat`. Because the owner
+  and group members of an accepted target directory can rename, replace or
+  link any entry in it at any time, the helper never writes, chowns, chmods
+  or relabels anything there by name: the replacement is created under an
+  unpredictable name with `O_CREAT|O_EXCL` and kept open, and its content,
+  owner, group, mode and SELinux context are applied only through that
+  descriptor (`/proc/self/fd`). The target is read only with `O_NOFOLLOW`
+  and `O_NONBLOCK` (`dd`). Pre-rename validation, verification and rollback
+  are bound to device/inode; the final rename is pathname-based. A swap
+  detected by these checks makes the operation fail.
+- Final race window: there is no compare-and-swap rename in this
+  implementation, so between the last target check and `mv -f -T` the owner
+  or a group member of the directory can still replace the target; that
+  concurrent change is then overwritten by the rename (and the following
+  verification or rollback fails). Such a user can also make the operation
+  fail or change the certificate after it, exactly as they could without
+  P1CERT, but cannot redirect the helper's privileged content write, chown,
+  chmod or SELinux relabel to another inode. The helper works only relative
+  to the pinned target directory. Parent directories above it are only
+  checked for symlinks; the operation itself does not depend on them after
+  the directory is pinned.
+- Targets in directories owned by another user, group-writable by a group
+  other than `root` or the P1CERT user's group, or world writable are
+  skipped and must be replaced manually. POSIX ACLs on the target directory
+  are not evaluated: grant write access through them only to principals
+  that may change the certificate anyway.
 - The old certificate used for rollback lives only in the helper's private
   temporary directory for the duration of the operation. If the helper is
   killed with SIGKILL (or the host crashes) between replacement and rollback,
