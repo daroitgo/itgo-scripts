@@ -62,7 +62,10 @@ export LC_ALL
 # 3: target directory policy of the library (ez_target_dir_ok: root or
 #    operator owned, group-writable for root/operator group) and the
 #    descriptor/inode bound replacement; API 2 components are incompatible.
-HELPER_API_VERSION=3
+# 4: systemd binding through SSL.patch of the classic Integration Platform
+#    (appConfig.properties of the installation the unit runs from, own
+#    application tree policy); API 1-3 components are incompatible.
+HELPER_API_VERSION=4
 
 HELPER_DIR=/usr/local/libexec/itgo-p1cert
 HELPER_SELF="$HELPER_DIR/p1cert-ezdrowie-helper"
@@ -603,14 +606,77 @@ helper_path_trusted() {
   done
 }
 
+# helper_pi_appconfig <ip-root> <systemctl-show-output>
+# Prints appConfig.properties of the IntegrationPlatform installation
+# <ip-root> (the one the unit runs from) for ez_systemd_bound rule C, or
+# fails.  This file belongs to the application, not to root (real model:
+# itgo:itgo 775), so helper_path_trusted does not apply; instead the narrow
+# library policy ez_pi_appconfig_trusted is enforced with the unit's own
+# User= as the only principal besides root: / up to the parent of <ip-root>
+# root-controlled, the installation tree and the file owned by root or that
+# user, group write only for root or the user's primary group, never world
+# writable, no symlink, one hard link, size limit.  The file is then read in
+# a subshell from its pinned directory (cd -P, policy re-checked on ".") by
+# name with O_NOFOLLOW/O_NONBLOCK/O_NOCTTY (dd), so a symlink, FIFO or device
+# swapped in is never followed or blocked on.  The entry must be the
+# device:inode validated by path (regular, one link) right before the open
+# and again after the read, and the copy must have the entry's size.  This is
+# NOT a descriptor-bound read (Bash has no openat/fstat): a principal that can
+# modify WEB-INF (by the policy above root, the unit user and, with group
+# write, members of the root group or the user's primary group) can still swap
+# another regular file in after the pre-open check and back before the
+# post-read check (A-B-A); see README.  Needs HELPER_TMP.
+helper_pi_appconfig() {
+  local root="$1" props="$2" file ids auid agid fs dir copy id
+
+  file="$root/$EZ_PI_APPCONFIG_REL"
+  fs="$(helper_fs "$file")"
+  ids="$(ez_systemd_app_ids "$props" "$HELPER_TRUSTED_UID" "$HELPER_TRUSTED_GID")" || {
+    helper_info "User= of the unit cannot be resolved; $file is not used as evidence"
+    return 1
+  }
+  read -r auid agid <<EOF
+$ids
+EOF
+  ez_pi_appconfig_trusted "$HELPER_FS_ROOT" "$root" "$HELPER_TRUSTED_UID" "$HELPER_TRUSTED_GID" "$auid" "$agid" || {
+    helper_info "$file or one of its directories is not controlled only by root and the unit user (uid $auid), is a symlink, has several links or is too large; not used as evidence"
+    return 1
+  }
+  helper_entry_meta "$fs" || return 1
+  id="$E_ID"
+  dir="${fs%/*}"
+  copy="$HELPER_TMP/pi-appconfig"
+  rm -f -- "$copy"
+  (
+    cd -P -- "$dir" 2>/dev/null && [ "$(pwd -P)" = "$dir" ] || exit 1
+    ez_target_dir_ok . "$HELPER_TRUSTED_UID" "$HELPER_TRUSTED_GID" "$auid" "$agid" || exit 1
+    [ "$(helper_entry_id appConfig.properties)" = "$id" ] || exit 1
+    dd if=appConfig.properties of="$copy" iflag=nofollow,nonblock,noctty bs="$EZ_PI_APPCONFIG_MAX_BYTES" count=2 2>/dev/null || exit 1
+    [ "$(helper_entry_id appConfig.properties)" = "$id" ] || exit 1
+    [ "$(stat -c '%s' -- appConfig.properties 2>/dev/null)" = "$(ez_file_size "$copy")" ]
+  ) || {
+    helper_info "$file changed while it was read; not used as evidence"
+    rm -f -- "$copy"
+    return 1
+  }
+  ez_pi_appconfig_load "$copy" || {
+    helper_info "$file is too large or contains NUL bytes; not used as evidence"
+    rm -f -- "$copy"
+    return 1
+  }
+  rm -f -- "$copy"
+}
+
 # Proves, independently of the caller, that unit $2 uses certificate $1 (see
 # ez_systemd_bound).  Only root-controlled unit, drop-in and environment
-# files are read.  Sets A_REASON.
+# files are read, plus appConfig.properties of the unit's IntegrationPlatform
+# installation under its own narrow policy (helper_pi_appconfig).  Sets
+# A_REASON.
 helper_systemd_bound() {
-  local target="$1" unit="$2" props load fragment kind file fs config="" reason
+  local target="$1" unit="$2" props load fragment kind file fs config="" reason root appcfg=""
 
   props="$(helper_systemctl show --no-pager -p LoadState -p FragmentPath -p DropInPaths \
-    -p WorkingDirectory -p ExecStart -p Environment -p EnvironmentFiles -- "$unit" 2>/dev/null)" || {
+    -p WorkingDirectory -p ExecStart -p Environment -p EnvironmentFiles -p User -- "$unit" 2>/dev/null)" || {
     helper_fail "cannot inspect unit: $unit"
     return 1
   }
@@ -647,7 +713,16 @@ $(cat -- "$fs" 2>/dev/null)"
   done <<EOF
 $(ez_systemd_config_files "$props")
 EOF
-  reason="$(ez_systemd_bound "$target" "$props" "$config")" || {
+  # Classic Integration Platform: SSL.patch of the installation the unit
+  # runs from (never of the installation the certificate lies in).
+  if root="$(ez_systemd_ip_root "$props")"; then
+    fs="$(helper_fs "$root/$EZ_PI_APPCONFIG_REL")"
+    if [ -e "$fs" ] || [ -L "$fs" ]; then
+      helper_tmpdir || return 1
+      appcfg="$(helper_pi_appconfig "$root" "$props")" || appcfg=""
+    fi
+  fi
+  reason="$(ez_systemd_bound "$target" "$props" "$config" "$appcfg")" || {
     helper_fail "no provable relation between $unit and $target; automatic restart refused"
     return 1
   }

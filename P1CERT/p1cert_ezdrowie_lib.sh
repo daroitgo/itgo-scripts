@@ -18,13 +18,21 @@
 # for the root or operator group) used by the helper's descriptor/inode bound
 # replacement.  A helper of API 1 or 2 left with this library (interrupted
 # upgrade) refuses to run.
-EZ_LIB_API=3
+# 4: classic Integration Platform binding (ez_systemd_bound rule C): an
+# external certificate named by SSL.patch in the appConfig.properties of the
+# IntegrationPlatform installation the unit runs from, with the application
+# tree policy ez_pi_appconfig_trusted.  Helpers of API 1-3 refuse it.
+EZ_LIB_API=4
 
 EZ_ALLOWED_ROOTS='/srv /usr/local /opt'
 EZ_MAX_CERT_BYTES=65536
 # Upper bound for the number of certificates in one PEM chain file.
 EZ_MAX_CHAIN_CERTS=10
 EZ_IDENTITY_DOMAIN='ezdrowie.gov.pl'
+# Configuration of the classic Integration Platform (Tomcat p1-war), relative
+# to its IntegrationPlatform installation directory, and its size limit.
+EZ_PI_APPCONFIG_REL='apache-tomcat/webapps/p1-war/WEB-INF/appConfig.properties'
+EZ_PI_APPCONFIG_MAX_BYTES=262144
 
 # Lowercase without depending on bash 4 case modification (OL7 ships bash 4.2,
 # but keep the helpers usable from any POSIX tr).
@@ -870,18 +878,328 @@ ez_systemd_config_files() {
     /^EnvironmentFiles=./ { v = substr($0, 18); sub(/[ \t].*$/, "", v); if (v != "") print "E " v }'
 }
 
-# ez_systemd_bound <cert-path> <systemctl-show-output> <config-text>
+# Paths a unit runs from, from "systemctl show" output: "W <dir>" for
+# WorkingDirectory, "P <exe>" for the executable of EVERY ExecStart command
+# and "A <path>" for what a shell runs (see below).
+#
+# Every ExecStart command counts: "systemctl show" prints one
+# "ExecStart={ path=... ; argv[]=... ; ignore_errors=... ; ... }" line per
+# command (argv joined with spaces, without quoting); several blocks on one
+# line are accepted as well.  Further lines:
+#   "R <path>"  every other absolute path in an argument (references, used
+#               only to detect ambiguity, never as a run path),
+#   "X <why>"   the command cannot be analysed safely; ez_systemd_ip_root
+#               then refuses the unit.
+# Shells (/bin/sh, /bin/bash, also below /usr): "<shell> <script> [args]"
+# gives "A <script>" (absolute only).  "<shell> -c <command>" is accepted
+# only in the narrow form of ONE simple command "[exec] /absolute/program
+# [args]" made of the characters A-Z a-z 0-9 . _ / @ + = : , - space tab:
+# the program is "A", every other absolute path "R".  No control operator
+# (; & && || |), redirection, assignment, cd, builtin (set -e, false, ...),
+# relative program, $, backtick, quote, parenthesis, brace, glob or
+# backslash: the shell semantics of anything else are not modelled, so it
+# gives "X" (false negatives accepted, no false positive).  Nothing is
+# expanded or executed.  Other shell
+# options, a block that cannot be parsed or an argument that names an
+# IntegrationPlatform installation without an absolute path (e.g.
+# "${APP}/IntegrationPlatform_X") give "X".  The values are not validated
+# here.
+ez_systemd_run_paths() {
+  printf '%s\n' "$1" | LC_ALL=C awk '
+    function isshell(p) { return p ~ /^\/(usr\/)?bin\/(ba)?sh$/ }
+    function refs(s,   t, p, hit) {
+      t = " " s; hit = 0
+      while (match(t, /[^A-Za-z0-9._\/@+-]\/[A-Za-z0-9._\/@+-]*/)) {
+        p = substr(t, RSTART + 1, RLENGTH - 1)
+        print "R " p
+        if (tolower(p) ~ /integrationplatform/) hit = 1
+        t = substr(t, RSTART + RLENGTH)
+      }
+      # Named without a plain absolute path, or next to variable, command
+      # substitution or home syntax ("${APP}/IntegrationPlatform_X").
+      if (tolower(s) ~ /integrationplatform/ && ((!hit && s ~ /\//) || s ~ /[$`~]/)) print "X unresolved-reference"
+    }
+    # "-c": only ONE simple command "[exec] /absolute/program [args]" of
+    # plain words; everything else (control operators, assignments, cd,
+    # builtins, relative programs, any other shell syntax) is X.
+    function shc(cmd,   n, w, m, v, j) {
+      if (cmd ~ /[^A-Za-z0-9._\/@+=:, \t-]/) { print "X shell-c-syntax"; return }
+      n = split(cmd, w, /[ \t]+/); m = 0
+      for (j = 1; j <= n; j++) if (w[j] != "") v[++m] = w[j]
+      j = 1
+      if (j <= m && v[j] == "exec") j++
+      if (j > m || substr(v[j], 1, 1) != "/") { print "X shell-c-command"; return }
+      print "A " v[j]
+      for (j++; j <= m; j++) refs(v[j])
+    }
+    function block(exe, argv,   n, t, m, v, i, cmd) {
+      print "P " exe
+      n = split(argv, t, /[ \t]+/); m = 0
+      for (i = 1; i <= n; i++) if (t[i] != "") v[++m] = t[i]
+      if (isshell(exe)) {
+        if (m < 2) return
+        if (v[2] == "-c") {
+          cmd = ""
+          for (i = 3; i <= m; i++) cmd = cmd " " v[i]
+          shc(cmd)
+          return
+        }
+        if (substr(v[2], 1, 1) == "-") { print "X shell-option"; return }
+        if (substr(v[2], 1, 1) == "/") print "A " v[2]; else refs(v[2])
+        for (i = 3; i <= m; i++) refs(v[i])
+        return
+      }
+      for (i = 2; i <= m; i++) refs(v[i])
+    }
+    /^ExecStart=/ {
+      s = substr($0, 11); nb = 0
+      while ((i = index(s, "{ path=")) > 0) {
+        s = substr(s, i + 7)
+        j = index(s, " ; argv[]=")
+        if (j == 0) { print "X exec-block"; break }
+        exe = substr(s, 1, j - 1)
+        s = substr(s, j + 10)
+        k = index(s, " ; ignore_errors=")
+        if (k == 0) k = index(s, " ; flags=")
+        if (k == 0) { print "X exec-block"; break }
+        nb++
+        block(exe, substr(s, 1, k - 1))
+        s = substr(s, k + 3)
+      }
+      if (nb == 0 && substr($0, 11) !~ /^[ \t]*$/) print "X exec-block"
+    }
+    /^WorkingDirectory=/ { w = substr($0, 18); sub(/^[-!]/, "", w); print "W " w }'
+}
+
+# The one IntegrationPlatform installation directory a unit runs from
+# (ez_systemd_run_paths), fail closed:
+#   - any "X" line refuses the unit,
+#   - every W/P/A path and every R path below an allowed root that names an
+#     IntegrationPlatform component must resolve with ez_ip_root, and all of
+#     them must give the SAME installation (IntegrationPlatform_PI and
+#     IntegrationPlatform_PI2 are different installations),
+#   - at least one of them must be a run path (W/P/A); a mere reference such
+#     as "rsync /srv/IntegrationPlatform_PI/conf /backup" is not enough.
+# Prints the installation directory or fails.
+ez_systemd_ip_root() {
+  local kind value root found="" run=no allowed under
+
+  while IFS=' ' read -r kind value; do
+    case "$kind" in
+      X) return 1 ;;
+      W|P|A|R) ;;
+      *) continue ;;
+    esac
+    [ -n "$value" ] || continue
+    case "$(ez_lower "$value")" in
+      *integrationplatform*) ;;
+      *) continue ;;
+    esac
+    if [ "$kind" = R ]; then
+      # References outside the allowed roots cannot name an installation.
+      under=no
+      for allowed in $EZ_ALLOWED_ROOTS; do
+        case "$value" in
+          "$allowed"/*) under=yes ;;
+        esac
+      done
+      [ "$under" = yes ] || continue
+    fi
+    root="$(ez_ip_root "$value")" || return 1
+    if [ -z "$found" ]; then
+      found="$root"
+    elif [ "$found" != "$root" ]; then
+      return 1
+    fi
+    [ "$kind" = R ] || run=yes
+  done <<EOF
+$(ez_systemd_run_paths "$1")
+EOF
+  [ -n "$found" ] && [ "$run" = yes ] || return 1
+  printf '%s' "$found"
+}
+
+# "<uid> <gid>" (primary group) of the unit's User= from "systemctl show"
+# output; the trusted ids $2/$3 (root) when User= is empty.  Only a plain
+# user name or number that resolves through "id" is accepted.
+ez_systemd_app_ids() {
+  local user uid gid
+
+  [ "$(printf '%s\n' "$1" | grep -c '^User=')" -le 1 ] || return 1
+  user="$(printf '%s\n' "$1" | sed -n 's/^User=//p')"
+  if [ -z "$user" ]; then
+    printf '%s %s' "$2" "$3"
+    return 0
+  fi
+  case "$user" in
+    -*|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  [ "${#user}" -le 32 ] || return 1
+  uid="$(id -u -- "$user" 2>/dev/null)" && gid="$(id -g -- "$user" 2>/dev/null)" || return 1
+  case "$uid:$gid" in
+    *[!0-9:]*|:*|*::*|*:) return 1 ;;
+  esac
+  printf '%s %s' "$uid" "$gid"
+}
+
+# ez_pi_parents_ok <fs-prefix> <ip-root> <trusted-uid> <trusted-gid>
+# Every directory from / down to the parent of an IntegrationPlatform
+# installation directory is root-controlled: ez_target_dir_ok without a
+# second principal (owner root, group write only for the root group, never
+# world writable, not a symlink), e.g. /srv as root:root 775.
+ez_pi_parents_ok() {
+  local prefix="$1" root="$2" tuid="$3" tgid="$4" current="" rest part
+
+  ez_path_under_roots "$root" || return 1
+  ez_target_dir_ok "$prefix/" "$tuid" "$tgid" || return 1
+  rest="${root#/}"
+  while :; do
+    case "$rest" in
+      */*) part="${rest%%/*}"; rest="${rest#*/}" ;;
+      *) return 0 ;;
+    esac
+    current="$current/$part"
+    ez_target_dir_ok "$prefix$current" "$tuid" "$tgid" || return 1
+  done
+}
+
+# ez_pi_tree_ok <fs-prefix> <ip-root> <trusted-uid> <trusted-gid> <app-uid> <app-gid>
+# The installation directory, every directory below it down to WEB-INF and
+# appConfig.properties itself belong to root or to the application user of
+# the unit (User=): owner root or that user, group write only for the root
+# group or the user's primary group, never world writable, no symlink.  The
+# file is a regular file with one hard link and at most
+# EZ_PI_APPCONFIG_MAX_BYTES bytes.  Matches the real model itgo:itgo 775.
+ez_pi_tree_ok() {
+  local prefix="$1" root="$2" tuid="$3" tgid="$4" auid="$5" agid="$6" file current rest part meta links owner group mode size
+
+  case "$tuid:$tgid:$auid:$agid" in
+    *[!0-9:]*|:*|*::*|*:) return 1 ;;
+  esac
+  ez_path_under_roots "$root" || return 1
+  file="$root/$EZ_PI_APPCONFIG_REL"
+  ez_path_under_roots "$file" || return 1
+  ez_path_no_symlinks "$prefix" "$file" || return 1
+  current="$root"
+  rest="$EZ_PI_APPCONFIG_REL"
+  while :; do
+    ez_target_dir_ok "$prefix$current" "$tuid" "$tgid" "$auid" "$agid" || return 1
+    case "$rest" in
+      */*) part="${rest%%/*}"; rest="${rest#*/}"; current="$current/$part" ;;
+      *) break ;;
+    esac
+  done
+  [ -f "$prefix$file" ] && [ ! -L "$prefix$file" ] || return 1
+  meta="$(stat -c '%h %u %g %a %s' -- "$prefix$file" 2>/dev/null)" || return 1
+  read -r links owner group mode size <<EOF
+$meta
+EOF
+  case "$links:$owner:$group:$mode:$size" in
+    *[!0-9:]*|:*|*::*|*:) return 1 ;;
+  esac
+  [ "$links" = 1 ] || return 1
+  [ "$owner" = "$tuid" ] || [ "$owner" = "$auid" ] || return 1
+  [ $((8#$mode & 8#002)) -eq 0 ] || return 1
+  if [ $((8#$mode & 8#020)) -ne 0 ]; then
+    [ "$group" = "$tgid" ] || [ "$group" = "$agid" ] || return 1
+  fi
+  [ "$size" -le "$EZ_PI_APPCONFIG_MAX_BYTES" ]
+}
+
+# ez_pi_appconfig_trusted <fs-prefix> <ip-root> <trusted-uid> <trusted-gid> <app-uid> <app-gid>
+# Narrow trust policy for appConfig.properties of one IntegrationPlatform
+# installation (ez_pi_parents_ok and ez_pi_tree_ok).  <ip-root> must itself be
+# an installation directory (its own ez_ip_root).  Used only for SSL.patch
+# evidence; helper_path_trusted / helper_node_trusted are not affected.
+ez_pi_appconfig_trusted() {
+  [ "$(ez_ip_root "$2")" = "$2" ] || return 1
+  ez_pi_parents_ok "$1" "$2" "$3" "$4" && ez_pi_tree_ok "$@"
+}
+
+# Prints a file for SSL.patch evidence: at most EZ_PI_APPCONFIG_MAX_BYTES
+# bytes and no NUL byte (a shell variable would silently drop it).
+ez_pi_appconfig_load() {
+  local size
+
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  size="$(ez_file_size "$1")"
+  case "$size" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$size" -le "$EZ_PI_APPCONFIG_MAX_BYTES" ] || return 1
+  [ "$(tr -d '\000' < "$1" | wc -c | tr -d ' ')" = "$size" ] || return 1
+  cat -- "$1"
+}
+
+# Reads appConfig.properties text on stdin; true when it has at least one
+# active SSL.patch entry and every one of them is exactly the path $1.
+# Only the line structure of java.util.Properties is followed, nothing is
+# interpreted or expanded:
+#   - leading whitespace (space, tab, form feed) is ignored, "#"/"!" lines
+#     are comments (never continued), CRLF is accepted,
+#   - the key is "SSL.patch" (case-sensitive), separated by "=", ":" or
+#     whitespace; whitespace around the value is trimmed,
+#   - a line continued from the previous one (odd number of trailing
+#     backslashes) is never an entry,
+#   - fail closed: an escaped key (backslash), an SSL.patch entry that is
+#     continued, an SSL.patch-like continuation line or a bare CR (another
+#     line terminator) make the whole file unusable as evidence.
+# Commented, prefixed, suffixed (.bak) or escaped values never match.
+ez_pi_ssl_patch_is() {
+  ez_path_chars_ok "$1" || return 1
+  LC_ALL=C awk -v want="$1" '
+    function odd_bs(s) { return match(s, /\\+$/) && RLENGTH % 2 == 1 }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      if (index(line, "\r") > 0) { bad = 1; exit }
+      s = line
+      sub(/^[ \t\f]+/, "", s)
+      if (cont) {
+        if (index(s, "SSL.patch") == 1) bad = 1
+        cont = odd_bs(line)
+        next
+      }
+      if (s == "" || s ~ /^[#!]/) next
+      cont = odd_bs(line)
+      match(s, /^[^ \t\f=:]*/)
+      key = substr(s, 1, RLENGTH)
+      rest = substr(s, RLENGTH + 1)
+      if (index(key, "\\") > 0) { bad = 1; next }
+      if (key != "SSL.patch") next
+      n++
+      if (cont) { bad = 1; next }
+      sub(/^[ \t\f]+/, "", rest)
+      c = substr(rest, 1, 1)
+      if (c == "=" || c == ":") rest = substr(rest, 2)
+      sub(/^[ \t\f]+/, "", rest)
+      sub(/[ \t\f]+$/, "", rest)
+      if (rest != want) bad = 1
+    }
+    END { exit (n > 0 && !bad) ? 0 : 1 }'
+}
+
+# ez_systemd_bound <cert-path> <systemctl-show-output> <config-text> [<pi-appconfig-text>]
 # Proves a relation between a certificate file and a systemd unit:
 #   A. the exact certificate path appears in the unit properties (ExecStart,
 #      Environment, ...) or in the unit/drop-in/environment file contents
 #      (comment lines ignored), or
 #   B. the certificate lies in an IntegrationPlatform installation directory
-#      and the unit runs from that SAME directory: its WorkingDirectory, its
-#      ExecStart executable, or the script started by /bin/sh|bash, lies in
-#      it.  A common parent such as /srv is never enough.
+#      and the unit runs from exactly that installation: ez_systemd_ip_root
+#      (every ExecStart command, shell and WorkingDirectory; no X record, no
+#      second installation) is that SAME directory.  Commands outside any
+#      installation do not matter.  A common parent such as /srv is never
+#      enough, or
+#   C. classic Integration Platform: <pi-appconfig-text> is the content of
+#      <ip-root>/$EZ_PI_APPCONFIG_REL of the one installation the unit runs
+#      from (ez_systemd_ip_root: all ExecStart commands, shells and
+#      WorkingDirectory unambiguous), read by the caller only after
+#      ez_pi_appconfig_trusted, and its SSL.patch names exactly the
+#      certificate (ez_pi_ssl_patch_is).  The certificate may lie anywhere
+#      (e.g. /srv/CERTYFIKATY); its location alone is never evidence.
 # Prints the reason and returns 0, or returns 1.
 ez_systemd_bound() {
-  local cert="$1" props="$2" config="$3" root kind value
+  local cert="$1" props="$2" config="$3" appcfg="${4:-}" root kind value
 
   ez_target_path_ok "$cert" || return 1
   if printf '%s\n' "$props" | ez_text_has_path "$cert"; then
@@ -892,30 +1210,31 @@ ez_systemd_bound() {
     printf 'plik unitu/drop-in/EnvironmentFile wskazuje dokładną ścieżkę certyfikatu'
     return 0
   fi
-  root="$(ez_ip_root "$cert")" || return 1
-  [ "$root" != "$cert" ] || return 1
-  while IFS=' ' read -r kind value; do
-    [ -n "$value" ] || continue
-    if ez_path_within "$value" "$root"; then
+  if root="$(ez_ip_root "$cert")" && [ "$root" != "$cert" ] &&
+     [ "$(ez_systemd_ip_root "$props")" = "$root" ]; then
+    # The unambiguous installation is the certificate's: name the run path.
+    while IFS=' ' read -r kind value; do
       case "$kind" in
-        W) printf 'WorkingDirectory w instalacji IntegrationPlatform %s' "$root" ;;
-        *) printf 'ExecStart w instalacji IntegrationPlatform %s' "$root" ;;
+        W|P|A) ;;
+        *) continue ;;
       esac
-      return 0
-    fi
-  done <<EOF
-$(printf '%s\n' "$props" | awk '
-  /^ExecStart=/ {
-    s = $0; exe = ""
-    if (match(s, /path=[^ ;]+/)) { exe = substr(s, RSTART + 5, RLENGTH - 5); print "P " exe }
-    if (exe ~ /^\/(usr\/)?bin\/(ba)?sh$/ && match(s, /argv\[\]=[^;]*/)) {
-      n = split(substr(s, RSTART + 7, RLENGTH - 7), t, /[ \t]+/); k = 0
-      for (i = 1; i <= n; i++) if (t[i] != "") { k++; if (k == 2) { print "A " t[i]; break } }
-    }
-  }
-  /^WorkingDirectory=/ { w = substr($0, 18); sub(/^[-!]/, "", w); print "W " w }')
+      [ -n "$value" ] || continue
+      if ez_path_within "$value" "$root"; then
+        case "$kind" in
+          W) printf 'WorkingDirectory w instalacji IntegrationPlatform %s' "$root" ;;
+          *) printf 'ExecStart w instalacji IntegrationPlatform %s' "$root" ;;
+        esac
+        return 0
+      fi
+    done <<EOF
+$(ez_systemd_run_paths "$props")
 EOF
-  return 1
+  fi
+  [ -n "$appcfg" ] || return 1
+  root="$(ez_systemd_ip_root "$props")" || return 1
+  printf '%s\n' "$appcfg" | ez_pi_ssl_patch_is "$cert" || return 1
+  printf '%s SSL.patch wskazuje certyfikat w instalacji IntegrationPlatform %s' \
+    "${EZ_PI_APPCONFIG_REL#apache-tomcat/webapps/}" "$root"
 }
 
 # ez_mount_covers <cert-path> <bind-source>: a Docker bind mount source covers

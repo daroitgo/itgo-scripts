@@ -51,10 +51,11 @@ All system files are written to a temporary file in the target directory,
 set to `root:root` and the final mode and renamed with `mv -f -T`.
 
 Caller, library and helper share a contract version (`HELPER API`, currently
-`3`; independent of the P1CERT version). `helper ping` prints `HELPER=OK`
-and `API_VERSION=3`; `p1cert ezdrowie` and the installer accept only exactly
+`4`; independent of the P1CERT version). `helper ping` prints `HELPER=OK`
+and `API_VERSION=4`; `p1cert ezdrowie` and the installer accept only exactly
 this version, and the helper refuses a root library with another version
-(API 1 and 2 components of earlier releases are incompatible).
+(API 1, 2 and 3 components of earlier releases, as well as unknown future or
+malformed versions, are incompatible).
 After a partial upgrade (new scripts, old helper) `run`/`schedule` therefore
 stop with "uprzywilejowany helper ma niezgodną wersję API" instead of using
 an incompatible helper.
@@ -311,13 +312,70 @@ Service detection offers only restarts the root helper can prove later:
 
 - a systemd unit whose configuration (`ExecStart`, `Environment`, unit file,
   drop-ins, `EnvironmentFile`) names the exact certificate path, or whose
-  `WorkingDirectory`, `ExecStart` executable (or the script started by
-  `/bin/sh`/`/bin/bash`) lies in the same IntegrationPlatform installation
-  directory as the certificate (e.g. certificate
-  `/srv/IntegrationPlatform_PI/conf/ezdrowiegovpl.pem` and
+  one unambiguous IntegrationPlatform installation (same rule as below:
+  `WorkingDirectory`, every `ExecStart` command, what `/bin/sh`/`/bin/bash`
+  runs) is the installation directory that contains the certificate (e.g.
+  certificate `/srv/IntegrationPlatform_PI/conf/ezdrowiegovpl.pem` and
   `ExecStart=/srv/IntegrationPlatform_PI/apache-tomcat/bin/startup.sh`);
-  a common parent such as `/srv` is not enough; system units on a deny-list
+  commands outside any installation do not matter, but a unit that also
+  runs or references `IntegrationPlatform_PI2`, or a command that cannot be
+  analysed, is not bound; a common parent such as `/srv` is not enough;
+  system units on a deny-list
   (sshd, systemd-*, docker, network, cron, ...) are never offered,
+- a systemd unit of the classic Integration Platform (Tomcat `p1-war`) when
+  the certificate lies outside the installation (e.g.
+  `/srv/CERTYFIKATY/ezdrowieGovPl.cer`) and is named by `SSL.patch` in
+  `<installation>/apache-tomcat/webapps/p1-war/WEB-INF/appConfig.properties`
+  of exactly the IntegrationPlatform installation the unit runs from
+  (`WorkingDirectory` / `ExecStart`, e.g.
+  `WorkingDirectory=/srv/IntegrationPlatform_TST/apache-tomcat` and
+  `ExecStart=/srv/IntegrationPlatform_TST/apache-tomcat/bin/startup.sh`).
+  The plan then shows, for example,
+  `systemctl restart pi_tst.service - p1-war/WEB-INF/appConfig.properties
+  SSL.patch wskazuje certyfikat w instalacji IntegrationPlatform
+  /srv/IntegrationPlatform_TST`. Rules:
+  - only an active entry counts whose value, after trimming the usual
+    properties whitespace (`SSL.patch=...`, `SSL.patch = ...`,
+    `SSL.patch: ...`, CRLF), is exactly the certificate path; comments
+    (`#`, `!`), other certificates, prefixes, suffixes (`.bak`), quotes,
+    variables, `$(...)`/backticks and escapes never match - nothing is
+    expanded or interpreted,
+  - every `SSL.patch` entry of the file must name the certificate; an entry
+    that is continued (`\` at the end of the line), a line continued from
+    the previous one that looks like `SSL.patch`, a key with a backslash
+    escape or a bare CR make the file unusable as evidence (fail closed),
+  - the unit must run from exactly one installation (fail closed):
+    `WorkingDirectory`, the executable of EVERY `ExecStart` command (one
+    `ExecStart=` line per command in `systemctl show`; several
+    `{ path=... }` blocks on one line are accepted too), what a shell runs and
+    every absolute path in the arguments that lies below `/srv`, `/opt` or
+    `/usr/local` and names an IntegrationPlatform component must all name
+    the same installation (`IntegrationPlatform_PI` and
+    `IntegrationPlatform_PI2` are different), and at least one of them must
+    be a run path (a mere argument such as
+    `rsync /srv/IntegrationPlatform_PI/conf /backup` is not enough),
+  - shells (`/bin/sh`, `/bin/bash`, also in `/usr/bin`):
+    `sh <absolute script> [args]` runs that script; `sh -c <command>` is
+    accepted only in the narrow form of ONE simple command
+    `[exec] /absolute/program [args]` made of plain words (`A-Z a-z 0-9 .
+    _ / @ + = : , -`), e.g.
+    `sh -c 'exec /srv/IntegrationPlatform_X/apache-tomcat/bin/startup.sh'`.
+    Shell semantics are not modelled, so anything else refuses the unit
+    (false negatives are accepted, false positives are not): control
+    operators (`;`, `&`, `&&`, `||`, `|`), redirections, `cd`, builtins
+    (`set -e`, `false`, ...), assignments, relative programs, variables
+    (`$X`, `${X}`), `$(...)`, backticks, quotes, parentheses, braces, globs,
+    backslashes, other shell options (`-l`, `-e`, `-ec`, ...), an
+    unparseable `ExecStart` or an installation named without a plain
+    absolute path; nothing is expanded or executed,
+  - the existence of `appConfig.properties`, the name
+    `IntegrationPlatform`, the certificate directory or a common parent such
+    as `/srv` are never evidence; an `appConfig.properties` of a sibling
+    installation (`IntegrationPlatform_PI2` next to `IntegrationPlatform_PI`)
+    binds only the unit of that sibling,
+  - `appConfig.properties` and its directories must satisfy the narrow
+    application policy described under *Privileged helper* (otherwise the unit is
+    not offered; the root helper would refuse it),
 - Docker Compose services whose volumes, configs, secrets, `env_file`,
   environment or `.env` variables cover the file (static analysis of the
   compose file). Before a restart the helper additionally requires that the
@@ -475,7 +533,7 @@ target file and of the exact stdin bytes approved in the plan. For a single
 certificate the source digest binds the file passed on stdin; the helper may
 still re-encode it to the target's PEM/DER format. A PEM chain is written
 unchanged, so the installed file has exactly the source digest. The
-caller <-> helper <-> library contract is API version 3; any other version on
+caller <-> helper <-> library contract is API version 4; any other version on
 either side is refused before any certificate operation.
 
 The new certificate is passed on stdin. There is no standalone restart,
@@ -523,9 +581,36 @@ group/world writable. It then re-validates every argument on its own:
   automatic restart; this applies also to an optional `EnvironmentFile`
   that does not exist yet); the
   relation to the certificate must satisfy the rules described under *plan*
-  (exact path in the unit configuration, or the same IntegrationPlatform
-  installation directory). It is checked before the replacement and again
-  right before the restart,
+  (exact path in the unit configuration, the same IntegrationPlatform
+  installation directory, or `SSL.patch` of the classic Integration
+  Platform). It is checked before the replacement and again right before
+  the restart,
+- classic Integration Platform (`SSL.patch`): the helper derives the
+  installation itself from the unit (`systemctl show`, root-controlled unit
+  file as above) and reads only
+  `<installation>/apache-tomcat/webapps/p1-war/WEB-INF/appConfig.properties`
+  of that installation; nothing the caller found is used. This file belongs
+  to the application (production: `itgo:itgo 775`), so the root-controlled
+  rule above does not apply to it; instead a narrow policy used only for this
+  evidence applies, with the unit's `User=` (resolved with `id`; an empty
+  `User=` means root, an unknown or malformed one gives no evidence) as the
+  only principal besides root:
+  - `/` and every directory above the installation (e.g. `/srv`) are owned
+    by root, writable by group only for the `root` group, never by others,
+    not symlinks (`root:root 775` is accepted),
+  - the installation directory, every directory below it down to `WEB-INF`
+    and `appConfig.properties` are owned by root or by the unit user,
+    writable by group only for the `root` group or the unit user's primary
+    group, never by others, not symlinks (`itgo:itgo 775` with `User=itgo`
+    is accepted; a tree of another user, a foreign writable group or a
+    world-writable node is refused),
+  - `appConfig.properties` is a regular file with one hard link, at most
+    256 KiB, without NUL bytes; it is read by name from its pinned
+    directory (`cd -P`, policy re-checked) with
+    `O_NOFOLLOW`/`O_NONBLOCK`/`O_NOCTTY`; the entry must be the validated
+    device:inode (regular file, one link) right before the open and again
+    after the read, and the copy must have its size (see *Limitations* for
+    the remaining window),
 - Docker Compose: the project directory must contain a standard compose file
   (`compose.yaml`, `compose.yml`, `docker-compose.yaml`,
   `docker-compose.yml`); the compose files themselves are not parsed and
@@ -610,6 +695,49 @@ this is accepted.
   installation must likewise run from a root-owned directory. An offline
   source must be a trusted artifact: the staging prevents substitution after
   the copy, but does not prove the authenticity of the bundle itself.
+- `SSL.patch` evidence: `appConfig.properties`, controlled by the unit's
+  `User=` (or root), is part of the binding proof. The application user
+  alone cannot start the root helper - only the P1CERT user has the sudoers
+  entry, so this needs the P1CERT permissions separately - and a restart
+  happens only inside an operation started by an authorised P1CERT
+  operator (plan/run/schedule, or a direct helper call by that operator).
+  The P1CERT operator and `User=` of the unit may be different accounts:
+  the operator can then restart a proven unit that runs as another user.
+  The safety of this binding therefore rests on the combination of a
+  root-controlled systemd unit, one unambiguous IntegrationPlatform
+  installation derived from it, `appConfig.properties` from an application
+  tree owned only by root or `User=` (with the allowed group write, e.g.
+  `itgo:itgo 775`, every member of the `root` group or of the primary group
+  of `User=` can modify its entries as well, and so takes part in that
+  evidence), an exact `SSL.patch` value and
+  the authorised caller/helper; it is not a guarantee that the evidence
+  grants the application user or the operator nothing. Whoever can edit
+  `appConfig.properties` (or the installation tree) can point `SSL.patch` at
+  another ezdrowie certificate and so make an operator's replacement of that
+  certificate restart this unit. POSIX ACLs and
+  Tomcat/Spring property sources other than this one file (system
+  properties, other `.properties` files, `JAVA_OPTS`) are not evaluated.
+  Only the line structure of `java.util.Properties` is followed; unusual
+  but valid syntax (escapes, continuation lines around `SSL.patch`) is
+  refused rather than interpreted, so such a unit is simply not offered.
+  Only `ExecStart` and `WorkingDirectory` are analysed (not `ExecStartPre`,
+  `Environment` variables or what a script does internally); a directory
+  such as `apache-tomcat` that is a symlink (e.g. to a versioned Tomcat
+  directory) makes the evidence unusable.
+- `appConfig.properties` read window: Bash has no `openat`/`fstat`, so the
+  read is by name between two identity checks, not bound to an open
+  descriptor. A symlink, FIFO or device swapped in is never followed or
+  blocked on (`O_NOFOLLOW`/`O_NONBLOCK`), and a new inode, a hard link or a
+  copy of another size is detected. A principal that can modify `WEB-INF`
+  (by the policy root, the unit's `User=` and, with group write, members of
+  the `root` group or of the primary group of `User=`) can still put another regular
+  file there for the read and the validated inode back before the second
+  check (A-B-A swap of the same size); its content is then used as
+  evidence. The binding is checked again right before the restart, so such a
+  swap has to be repeated for that check as well. That principal controls
+  the real file anyway; with `fs.protected_hardlinks=0` it could also use a
+  hard link to a file it cannot read, whose content is only parsed for
+  `SSL.patch` and never output.
 - SAN parsing relies on the text output of `openssl x509 -text`; exotic SAN
   types whose printed value contains `, DNS:` could be misread. Sources are
   expected to be CA-issued ezdrowie.gov.pl certificates.

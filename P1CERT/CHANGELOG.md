@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+- `p1cert ezdrowie`: classic Integration Platform (Tomcat `p1-war`) support
+  for certificates outside the installation. A systemd unit is detected and
+  may be restarted when `SSL.patch` in
+  `<installation>/apache-tomcat/webapps/p1-war/WEB-INF/appConfig.properties`
+  of exactly the IntegrationPlatform installation the unit runs from
+  (`WorkingDirectory`/`ExecStart`) names the certificate, e.g.
+  `/srv/CERTYFIKATY/ezdrowieGovPl.cer` with
+  `ExecStart=/srv/IntegrationPlatform_TST/apache-tomcat/bin/startup.sh`;
+  the plan now shows `systemctl restart <unit>` instead of `NIE WYKRYTO`.
+  Only an exact active entry counts (properties whitespace and CRLF
+  trimmed); comments, other paths, prefixes/suffixes such as `.bak`,
+  quotes, variables, command substitution, escapes and continuation lines
+  never match, a second `SSL.patch` with another value disables the
+  evidence, nothing is expanded or evaluated. The unit must run from exactly
+  one installation: `WorkingDirectory`, every `ExecStart` command (one line
+  per command or several blocks on one line), what `sh`/`bash` runs (a
+  direct absolute script, or `-c` only as ONE simple command
+  `[exec] /absolute/program [args]` without control operators, `cd`,
+  builtins or assignments) and absolute arguments below the
+  allowed roots must all name the same installation; two installations
+  (`IntegrationPlatform_PI` vs `_PI2`), variables, `$(...)`, backticks,
+  quotes and other shell syntax or options refuse the unit. A sibling
+  installation, the certificate directory or a common parent such as `/srv`
+  is never evidence. Rule B (certificate inside the installation) now
+  requires the same unambiguous installation of the whole unit: a unit that
+  also runs or references a second installation, or has a command that
+  cannot be analysed, is no longer bound (commands outside any installation
+  still do not matter). The restart target is
+  still `systemd|<unit>`; `PLAN_VERSION=2` is unchanged. The root helper
+  re-derives the installation from the unit and re-proves the binding on
+  its own, before the replacement and again before the restart, under a
+  narrow policy used only for this file: parents above the installation
+  root-controlled (`root:root 775` accepted), installation tree and
+  `appConfig.properties` owned by root or the unit's `User=` with group
+  write only for root or that user's primary group (`itgo:itgo 775`
+  accepted), never world writable, no symlink, one hard link, at most
+  256 KiB, no NUL, read by name with `O_NOFOLLOW`/`O_NONBLOCK` between two
+  device:inode checks (not descriptor-bound: a same-size A-B-A swap by the
+  owner of `WEB-INF` is not detected by the read, see README). The
+  existing `helper_node_trusted`/`helper_path_trusted` rules for unit,
+  drop-in and environment files are unchanged. The WorkingDirectory/
+  ExecStart analysis is shared by the old and the new rule
+  (`ez_systemd_run_paths`, `ez_systemd_ip_root`); certificates inside an
+  installation, exact paths in the unit configuration and Docker Compose
+  behave as before.
+- Helper contract API 4 (helper, library, caller and installer): the
+  binding semantics above change the caller/library/helper contract.
+  Operations, arguments and results are unchanged, but API 1, 2 and 3
+  components (and unknown or malformed versions) next to API 4 components
+  refuse to work (partial upgrade); re-run the installer.
 - `p1cert ezdrowie`: certificate target directories may be owned by root or
   by the P1CERT user (the sudo caller, also for the scheduled run) and may be
   group-writable for the `root` group or the P1CERT user's group (e.g.

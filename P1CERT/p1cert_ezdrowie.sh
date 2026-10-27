@@ -62,7 +62,9 @@ EZ_HELPER='/usr/local/libexec/itgo-p1cert/p1cert-ezdrowie-helper'
 # the P1CERT release version).  2: PEM chains, apply with old/new file SHA-256.
 # 3: root/operator owned, group-writable target directories (ez_target_dir_ok)
 # with descriptor/inode bound replacement; an API 2 helper is refused.
-EZ_HELPER_API=3
+# 4: systemd binding through SSL.patch of the classic Integration Platform
+# (ez_systemd_bound rule C); helpers of API 1-3 are refused.
+EZ_HELPER_API=4
 EZ_SERVICE_UNIT='itgo-p1cert-ezdrowie.service'
 EZ_TIMER_UNIT='itgo-p1cert-ezdrowie.timer'
 # Trusted owner/group of target directories besides the P1CERT user itself
@@ -883,13 +885,35 @@ ez_scan() {
 # Application / service detection
 # ---------------------------------------------------------------------------
 
+# appConfig.properties of the IntegrationPlatform installation a unit runs
+# from (ez_systemd_ip_root), printed only when it satisfies the same narrow
+# policy the root helper enforces (ez_pi_appconfig_trusted with the unit's
+# User=); nothing otherwise.
+ez_detect_pi_appconfig() {
+  local props="$1" root ids auid agid file
+
+  root="$(ez_systemd_ip_root "$props")" || return 1
+  file="$(fs_path "$root/$EZ_PI_APPCONFIG_REL")"
+  [ -e "$file" ] || [ -L "$file" ] || return 1
+  ids="$(ez_systemd_app_ids "$props" "$EZ_TRUSTED_UID" "$EZ_TRUSTED_GID")" || return 1
+  read -r auid agid <<EOF
+$ids
+EOF
+  ez_pi_appconfig_trusted "${P1CERT_FS_ROOT:-}" "$root" "$EZ_TRUSTED_UID" "$EZ_TRUSTED_GID" "$auid" "$agid" || {
+    ez_log "appConfig.properties of $root is not controlled only by root and the unit user; not used for detection"
+    return 1
+  }
+  ez_pi_appconfig_load "$file"
+}
+
 # Prints "systemd|<unit>|<reason>" for units that satisfy the same binding
 # rule the root helper enforces before a restart (ez_systemd_bound): the unit
-# configuration names the exact certificate path, or the unit runs from the
-# same IntegrationPlatform installation directory that contains the file.
-# Denied system units are never offered.
+# configuration names the exact certificate path, the unit runs from the
+# same IntegrationPlatform installation directory that contains the file, or
+# SSL.patch in appConfig.properties of the installation the unit runs from
+# names exactly the certificate.  Denied system units are never offered.
 ez_detect_systemd() {
-  local cert="$1" dir fsdir file unit seen=" " props config kind path reason
+  local cert="$1" dir fsdir file unit seen=" " props config kind path reason appcfg
 
   command -v systemctl >/dev/null 2>&1 || return 0
   for dir in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
@@ -904,7 +928,7 @@ ez_detect_systemd() {
       ez_unit_denied "$unit" && continue
 
       props="$(systemctl show --no-pager -p LoadState -p FragmentPath -p DropInPaths \
-        -p WorkingDirectory -p ExecStart -p Environment -p EnvironmentFiles -- "$unit" 2>/dev/null)" || continue
+        -p WorkingDirectory -p ExecStart -p Environment -p EnvironmentFiles -p User -- "$unit" 2>/dev/null)" || continue
       printf '%s\n' "$props" | grep -F -x -q 'LoadState=loaded' || continue
       config=""
       while IFS=' ' read -r kind path; do
@@ -917,7 +941,8 @@ $(cat -- "$path" 2>/dev/null)"
       done <<EOF
 $(ez_systemd_config_files "$props")
 EOF
-      reason="$(ez_systemd_bound "$cert" "$props" "$config")" || continue
+      appcfg="$(ez_detect_pi_appconfig "$props")" || appcfg=""
+      reason="$(ez_systemd_bound "$cert" "$props" "$config" "$appcfg")" || continue
       printf 'systemd|%s|%s\n' "$unit" "$reason"
     done
   done
