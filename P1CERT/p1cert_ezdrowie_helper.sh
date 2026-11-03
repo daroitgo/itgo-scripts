@@ -1353,13 +1353,14 @@ helper_dc_single_unit() {
   return 0
 }
 
-# Services referencing <path> explicitly in H_MODEL: "svc<TAB>origin" lines.
+# Services referencing <path> explicitly in H_MODEL:
+# "svc<TAB>container-path<TAB>origin" lines.
 helper_dc_refs() {
   local path="$1" t a b c d
 
   while IFS="$(printf '\034')" read -r t a b c d; do
     [ "$t" = REF ] && [ "$b" = "$path" ] || continue
-    printf '%s\t%s\n' "$a" "$d"
+    printf '%s\t%s\t%s\n' "$a" "$c" "$d"
   done <<EOF
 $H_MODEL
 EOF
@@ -1379,35 +1380,38 @@ helper_dc_pw_file() {
 }
 
 # Binds and reads the password of keystore <path> exactly like discover
-# (ez_dc_pw_stem/ez_dc_pw_base/ez_dc_pw_named over the password variables of
+# (ez_dc_pw_stem/ez_dc_pw_base/ez_dc_pw_match over the password variables of
 # the services that reference it): no reference may bind several variables,
 # at least one must bind one, and all bound values must be equal.  Sets
 # EZS_PASSWORD.
 helper_dc_password() {
-  local path="$1" svc origin t a b c d stem base n cands bound="" value first=yes upper explicit=0 nl
+  local path="$1" svc cont origin t a b c d stem base cbase n cands bound="" value first=yes upper explicit=0 nl
 
   nl='
 '
   EZS_PASSWORD=""
   [ -z "$DCI_ENVFILE" ] || explicit=1
-  while IFS="$(printf '\t')" read -r svc origin; do
+  while IFS="$(printf '\t')" read -r svc cont origin; do
     [ -n "$svc" ] || continue
     cands=""
     if stem="$(ez_dc_pw_stem "$origin")"; then
       while IFS="$(printf '\034')" read -r t a b c d; do
         [ "$t" = PW ] && [ "$a" = "$svc" ] || continue
         upper="$(printf '%s' "$b" | tr '[:lower:]' '[:upper:]')"
-        ! ez_dc_pw_named "$upper" "$stem" || cands="$cands$a|$b|$d$nl"
+        ! ez_dc_pw_match "$upper" "$c" "$stem" || cands="$cands$a|$b|$d$nl"
       done <<EOF
 $H_MODEL
 EOF
     fi
     if [ -z "$cands" ]; then
       base="$(ez_dc_pw_base "$path")"
+      cbase="$(ez_dc_pw_base "$cont")"
       while IFS="$(printf '\034')" read -r t a b c d; do
         [ "$t" = PW ] && [ "$a" = "$svc" ] || continue
         upper="$(printf '%s' "$b" | tr '[:lower:]' '[:upper:]')"
-        ! ez_dc_pw_named "$upper" "$base" suffix || cands="$cands$a|$b|$d$nl"
+        ez_dc_pw_match "$upper" "$c" "$base" suffix || ez_dc_pw_match "$upper" "$c" "$cbase" suffix ||
+          continue
+        cands="$cands$a|$b|$d$nl"
       done <<EOF
 $H_MODEL
 EOF

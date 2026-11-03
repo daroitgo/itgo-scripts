@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Fix (Docker discovery): a relative certificate/keystore path of a service
+  without `working_dir` is resolved when exactly one host file is reachable
+  through a mount of that service (otherwise still reported as unmapped);
+  a relative `*_FILE` password path uses `working_dir`. A keystore password
+  also binds through the container file name and through the variable a
+  password variable is set from (`KS_SECRET: ${P1_KEYSTORE_PASSWORD}`); the
+  root helper binds the same way. A P1 file found only in a mounted
+  directory, without a reference in the configuration, is reported in
+  `plan` (`INFO ... pominięty, nie blokuje aplikacji`) and no longer blocks
+  the application nor counts as a second user of an explicitly referenced
+  file; a referenced P1 keystore that cannot be handled still refuses the
+  whole application.
 - Fix: `plan` refused Docker applications whose P1 keystore entry has an
   alias with spaces, brackets or `*` (`SKIP ...: alias wpisu P1 zawiera
   nieobsługiwane znaki`, e.g. P1ADAPTER with `*.ezdrowie.gov.pl (certum ov

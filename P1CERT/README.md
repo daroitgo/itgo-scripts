@@ -301,8 +301,12 @@ host paths:
   path in a variable whose name names a certificate or keystore (`CERT`,
   `TRUST`, `KEYSTORE`, `SSL`, `TLS`, `PEM`, `PKCS`, `P12`, `JKS`, `CA`),
   mapped through the longest matching mount; relative values use the
-  service `working_dir`; a path without a host mount is reported as inside
-  the image,
+  service `working_dir`; without `working_dir` a relative value is resolved
+  only when exactly one existing host file is reachable through a mount of
+  that service (the mount target itself or a parent of it whose remaining
+  components start the value: target `/app/conf/tls`, value
+  `conf/tls/store.jks`), otherwise it is reported as unmapped; a path
+  without a host mount is reported as inside the image,
 - certificate/keystore files in mounted directories (depth 3, at most 50
   per directory).
 
@@ -359,8 +363,12 @@ the order of variables, and never because a service has a single password):
    `KEYSTORE_PASS`, `JAVAX_NET_SSL_TRUSTSTORE` ->
    `JAVAX_NET_SSL_TRUSTSTOREPASSWORD`, `SERVER_SSL_KEY_STORE` ->
    `SERVER_SSL_KEY_STORE_PASSWORD`),
-2. otherwise the file name without extension, optionally with a prefix
-   (`truststore.p12` -> `TRUSTSTORE_PASSWORD`, `P1_TRUSTSTORE_PASS`).
+2. otherwise the file name without extension on the host or in the
+   container, optionally with a prefix (`truststore.p12` ->
+   `TRUSTSTORE_PASSWORD`, `P1_TRUSTSTORE_PASS`).
+
+A password variable also matches by the variable it is set from
+(`KS_SECRET: ${P1_KEYSTORE_PASSWORD}` matches `P1_KEYSTORE_PATH`).
 
 The value comes from `environment`/`env_file` with the same interpolation as
 above (`.env`, unit environment), or from the file named by a `<NAME>_FILE`

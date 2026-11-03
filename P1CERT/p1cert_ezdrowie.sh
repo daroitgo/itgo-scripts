@@ -1179,6 +1179,7 @@ ez_restart_label() {
 EZ_DC_SEP="$(printf '\034')"
 # Upper bound for the files listed from one bind-mounted directory.
 EZ_DC_DIR_SCAN_MAX=50
+EZ_DC_DIR_ONLY='plik tylko w zamontowanym katalogu (brak odwołania w konfiguracji)'
 
 ez_dc_unit_show() {
   systemctl show --no-pager -p LoadState -p ActiveState -p FragmentPath -p DropInPaths \
@@ -1283,7 +1284,7 @@ ez_dc_add_project() {
         ;;
       PW)
         ez_dc_note "$p" "$a" PW "$b ($c)"
-        DW_PROJ[$DW_COUNT]="$p"; DW_SVC[$DW_COUNT]="$a"; DW_NAME[$DW_COUNT]="$b"; DW_FILE[$DW_COUNT]="$d"
+        DW_PROJ[$DW_COUNT]="$p"; DW_SVC[$DW_COUNT]="$a"; DW_NAME[$DW_COUNT]="$b"; DW_FILE[$DW_COUNT]="$d"; DW_SRC[$DW_COUNT]="$c"
         DW_UNAME[$DW_COUNT]="$(printf '%s' "$b" | tr '[:lower:]' '[:upper:]')"
         DW_COUNT=$((DW_COUNT + 1))
         ;;
@@ -1301,7 +1302,7 @@ ez_dc_collect() {
 
   DP_COUNT=0; DP_UNIT=(); DP_ACTIVE=(); DP_VERSION=(); DP_PROG=(); DP_SUB=(); DP_PROJDIR=(); DP_FILES=()
   DP_ENVFILE=(); DP_ERR=(); DP_PROFILES=(); DP_SERVICES=(); DP_INPUT=(); DP_ENVCFG=(); DP_ENVEXPL=()
-  DW_COUNT=0; DW_PROJ=(); DW_SVC=(); DW_NAME=(); DW_UNAME=(); DW_FILE=()
+  DW_COUNT=0; DW_PROJ=(); DW_SVC=(); DW_NAME=(); DW_UNAME=(); DW_FILE=(); DW_SRC=()
   DR_COUNT=0; DR_PROJ=(); DR_SVC=(); DR_HOST=(); DR_CONT=(); DR_ORIGIN=()
   DN_COUNT=0; DN_PROJ=(); DN_SVC=(); DN_KIND=(); DN_TEXT=()
   prefix="${P1CERT_FS_ROOT:-}"
@@ -1441,12 +1442,17 @@ ez_dc_inspect() {
 # exactly one systemd unit runs the project(s) naming it, every such project
 # is unambiguous and at least one service names it explicitly (mount or
 # variable; a file merely present in a mounted directory is not enough).
+# A project that only mounts the directory holding a named file does not
+# use it as far as the configuration shows: it does not count.
 ez_dc_certainty() {
   local t="$1" r p why="" explicit=no units=" " n=0
 
   for r in ${DT_REFS[$t]}; do
-    p="${DR_PROJ[$r]}"
     [ "${DR_ORIGIN[$r]}" = dir ] || explicit=yes
+  done
+  for r in ${DT_REFS[$t]}; do
+    [ "$explicit" = no ] || [ "${DR_ORIGIN[$r]}" != dir ] || continue
+    p="${DR_PROJ[$r]}"
     if [ -n "${DP_ERR[$p]}" ]; then
       case "$why" in
         *"[$((p + 1))]"*) ;;
@@ -1460,7 +1466,7 @@ ez_dc_certainty() {
       n=$((n + 1))
     fi
   done
-  [ "$explicit" = yes ] || why="${why:+$why, }plik tylko w zamontowanym katalogu (brak odwołania w konfiguracji)"
+  [ "$explicit" = yes ] || why="${why:+$why, }$EZ_DC_DIR_ONLY"
   [ "$n" -le 1 ] || why="${why:+$why, }plik używany przez kilka jednostek:${units% }"
   DT_WHY[$t]="$why"
   if [ -z "$why" ]; then DT_SURE[$t]=yes; else DT_SURE[$t]=no; fi
@@ -1528,10 +1534,13 @@ ez_dc_named() {
 #      _LOC/_NAME, followed by the password word (P1_KEYSTORE_PATH ->
 #      P1_KEYSTORE_PASSWORD, JAVAX_NET_SSL_TRUSTSTORE ->
 #      JAVAX_NET_SSL_TRUSTSTOREPASSWORD),
-#   2. otherwise the file name without extension (truststore.p12 ->
-#      TRUSTSTORE_PASSWORD or <PREFIX>_TRUSTSTORE_PASSWORD).
+#   2. otherwise the file name without extension, on the host or in the
+#      container (truststore.p12 -> TRUSTSTORE_PASSWORD or
+#      <PREFIX>_TRUSTSTORE_PASSWORD).
+# A password variable also matches by the variable it is set from
+# (ez_dc_pw_match: KS_PASS: ${P1_KEYSTORE_PASSWORD}).
 ez_dc_pw_bind() {
-  local r="$1" p="${DR_PROJ[$1]}" svc="${DR_SVC[$1]}" origin="${DR_ORIGIN[$1]}" stem base w
+  local r="$1" p="${DR_PROJ[$1]}" svc="${DR_SVC[$1]}" origin="${DR_ORIGIN[$1]}" stem base cbase w
 
   PB_CANDS=""; PB_RULE=""
   case "$origin" in
@@ -1539,7 +1548,7 @@ ez_dc_pw_bind() {
       stem="$(ez_dc_pw_stem "$origin")"
       w=0
       while [ "$w" -lt "$DW_COUNT" ]; do
-        if [ "${DW_PROJ[$w]}" = "$p" ] && [ "${DW_SVC[$w]}" = "$svc" ] && ez_dc_pw_named "${DW_UNAME[$w]}" "$stem"; then
+        if [ "${DW_PROJ[$w]}" = "$p" ] && [ "${DW_SVC[$w]}" = "$svc" ] && ez_dc_pw_match "${DW_UNAME[$w]}" "${DW_SRC[$w]}" "$stem"; then
           PB_CANDS="$PB_CANDS $w"
         fi
         w=$((w + 1))
@@ -1549,14 +1558,18 @@ ez_dc_pw_bind() {
   esac
   [ -z "$PB_CANDS" ] || return 0
   base="$(ez_dc_pw_base "${DR_HOST[$r]}")"
+  cbase="$(ez_dc_pw_base "${DR_CONT[$r]}")"
   w=0
   while [ "$w" -lt "$DW_COUNT" ]; do
-    if [ "${DW_PROJ[$w]}" = "$p" ] && [ "${DW_SVC[$w]}" = "$svc" ] && ez_dc_pw_named "${DW_UNAME[$w]}" "$base" suffix; then
+    if [ "${DW_PROJ[$w]}" = "$p" ] && [ "${DW_SVC[$w]}" = "$svc" ] &&
+      { ez_dc_pw_match "${DW_UNAME[$w]}" "${DW_SRC[$w]}" "$base" suffix ||
+        ez_dc_pw_match "${DW_UNAME[$w]}" "${DW_SRC[$w]}" "$cbase" suffix; }; then
       PB_CANDS="$PB_CANDS $w"
     fi
     w=$((w + 1))
   done
   PB_RULE="nazwa pliku ${DR_HOST[$r]##*/}"
+  [ "$cbase" = "$base" ] || PB_RULE="$PB_RULE / ${DR_CONT[$r]##*/} w kontenerze"
 }
 
 # Prints the value of password variable DW $1: through ez_dc_secret, or the
@@ -1605,12 +1618,16 @@ ez_dc_pw_label() {
 # ez_dc_pw_bind): EZS_PASSWORD (caller clears it), DSP_HAVE yes|no and, without
 # a usable password, DSP_STATUS/DSP_REASON.  Sets DT_PWDESC (names only).
 ez_dc_store_pw() {
-  local t="$1" r w bound="" nb=0 amb="" names value status="" reason="" have=no n
+  local t="$1" r w bound="" nb=0 amb="" names value status="" reason="" have=no n explicit=no
 
   DT_PWDESC[$t]=""
   for r in ${DT_REFS[$t]}; do
-    # A directory listing adds nothing when the service names the file.
-    [ "${DR_ORIGIN[$r]}" != dir ] || ! ez_dc_named "${DR_PROJ[$r]}" "$t" "${DR_SVC[$r]}" || continue
+    [ "${DR_ORIGIN[$r]}" = dir ] || explicit=yes
+  done
+  for r in ${DT_REFS[$t]}; do
+    # A directory listing adds nothing when a service names the file (the
+    # root helper binds through named references only).
+    [ "${DR_ORIGIN[$r]}" != dir ] || [ "$explicit" = no ] || continue
     ez_dc_pw_bind "$r"
     set -- $PB_CANDS
     if [ "$#" -eq 1 ]; then
@@ -1949,16 +1966,24 @@ ez_discover() {
 ez_dc_app_decide() {
   local p="$1" t r mine names fp na action reason
 
-  DU_ALL=""; DU_UPD=""; DU_SRC=-1; DU_REASON=""; DU_DETAIL=""
+  DU_ALL=""; DU_UPD=""; DU_SRC=-1; DU_REASON=""; DU_DETAIL=""; DU_SKIP=""
   [ "${DP_UNIT[$p]}" != - ] || { DU_REASON='projekt bez jednostki systemd'; return 1; }
   [ -z "${DP_ERR[$p]}" ] || { DU_REASON="niejednoznaczna konfiguracja projektu: ${DP_ERR[$p]}"; return 1; }
   t=0
   while [ "$t" -lt "$DT_COUNT" ]; do
+    # dir: the project only mounts a directory holding the file; such a
+    # P1 file is reported (DU_SKIP), never replaced and never a blocker.
     mine=no
     for r in ${DT_REFS[$t]}; do
-      [ "${DR_PROJ[$r]}" != "$p" ] || mine=yes
+      [ "${DR_PROJ[$r]}" = "$p" ] || continue
+      if [ "${DR_ORIGIN[$r]}" != dir ]; then mine=yes; elif [ "$mine" = no ]; then mine=dir; fi
     done
-    if [ "$mine" = yes ]; then
+    if [ "$mine" = dir ]; then
+      case "${DT_STATE[$t]}" in
+        CERT) [ "${DT_EZ[$t]}" != yes ] || [ -n "${DT_REASON[$t]}" ] || DU_SKIP="$DU_SKIP $t" ;;
+        STORE) [ "${DT_SURE[$t]}" = na ] || DU_SKIP="$DU_SKIP $t" ;;
+      esac
+    elif [ "$mine" = yes ]; then
       case "${DT_STATE[$t]}" in
         CERT)
           if [ "${DT_EZ[$t]}" = yes ] && [ -z "${DT_REASON[$t]}" ]; then
@@ -2030,6 +2055,16 @@ ez_dc_app_files() {
   done
 }
 
+# Report of the P1 files of application $1 left out by ez_dc_app_decide
+# (DU_SKIP: only in a mounted directory, no reference in the configuration).
+ez_dc_app_skipped() {
+  local t
+
+  for t in $DU_SKIP; do
+    ez_say "  INFO       [$(($1 + 1))] ${DP_UNIT[$1]}: $(ez_printable "${DT_PATH[$t]}") - $EZ_DC_DIR_ONLY - pominięty, nie blokuje aplikacji"
+  done
+}
+
 # Docker part of the plan: every application with P1 files is shown with
 # its files, the source, the state of its unit and the predicted restart;
 # the operator approves the replacement of ALL its files as one operation
@@ -2055,11 +2090,13 @@ ez_plan_docker() {
   p=0
   while [ "$p" -lt "$DP_COUNT" ]; do
     if ! ez_dc_app_decide "$p"; then
+      ez_dc_app_skipped "$p"
       [ "$DU_REASON" = 'aplikacja nie ma certyfikatu P1 do podmiany' ] ||
         ez_say "  SKIP       [$((p + 1))] ${DP_UNIT[$p]} ${DP_PROJDIR[$p]}: $DU_REASON"
       p=$((p + 1))
       continue
     fi
+    ez_dc_app_skipped "$p"
     if [ -z "$DU_UPD" ]; then
       ez_say "  NO CHANGE  [$((p + 1))] ${DP_UNIT[$p]}: certyfikaty P1 aplikacji są aktualne"
       p=$((p + 1))

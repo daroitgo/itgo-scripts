@@ -1586,7 +1586,11 @@ function certext(p) { p = tolower(p); sub(/.*\//, "", p); return p ~ /\.(pem|crt
 # Variable names that point to a certificate or keystore even without a
 # known extension (the content decides the type later).
 function certkey(k) { k = toupper(k); return k ~ /CERT|TRUST|KEYSTORE|SSL|TLS|PEM|PKCS|P12|JKS|(^|_)CA(_|$)/ }
-function certref(k, p) { return certext(p) || (certkey(k) && substr(p, 1, 1) == "/") }
+# A relative value without extension counts only as a plain path with a
+# directory part (certs/keystore), never a word such as "true" or a URL.
+function certref(k, p) { return certext(p) || (certkey(k) && (substr(p, 1, 1) == "/" || (index(p, "/") && safepath(p)))) }
+# The variable a container variable is set from ("environment <- NAME").
+function srcname(src) { return (src ~ /^environment <- /) ? substr(src, 16) : "" }
 # The only form in which a value may be printed (same set as ez_path_chars_ok).
 function safepath(p) { return p ~ /^[A-Za-z0-9._\/@+-]+$/ }
 function normpath(b, p,   n, parts, i, sp, stack, out) {
@@ -2035,14 +2039,16 @@ function resolve(s,   i, nm, HM, TM, kind, src, tgt, host, dv, n, p, k, v, best,
   if (WD[s] == "" || UNRES || wd !~ /^\//) wd = ""
   for (i = 1; i <= CEN; i++) {
     k = CEK[i]
-    if (secretkey(k)) {
-      if (!passkey(k)) continue
+    if (secretkey(k) || passkey(srcname(CES[k]))) {
+      # A password also when it is set from a password variable
+      # (KS_SECRET: ${P1_KEYSTORE_PASSWORD}).
+      if (!passkey(k) && !passkey(srcname(CES[k]))) continue
       # NAME_FILE: the password is read from that file (container path),
       # reported as its host path.
       if (toupper(k) !~ /_FILE$/) { rec("PW", s, k, CES[k], ""); continue }
       p = CE[k]
-      if (CEU[k] || !safepath(p) || substr(p, 1, 1) != "/") { rec("PW", s, k, CES[k], "file:"); continue }
-      p = normpath("/", p); best = 0; bl = -1
+      if (CEU[k] || !safepath(p) || (substr(p, 1, 1) != "/" && wd == "")) { rec("PW", s, k, CES[k], "file:"); continue }
+      p = normpath(substr(p, 1, 1) == "/" ? "/" : wd, p); best = 0; bl = -1
       for (n = 1; n <= nm; n++) {
         if (p == TM[n] || index(p, TM[n] "/") == 1 || TM[n] == "/") {
           if (length(TM[n]) > bl) { best = n; bl = length(TM[n]) }
@@ -2233,16 +2239,108 @@ EOF
 #   REF <service> <host-path> <container-path> <mount|env:NAME>
 #   DIR <service> <host-path> <container-path>   other mount
 #   UNMAPPED <service> <NAME> <container-path> <image|relative>
+#                                        (a relative path is resolved through
+#                                        the mounts when it can be, see
+#                                        ez_dc_model_relative)
 #   PW <service> <NAME> <source> <|file:HOST>  password variable (name
 #                                        only); NAME_FILE variables carry the
 #                                        host path of the file (empty: unmapped)
 ez_dc_model() {
-  local prefix="$1" input="$2" explicit=0
+  local prefix="$1" input="$2" explicit=0 model rc=0
 
   [ -z "$DCI_ENVFILE" ] || explicit=1
-  printf '%s\n' "$input" | LC_ALL=C awk -v mode=model -v fsroot="$prefix" -v envfile="$DCP_ENVFILE" \
+  model="$(printf '%s\n' "$input" | LC_ALL=C awk -v mode=model -v fsroot="$prefix" -v envfile="$DCP_ENVFILE" \
     -v envexplicit="$explicit" -v files="$DCP_FILES" -v projdir="$DCP_PROJDIR" \
-    -v maxbytes="$EZ_DC_MAX_CONFIG_BYTES" "$EZ_DC_AWK"
+    -v maxbytes="$EZ_DC_MAX_CONFIG_BYTES" "$EZ_DC_AWK")" || rc=$?
+  ez_dc_model_relative "$prefix" "$model"
+  return "$rc"
+}
+
+# Records of ez_dc_model with every "UNMAPPED ... relative" path (a service
+# without working_dir) that reaches exactly one host file through a mount
+# of that service replaced by a REF record (origin env:NAME) and a SWARN
+# note.  The working directory of the container is unknown, so every
+# candidate is tried: the mount target itself, or a parent of it whose
+# remaining components start the path (target /app/certs, path
+# certs/p1.jks -> /app/certs/p1.jks).  No candidate, several different host
+# files, ".." or an unusable host file keep the record UNMAPPED.
+ez_dc_model_relative() {
+  local prefix="$1" sep line t a b c d mounts=""
+
+  sep="$(printf '\034')"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      "MOUNT$sep"*)
+        IFS="$sep" read -r t a b c d <<EOF
+$line
+EOF
+        mounts="$mounts$a$sep$b$sep$c
+"
+        ;;
+      "UNMAPPED$sep"*)
+        IFS="$sep" read -r t a b c d <<EOF
+$line
+EOF
+        if [ "$d" = relative ] && ez_dc_relative_file "$prefix" "$a" "$c" "$mounts"; then
+          printf 'REF%s%s%s%s%s%s%senv:%s\n' "$sep" "$a" "$sep" "$EZR_HOST" "$sep" "$EZR_CONT" "$sep" "$b"
+          printf 'SWARN%s%s%s%s\n' "$sep" "$a" "$sep" "$b=$c - ścieżka względna rozwiązana przez wolumen jako $EZR_CONT (jedyny pasujący plik; brak working_dir)"
+          continue
+        fi
+        ;;
+    esac
+    printf '%s\n' "$line"
+  done <<EOF
+$2
+EOF
+}
+
+# EZR_HOST/EZR_CONT: the only host file relative path $3 of service $2
+# reaches through its mounts $4 ("service<034>host<034>target" lines).
+ez_dc_relative_file() {
+  local prefix="$1" svc="$2" rel="$3" sep s h tg head rest part host cont
+
+  EZR_HOST=""; EZR_CONT=""
+  sep="$(printf '\034')"
+  while :; do
+    case "$rel" in
+      ./*) rel="${rel#./}" ;;
+      *) break ;;
+    esac
+  done
+  case "/$rel/" in
+    //|*/../*|*/./*|*//*) return 1 ;;
+  esac
+  while IFS="$sep" read -r s h tg; do
+    [ -n "$s" ] && [ "$s" = "$svc" ] || continue
+    head=""; rest="$rel"
+    while :; do
+      host=""
+      if [ -z "$head" ]; then
+        host="${h%/}/$rest"; cont="${tg%/}/$rest"
+      else
+        case "$tg" in
+          */"$head")
+            if [ -z "$rest" ]; then host="$h"; cont="$tg"; else host="$h/$rest"; cont="$tg/$rest"; fi
+            ;;
+        esac
+      fi
+      if [ -n "$host" ] && [ "$host" != "$EZR_HOST" ] && ez_path_under_roots "$host" && ! ez_dc_path_in_old_dir "$host" &&
+        ez_path_no_symlinks "$prefix" "$host" && [ -f "$prefix$host" ] && [ ! -L "$prefix$host" ]; then
+        [ -z "$EZR_HOST" ] || { EZR_HOST=""; EZR_CONT=""; return 1; }
+        EZR_HOST="$host"; EZR_CONT="$cont"
+      fi
+      [ -n "$rest" ] || break
+      case "$rest" in
+        */*) part="${rest%%/*}"; rest="${rest#*/}" ;;
+        *) part="$rest"; rest="" ;;
+      esac
+      head="${head:+$head/}$part"
+    done
+  done <<EOF
+$4
+EOF
+  [ -n "$EZR_HOST" ]
 }
 
 # Content type of a certificate or keystore file, from its bytes (the name
@@ -2905,6 +3003,18 @@ ez_dc_pw_stem() {
     *_FILE|*_PATH|*_LOCATION|*_LOC|*_NAME) stem="${stem%_*}" ;;
   esac
   printf '%s' "$stem" | tr '[:lower:]' '[:upper:]'
+}
+
+# ez_dc_pw_match <NAME> <source> <stem> [suffix]: ez_dc_pw_named for the
+# password variable itself or for the variable it is set from (source
+# "environment <- VAR" of its PW record: KS_PASS: ${P1_KEYSTORE_PASSWORD}).
+ez_dc_pw_match() {
+  ez_dc_pw_named "$1" "$3" "${4:-}" && return 0
+  case "$2" in
+    'environment <- '?*) ;;
+    *) return 1 ;;
+  esac
+  ez_dc_pw_named "$(printf '%s' "${2#environment <- }" | tr '[:lower:]' '[:upper:]')" "$3" "${4:-}"
 }
 
 # Binding rule 2: the store file name without extension, uppercase, other
