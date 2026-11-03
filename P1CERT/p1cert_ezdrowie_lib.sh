@@ -2841,6 +2841,8 @@ ez_dc_target_spec_ok() {
 
   separators="${1//[!|]/}"
   [ "${#separators}" -eq 4 ] || return 1
+  # One line: "read" below would silently drop everything after a newline.
+  ! printf '%s' "$1" | LC_ALL=C grep -q '[[:cntrl:]]' && [ "$(printf '%s' "$1" | wc -l | tr -d ' ')" = 0 ] || return 1
   IFS='|' read -r path type sha fp alias <<EOF
 $1
 EOF
@@ -2852,12 +2854,22 @@ EOF
   esac
 }
 
-# An alias that may travel in plan records and helper arguments.
+# An alias that may travel in plan records and helper arguments (always as
+# one quoted value or argv element, compared literally, never evaluated):
+# printable ASCII as Java writes it, spaces, brackets and "*" included
+# ("*.ezdrowie.gov.pl (certum ov tls g2 r39 ca)").  Refused: empty, "-" first
+# (the PEM/DER placeholder), the record separator "|", control characters
+# (newline, CR, tab), bytes outside ASCII, "?" (the JKS reader shows a
+# non-ASCII byte as "?": ambiguous), a space first or last, more than 128
+# characters.
 ez_dc_alias_ok() {
   case "$1" in
-    ''|-*|*[!A-Za-z0-9._@+-]*) return 1 ;;
+    ''|-*|' '*|*' '|*'|'*|*'?'*) return 1 ;;
   esac
-  [ "${#1}" -le 128 ]
+  [ "${#1}" -le 128 ] || return 1
+  # One line of printable ASCII only (0x20-0x7E).
+  [ "$(printf '%s' "$1" | wc -l | tr -d ' ')" = 0 ] || return 1
+  ! printf '%s' "$1" | LC_ALL=C grep -q '[^ -~]'
 }
 
 # True when password variable name $1 (uppercase) belongs to stem $2: STEM

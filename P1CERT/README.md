@@ -440,7 +440,11 @@ derives everything again on its own.
   file SHA-256>` and one `APP_TARGET=<unit>|<path>|<PEM|DER|JKS|PKCS12>|<file
   SHA-256>|<old fp>|<alias|->` per file (`PLAN_VERSION=3`; a plan without
   Docker applications stays `PLAN_VERSION=2`, and version 2 plans keep
-  working).
+  working). The alias is the one in the store, unchanged: printable ASCII
+  including spaces, brackets and `*` (`*.ezdrowie.gov.pl (certum ov tls g2
+  r39 ca)`); an alias with `|`, control characters, non-ASCII bytes, `?`, a
+  leading `-` or space, a trailing space or more than 128 characters is
+  refused (the application is not offered).
 
 `run` (also scheduled, with the same lock and one-shot timer):
 

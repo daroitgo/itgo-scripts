@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fix: `plan` refused Docker applications whose P1 keystore entry has an
+  alias with spaces, brackets or `*` (`SKIP ...: alias wpisu P1 zawiera
+  nieobsługiwane znaki`, e.g. P1ADAPTER with `*.ezdrowie.gov.pl (certum ov
+  tls g2 r39 ca)`). The alias rule shared by `plan` and `apply-docker` now
+  accepts every printable ASCII alias as Java writes it and still refuses
+  the record separator `|`, control characters, non-ASCII bytes, `?`, a
+  leading `-` or space, a trailing space and more than 128 characters. The
+  alias stays unchanged and is compared literally.
 - Docker Compose applications in `plan`, `run` and the root helper (stage
   E4; helper/library API 5, plan version 3 only for plans with Docker
   applications). `plan` offers each unambiguous application once (all its
