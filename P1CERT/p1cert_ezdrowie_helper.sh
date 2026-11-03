@@ -17,6 +17,9 @@
 #   apply          <cert-path> <old-fp> <new-fp> <old-file-sha256> <new-source-sha256>
 #   apply-systemd  <cert-path> <old-fp> <new-fp> <old-file-sha256> <new-source-sha256> <unit.service>
 #   apply-compose  <cert-path> <old-fp> <new-fp> <old-file-sha256> <new-source-sha256> <project-dir> <service>
+#   apply-docker   <unit.service> <restart yes|no> <new-source-sha256> <new-fp>
+#                  <path|PEM|DER|JKS|PKCS12|old-file-sha256|old-fp|alias|->...
+#   recover
 #   schedule       <YYYY-MM-DD> <HH:MM>
 #   schedule-cancel
 #
@@ -44,6 +47,12 @@
 #                              single restart with it succeeded
 #   6 ROLLBACK_RESTART_FAILED  as 5, but the single restart with it failed
 #   7 ROLLBACK_FAILED          CRITICAL: previous certificate could not be restored
+#
+# apply-docker replaces the P1 certificate in all approved files of one
+# Docker Compose application as one journaled operation and restarts its
+# unit (see the section "Docker Compose applications"); same exit codes,
+# plus 8 PENDING_RECOVERY.  recover undoes interrupted apply-docker
+# operations.
 
 set -u
 set -f
@@ -65,7 +74,9 @@ export LC_ALL
 # 4: systemd binding through SSL.patch of the classic Integration Platform
 #    (appConfig.properties of the installation the unit runs from, own
 #    application tree policy); API 1-3 components are incompatible.
-HELPER_API_VERSION=4
+# 5: Docker Compose applications (apply-docker, recover, PKCS12 tool, plan
+#    version 3); API 1-4 components are incompatible.
+HELPER_API_VERSION=5
 
 HELPER_DIR=/usr/local/libexec/itgo-p1cert
 HELPER_SELF="$HELPER_DIR/p1cert-ezdrowie-helper"
@@ -331,7 +342,8 @@ helper_read_entry() {
   local name="$1" id="$2" out="$3"
 
   [ -n "$id" ] && [ "$(helper_entry_id "$name")" = "$id" ] || return 1
-  dd if="$name" of="$out" iflag=nofollow,nonblock,noctty bs="$EZ_MAX_CERT_BYTES" count=2 2>/dev/null || return 1
+  # Docker operations read keystores (HELPER_READ_BS up to their size limit).
+  dd if="$name" of="$out" iflag=nofollow,nonblock,noctty bs="${HELPER_READ_BS:-$EZ_MAX_CERT_BYTES}" count=2 2>/dev/null || return 1
   [ "$(helper_entry_id "$name")" = "$id" ]
 }
 
@@ -878,6 +890,11 @@ helper_restart_once() {
 
 op_ping() {
   printf 'HELPER=OK\nAPI_VERSION=%s\n' "$HELPER_API_VERSION"
+  # PKCS12 support of apply-docker: Java runtime and the verified tool.
+  helper_p12_ready || true
+  printf 'P12_TOOL=%s\n' "$HELPER_P12_STATE"
+  # Interrupted Docker operations waiting for "recover" (read only).
+  printf 'DOCKER_PENDING=%s\n' "$(helper_journal_pending | grep -c . || true)"
 }
 
 op_find_candidates() {
@@ -1148,6 +1165,955 @@ op_schedule_cancel() {
   printf 'RESULT=CANCELLED\n'
 }
 
+
+# --- Docker Compose applications (apply-docker, recover) -------------------
+#
+# One operation replaces the P1 certificate in ALL approved files of one
+# compose application (PEM, DER, JKS, PKCS12) and restarts its systemd unit
+# once.  Nothing the caller detected is trusted: the helper derives the
+# compose configuration of the unit itself (unit, drop-ins and environment
+# files must be root-controlled), requires every file to be referenced by
+# that configuration (bind mount, secret or certificate variable), binds and
+# reads the store passwords itself, checks the exact current bytes and the
+# P1 entry of every file and the approved source bytes.  Files are written
+# only with helper_atomic_replace (pinned directory, descriptor bound,
+# original owner/mode/SELinux context).  A root-only journal records the
+# operation before the first file changes, so that an interrupted operation
+# (SIGKILL, power loss) is undone by "recover".
+
+# Journal of Docker operations: root-only, holds the original bytes
+# (keystores with encrypted private keys included) and the state.
+HELPER_JOURNAL_PARENT=/var/lib/itgo-p1cert
+HELPER_JOURNAL_DIR="$HELPER_JOURNAL_PARENT/ezdrowie-journal"
+# Finished journals kept as root-only backups (oldest removed first).
+HELPER_JOURNAL_KEEP=20
+HELPER_DC_MAX_TARGETS=10
+# PKCS12 tool shipped with P1CERT (java/P1certPkcs12.java) and its SHA-256;
+# the installer refuses another file, the helper re-checks it before use.
+HELPER_P12_JAR="$HELPER_DIR/p1cert-pkcs12.jar"
+HELPER_P12_JAR_SHA256=8e439c107ace7e148153fb47a62ff3302ea5cf6d721413b57744aea16b762c9c
+# Bytes read from a target (helper_read_entry); keystores may be larger
+# than single certificates.
+HELPER_READ_BS=""
+
+# Java runtime 8+ for the PKCS12 tool, only from root-controlled locations
+# (the resolved binary and every directory above it); never installed.
+helper_java_find() {
+  local c real major
+
+  EZ_JAVA=""
+  set +f
+  for c in /usr/bin/java /usr/lib/jvm/*/bin/java /usr/lib/jvm/*/jre/bin/java /usr/java/*/bin/java; do
+    set -f
+    [ -e "$(helper_fs "$c")" ] || continue
+    real="$(readlink -f -- "$(helper_fs "$c")" 2>/dev/null)" || continue
+    real="${real#"$HELPER_FS_ROOT"}"
+    helper_path_trusted "$real" || continue
+    major="$(ez_java_major "$(helper_fs "$real")")" || continue
+    [ "$major" -ge 8 ] || continue
+    EZ_JAVA="$(helper_fs "$real")"
+    set -f
+    return 0
+  done
+  set -f
+  return 1
+}
+
+# P1CERT_P12: OK (runtime and the integrity-checked tool), NO_JAVA, NO_JAR
+# or BAD_JAR.  Sets EZ_JAVA and EZ_P12_TOOL for ez_p12_tool.
+helper_p12_ready() {
+  local jar
+
+  EZ_P12_TOOL=""
+  jar="$(helper_fs "$HELPER_P12_JAR")"
+  if ! helper_node_trusted "$jar" f; then
+    HELPER_P12_STATE=NO_JAR
+    return 1
+  fi
+  if [ "$(ez_file_digest "$jar")" != "$HELPER_P12_JAR_SHA256" ]; then
+    HELPER_P12_STATE=BAD_JAR
+    return 1
+  fi
+  if ! helper_java_find; then
+    HELPER_P12_STATE=NO_JAVA
+    return 1
+  fi
+  EZ_P12_TOOL="$jar"
+  HELPER_P12_STATE=OK
+}
+
+# A Docker target: allowed path without symlinks, a regular single-link file.
+helper_dc_check_target() {
+  local target="$1" fs
+
+  ez_dc_target_path_ok "$target" || { helper_fail "not an allowed Docker target path: $target"; return 1; }
+  ez_path_no_symlinks "$HELPER_FS_ROOT" "$target" || { helper_fail "target path contains a symlink: $target"; return 1; }
+  fs="$(helper_fs "$target")"
+  [ -f "$fs" ] && [ ! -L "$fs" ] || { helper_fail "target is not a regular file: $target"; return 1; }
+  [ "$(helper_link_count "$fs")" = 1 ] || { helper_fail "target has multiple hard links, refusing: $target"; return 1; }
+}
+
+# Unit, drop-in and environment files of the unit decide the compose
+# configuration: they must be root-controlled (as for the systemd binding).
+helper_dc_unit_files_ok() {
+  local props="$1" kind file fs
+
+  while IFS=' ' read -r kind file; do
+    [ -n "$file" ] || continue
+    case "$kind:$file" in
+      F:/etc/systemd/system/*|F:/usr/lib/systemd/system/*|F:/lib/systemd/system/*|F:/run/systemd/system/*|E:/*) ;;
+      *) helper_fail "unexpected unit configuration path: $file"; return 1 ;;
+    esac
+    ez_path_chars_ok "$file" || { helper_fail "unsupported unit configuration path: $file"; return 1; }
+    fs="$(helper_fs "$file")"
+    if [ "$kind" = E ] && [ ! -e "$fs" ] && [ ! -L "$fs" ]; then
+      helper_path_trusted "$file" parents || { helper_fail "directory of EnvironmentFile is not root-controlled: $file"; return 1; }
+      continue
+    fi
+    helper_path_trusted "$file" || { helper_fail "unit configuration file or one of its directories is not root-controlled: $file"; return 1; }
+  done <<EOF
+$(ez_systemd_config_files "$props")
+EOF
+}
+
+helper_dc_unit_show() {
+  helper_systemctl show --no-pager -p LoadState -p ActiveState -p FragmentPath -p DropInPaths \
+    -p WorkingDirectory -p ExecStart -p Environment -p EnvironmentFiles -- "$1" 2>/dev/null
+}
+
+# Derives the compose application run by <unit> (as discover does):
+# H_PROPS, H_INPUT, H_ACTIVE, DCI_*, DCP_* and H_MODEL (ez_dc_model records).
+# Refuses a unit that does not run compose unambiguously, a configuration
+# with errors or ambiguous services, and a project in an "old" directory.
+helper_dc_app() {
+  local unit="$1" load fragment t a b c d
+
+  H_PROPS="$(helper_dc_unit_show "$unit")" || { helper_fail "cannot inspect unit: $unit"; return 1; }
+  load="$(printf '%s\n' "$H_PROPS" | sed -n 's/^LoadState=//p' | head -n 1)"
+  fragment="$(printf '%s\n' "$H_PROPS" | sed -n 's/^FragmentPath=//p' | head -n 1)"
+  H_ACTIVE="$(printf '%s\n' "$H_PROPS" | sed -n 's/^ActiveState=//p' | head -n 1)"
+  [ "$load" = loaded ] || { helper_fail "unit is not loaded: $unit"; return 1; }
+  case "$fragment" in
+    /etc/systemd/system/*|/usr/lib/systemd/system/*|/lib/systemd/system/*) ;;
+    *) helper_fail "unit file location is not allowed: ${fragment:-none}"; return 1 ;;
+  esac
+  helper_dc_unit_files_ok "$H_PROPS" || return 1
+  ez_dc_invocation "$H_PROPS" || { helper_fail "unit $unit does not run docker compose"; return 1; }
+  case "$DCI_VERSION" in
+    v1|v2) ;;
+    *) helper_fail "compose invocation of $unit cannot be analysed: ${DCI_ERR:-unknown}"; return 1 ;;
+  esac
+  [ -z "$DCI_ERR" ] || { helper_fail "compose invocation of $unit is ambiguous: $DCI_ERR"; return 1; }
+  H_INPUT="$(ez_dc_unit_env_input "$H_PROPS" "$DCI_ASSIGN")"
+  ez_dc_project "$HELPER_FS_ROOT" "$H_INPUT"
+  [ -z "$DCP_ERR" ] && [ -n "$DCP_FILES" ] || { helper_fail "compose configuration of $unit is ambiguous: ${DCP_ERR:-no compose file}"; return 1; }
+  ez_dc_path_ok "$DCP_PROJDIR" && ! ez_dc_path_in_old_dir "$DCP_PROJDIR/x" || {
+    helper_fail "unsupported compose project directory: $DCP_PROJDIR"
+    return 1
+  }
+  H_MODEL="$(ez_dc_model "$HELPER_FS_ROOT" "$H_INPUT" 2>/dev/null)"
+  while IFS="$(printf '\034')" read -r t a b c d; do
+    case "$t" in
+      ERR) helper_fail "compose configuration of $unit cannot be analysed: $b"; return 1 ;;
+      SERR) helper_fail "compose service $a of $unit is ambiguous: $b"; return 1 ;;
+    esac
+  done <<EOF
+$H_MODEL
+EOF
+}
+
+# No other unit may run the same compose project: the restart target must
+# be unambiguous.  Only unit files mentioning compose are inspected.
+helper_dc_single_unit() {
+  local unit="$1" projdir="$2" dir file other props
+
+  set +f
+  for dir in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+    for file in "$(helper_fs "$dir")"/*.service; do
+      set -f
+      [ -f "$file" ] && [ ! -L "$file" ] || continue
+      other="${file##*/}"
+      [ "$other" != "$unit" ] || continue
+      ez_unit_name_ok "$other" && ! ez_unit_denied "$other" || continue
+      grep -q -i compose -- "$file" 2>/dev/null || continue
+      props="$(helper_dc_unit_show "$other")" || continue
+      printf '%s\n' "$props" | grep -F -x -q 'LoadState=loaded' || continue
+      ez_dc_invocation "$props" || continue
+      case "$DCI_VERSION" in v1|v2) ;; *) continue ;; esac
+      ez_dc_project "$HELPER_FS_ROOT" "$(ez_dc_unit_env_input "$props" "$DCI_ASSIGN")"
+      if [ "$DCP_PROJDIR" = "$projdir" ]; then
+        helper_fail "compose project $projdir is also run by $other; the restart target is ambiguous"
+        set -f
+        return 1
+      fi
+      set +f
+    done
+  done
+  set -f
+  return 0
+}
+
+# Services referencing <path> explicitly in H_MODEL: "svc<TAB>origin" lines.
+helper_dc_refs() {
+  local path="$1" t a b c d
+
+  while IFS="$(printf '\034')" read -r t a b c d; do
+    [ "$t" = REF ] && [ "$b" = "$path" ] || continue
+    printf '%s\t%s\n' "$a" "$d"
+  done <<EOF
+$H_MODEL
+EOF
+}
+
+# First line of a password file named by a NAME_FILE variable (host path
+# from the model), read without following a symlink.
+helper_dc_pw_file() {
+  local path="$1" fs line
+
+  ez_dc_path_ok "$path" && ez_path_no_symlinks "$HELPER_FS_ROOT" "$path" || return 1
+  fs="$(helper_fs "$path")"
+  helper_entry_meta "$fs" || return 1
+  [ "$(stat -c '%s' -- "$fs" 2>/dev/null)" -le 4096 ] || return 1
+  line="$(dd if="$fs" iflag=nofollow,nonblock,noctty bs=4096 count=1 2>/dev/null | head -n 1)"
+  printf '%s' "${line%"$(printf '\r')"}"
+}
+
+# Binds and reads the password of keystore <path> exactly like discover
+# (ez_dc_pw_stem/ez_dc_pw_base/ez_dc_pw_named over the password variables of
+# the services that reference it): no reference may bind several variables,
+# at least one must bind one, and all bound values must be equal.  Sets
+# EZS_PASSWORD.
+helper_dc_password() {
+  local path="$1" svc origin t a b c d stem base n cands bound="" value first=yes upper explicit=0 nl
+
+  nl='
+'
+  EZS_PASSWORD=""
+  [ -z "$DCI_ENVFILE" ] || explicit=1
+  while IFS="$(printf '\t')" read -r svc origin; do
+    [ -n "$svc" ] || continue
+    cands=""
+    if stem="$(ez_dc_pw_stem "$origin")"; then
+      while IFS="$(printf '\034')" read -r t a b c d; do
+        [ "$t" = PW ] && [ "$a" = "$svc" ] || continue
+        upper="$(printf '%s' "$b" | tr '[:lower:]' '[:upper:]')"
+        ! ez_dc_pw_named "$upper" "$stem" || cands="$cands$a|$b|$d$nl"
+      done <<EOF
+$H_MODEL
+EOF
+    fi
+    if [ -z "$cands" ]; then
+      base="$(ez_dc_pw_base "$path")"
+      while IFS="$(printf '\034')" read -r t a b c d; do
+        [ "$t" = PW ] && [ "$a" = "$svc" ] || continue
+        upper="$(printf '%s' "$b" | tr '[:lower:]' '[:upper:]')"
+        ! ez_dc_pw_named "$upper" "$base" suffix || cands="$cands$a|$b|$d$nl"
+      done <<EOF
+$H_MODEL
+EOF
+    fi
+    # As discover (ez_dc_store_pw): a reference that binds no variable (a
+    # mount next to the path variable) adds nothing; several are ambiguous.
+    n="$(printf '%s' "$cands" | grep -c '|' || true)"
+    [ "$n" -le 1 ] || { helper_fail "password of $path is not bound unambiguously for service $svc ($n candidates)"; return 1; }
+    case "$bound" in *"$cands"*) ;; *) bound="$bound$cands" ;; esac
+  done <<EOF
+$(helper_dc_refs "$path")
+EOF
+  [ -n "$bound" ] || { helper_fail "no password bound to $path"; return 1; }
+  while IFS='|' read -r svc b d; do
+    [ -n "$svc" ] || continue
+    case "$d" in
+      '') value="$(ez_dc_secret "$HELPER_FS_ROOT" "$H_INPUT" "$DCP_ENVFILE" "$explicit" "$DCP_FILES" "$DCP_PROJDIR" "$svc" "$b")" || {
+            helper_fail "password variable $b of service $svc cannot be read"
+            return 1
+          } ;;
+      file:?*) value="$(helper_dc_pw_file "${d#file:}")" || { helper_fail "password file of $b cannot be read"; return 1; } ;;
+      *) helper_fail "password file of $b is not mounted from the host"; return 1 ;;
+    esac
+    if [ "$first" = yes ]; then
+      EZS_PASSWORD="$value"
+      first=no
+    elif [ "$value" != "$EZS_PASSWORD" ]; then
+      value=""
+      EZS_PASSWORD=""
+      helper_fail "password variables bound to $path have different values"
+      return 1
+    fi
+  done <<EOF
+$bound
+EOF
+  value=""
+  return 0
+}
+
+# --- journal -------------------------------------------------------------
+
+helper_journal_root() {
+  local dir
+
+  helper_node_trusted "$(helper_fs /var)" d && helper_node_trusted "$(helper_fs /var/lib)" d || {
+    helper_fail '/var/lib is not root-controlled; journal unavailable'
+    return 1
+  }
+  for dir in "$HELPER_JOURNAL_PARENT" "$HELPER_JOURNAL_DIR"; do
+    if [ ! -e "$(helper_fs "$dir")" ] && [ ! -L "$(helper_fs "$dir")" ]; then
+      ( umask 077 && mkdir -- "$(helper_fs "$dir")" ) || return 1
+    fi
+    helper_node_trusted "$(helper_fs "$dir")" d || { helper_fail "journal directory is not root-controlled: $dir"; return 1; }
+    chmod 0700 "$(helper_fs "$dir")" || return 1
+  done
+}
+
+helper_journal_state() {
+  printf '%s\n' "$2" > "$1/state.tmp" && mv -f -T -- "$1/state.tmp" "$1/state" && sync
+}
+
+# Journals not finished (any state but DONE, ROLLED_BACK, RECOVERED).
+helper_journal_pending() {
+  local root j state
+
+  root="$(helper_fs "$HELPER_JOURNAL_DIR")"
+  [ -d "$root" ] || return 0
+  set +f
+  for j in "$root"/*; do
+    set -f
+    [ -d "$j" ] && [ ! -L "$j" ] || continue
+    state="$(head -n 1 -- "$j/state" 2>/dev/null)"
+    case "$state" in
+      DONE|ROLLED_BACK|RECOVERED) ;;
+      *) printf '%s\n' "$j" ;;
+    esac
+  done
+  set -f
+}
+
+# Keeps the newest HELPER_JOURNAL_KEEP finished journals.
+helper_journal_prune() {
+  local root n=0 j state
+
+  root="$(helper_fs "$HELPER_JOURNAL_DIR")"
+  [ -d "$root" ] || return 0
+  while IFS= read -r j; do
+    [ -n "$j" ] || continue
+    state="$(head -n 1 -- "$root/$j/state" 2>/dev/null)"
+    case "$state" in
+      DONE|ROLLED_BACK|RECOVERED) n=$((n + 1)); [ "$n" -le "$HELPER_JOURNAL_KEEP" ] || rm -rf -- "${root:?}/$j" ;;
+    esac
+  done <<EOF
+$(ls -1 -- "$root" 2>/dev/null | grep -E '^[0-9]{14}-[0-9]+$' | LC_ALL=C sort -r)
+EOF
+}
+
+# --- one file of the operation (HT_* arrays) -----------------------------
+
+# Installs <content> as target <i> when it still holds <expect-sha> as the
+# entry <expect-id> (helper_atomic_replace with the original owner, group,
+# mode and SELinux context) and checks the bytes on disk.  HT_ID[i] becomes
+# the installed entry.
+helper_dc_install() {
+  local i="$1" content="$2" expect="$3" expect_id="$4" want
+
+  helper_pin_target_dir "${HT_PATH[$i]}" || return 1
+  T_UID="${HT_UID[$i]}"; T_GID="${HT_GID[$i]}"; T_MODE="${HT_MODE[$i]}"; T_CONTEXT="${HT_CTX[$i]}"
+  helper_atomic_replace "$content" "$expect" "$expect_id" || return 1
+  HT_ID[$i]="$INSTALLED_ID"
+  want="$(ez_file_digest "$content")"
+  helper_read_entry "$T_NAME" "$INSTALLED_ID" "$HELPER_TMP/installed" &&
+    [ "$(ez_file_digest "$HELPER_TMP/installed")" = "$want" ]
+}
+
+# Content check of target <i> on disk after the commit.
+helper_dc_verify() {
+  local i="$1" copy="$HELPER_TMP/verify-$1" rc=0
+
+  helper_pin_target_dir "${HT_PATH[$i]}" &&
+    helper_read_entry "$T_NAME" "${HT_ID[$i]}" "$copy" &&
+    [ "$(ez_file_digest "$copy")" = "${HT_NEWSHA[$i]}" ] || return 1
+  case "${HT_TYPE[$i]}" in
+    PEM|DER)
+      ez_cert_inspect "$copy" && [ "$EZC_FP" = "$H_NEWFP" ] && [ "$EZC_FORMAT" = "${HT_TYPE[$i]}" ]
+      ;;
+    *)
+      EZS_PASSWORD="${HT_PW[$i]}"
+      ez_dc_verify_store "$copy" "${HT_TYPE[$i]}" "${HT_ALIAS[$i]}" "$H_NEWFP" "${HT_EXPECT[$i]}" "$H_J/old-$i" || rc=1
+      EZS_PASSWORD=""
+      return "$rc"
+      ;;
+  esac
+}
+
+# Puts the original bytes back into every committed target (newest first).
+# 0 all restored and verified, 1 at least one could not be restored.
+helper_dc_rollback() {
+  local i rc=0
+
+  i=$((HT_COUNT - 1))
+  while [ "$i" -ge 0 ]; do
+    if [ "${HT_STATE[$i]}" = committed ]; then
+      if helper_dc_install "$i" "$H_J/old-$i" "${HT_NEWSHA[$i]}" "${HT_ID[$i]}"; then
+        HT_STATE[$i]=restored
+      else
+        helper_fail "CRITICAL: original bytes of ${HT_PATH[$i]} could not be restored (copy: $HELPER_JOURNAL_DIR/${H_J##*/}/old-$i)"
+        rc=1
+      fi
+    fi
+    i=$((i - 1))
+  done
+  return "$rc"
+}
+
+# --- restart and its verification ------------------------------------------
+
+# Services of H_MODEL (SVC records), space separated; 1 when a name has
+# characters compose labels cannot be compared with safely.
+helper_dc_model_services() {
+  local t a b c d out=""
+
+  while IFS="$(printf '\034')" read -r t a b c d; do
+    [ "$t" = SVC ] || continue
+    printf '%s\n' "$a" | grep -E -x -q '[A-Za-z0-9][A-Za-z0-9_.-]{0,127}' || return 1
+    out="${out:+$out }$a"
+  done <<EOF
+$H_MODEL
+EOF
+  printf '%s' "$out"
+}
+
+# Inspects container <id> of compose project <projdir>: C_RUNNING,
+# C_RESTARTING, C_EPOCH (StartedAt), C_CODE, C_HEALTH, C_SVC.  Fails for an
+# unexpected id, label or date.
+helper_dc_container() {
+  local id="$1" projdir="$2" info started label
+
+  printf '%s\n' "$id" | grep -E -q '^[0-9a-f]{64}$' || return 1
+  info="$(helper_docker inspect --type container --format \
+    '{{.State.Running}}|{{.State.Restarting}}|{{.State.StartedAt}}|{{.State.ExitCode}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.service"}}' \
+    "$id" 2>/dev/null)" || return 1
+  IFS='|' read -r C_RUNNING C_RESTARTING started C_CODE C_HEALTH label C_SVC <<EOF
+$info
+EOF
+  [ "$label" = "$projdir" ] || return 1
+  C_EPOCH="$(date -u -d "$started" '+%s' 2>/dev/null)" || return 1
+}
+
+helper_dc_project_ids() {
+  helper_docker ps -a -q --no-trunc --filter "label=com.docker.compose.project.working_dir=$1" 2>/dev/null
+}
+
+# Services out of <services> that have a running container of the project
+# now (space separated).  1 when docker cannot be read.
+helper_dc_running_services() {
+  local projdir="$1" services="$2" ids id out=""
+
+  ids="$(helper_dc_project_ids "$projdir")" || return 1
+  for id in $ids; do
+    helper_dc_container "$id" "$projdir" || return 1
+    [ "$C_RUNNING" = true ] || continue
+    case " $services " in *" $C_SVC "*) ;; *) continue ;; esac
+    case " $out " in *" $C_SVC "*) ;; *) out="${out:+$out }$C_SVC" ;; esac
+  done
+  printf '%s' "$out"
+}
+
+# True when a container of the project was started at or after <epoch>
+# (it may have loaded files changed by the operation).
+helper_dc_started_since() {
+  local projdir="$1" epoch="$2" ids id
+
+  ids="$(helper_dc_project_ids "$projdir")" || return 0
+  for id in $ids; do
+    helper_dc_container "$id" "$projdir" || return 0
+    [ "$C_EPOCH" -lt "$epoch" ] || return 0
+  done
+  return 1
+}
+
+# The project after a restart started at <since>: every service of
+# <services> (the services that ran before the operation) runs again in a
+# container (re)started after <since>, not restarting and not unhealthy (a
+# health check still "starting" is waited for); a stopped container of such
+# a service only when it exited 0 after <since>.  Containers of other
+# services (not running before, orphans, inactive profiles) are not judged.
+# 0 ok, 1 not (yet).
+helper_dc_containers_ok() {
+  local projdir="$1" since="$2" services="$3" ids id seen=" " svc
+
+  [ -n "$services" ] || return 1
+  ids="$(helper_dc_project_ids "$projdir")" || return 1
+  for id in $ids; do
+    helper_dc_container "$id" "$projdir" || return 1
+    case " $services " in *" $C_SVC "*) ;; *) continue ;; esac
+    if [ "$C_RUNNING" = true ]; then
+      [ "$C_RESTARTING" = false ] && [ "$C_EPOCH" -ge "$since" ] || return 1
+      case "$C_HEALTH" in healthy|none) ;; *) return 1 ;; esac
+      seen="$seen$C_SVC "
+    else
+      [ "$C_CODE" = 0 ] && [ "$C_EPOCH" -ge "$since" ] || return 1
+    fi
+  done
+  for svc in $services; do
+    case "$seen" in *" $svc "*) ;; *) return 1 ;; esac
+  done
+}
+
+# One restart of the unit: systemctl restart, the unit stays active
+# (helper_wait_systemd_active) and the services that ran before really run
+# again (the exit code of systemctl alone proves nothing for "docker compose
+# up -d").
+helper_dc_restart() {
+  local unit="$1" projdir="$2" services="$3" since waited=0
+
+  since="$(date -u '+%s')"
+  helper_info "systemctl restart $unit"
+  helper_systemctl restart -- "$unit" || return 1
+  helper_wait_systemd_active "$unit" || { helper_fail "$unit did not stay active after the restart"; return 1; }
+  while [ "$waited" -le "$HELPER_WAIT_SECONDS" ]; do
+    helper_dc_containers_ok "$projdir" "$since" "$services" && return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  helper_fail "services $services of $projdir were not restarted or do not run correctly after restarting $unit"
+  return 1
+}
+
+# True when the copy of target <i> already holds the new P1 certificate
+# (H_NEWFP): the certificate itself, or the P1 entry of the store opened with
+# its configured password.
+helper_dc_is_current() {
+  local i="$1" copy="$HELPER_TMP/old-$1" rc=1
+
+  case "${HT_TYPE[$i]}" in
+    PEM|DER) ez_cert_inspect "$copy" && [ "$EZC_FP" = "$H_NEWFP" ] ;;
+    *)
+      helper_dc_password "${HT_PATH[$i]}" 2>/dev/null || { EZS_PASSWORD=""; return 1; }
+      if ez_store_open "$copy" "${HT_TYPE[$i]}" yes; then
+        ez_store_p1
+        [ "$EZS_P1" = PEWNA ] && [ "${ES_ALIAS[$EZS_P1_ROW]}" = "${HT_ALIAS[$i]}" ] &&
+          [ "${ES_FP[$EZS_P1_ROW]}" = "$H_NEWFP" ] && rc=0
+      fi
+      EZS_PASSWORD=""
+      return "$rc"
+      ;;
+  esac
+}
+
+# --- apply-docker ------------------------------------------------------------
+
+helper_dc_result() {
+  printf 'RESULT=%s\nUNIT_STATE_BEFORE=%s\nJOURNAL=%s\n' "$1" "${H_ACTIVE:-unknown}" "${H_J##*/}"
+}
+
+helper_dc_finish() {
+  local i=0
+
+  while [ "$i" -lt "${HT_COUNT:-0}" ]; do
+    HT_PW[$i]=""
+    i=$((i + 1))
+  done
+  EZS_PASSWORD=""
+}
+
+
+# helper_apply_docker <unit> <restart yes|no> <source-sha256> <new-fp>
+#                     <path|type|old-file-sha256|old-fp|alias>...
+# The new certificate (exactly the approved source bytes) is read from stdin.
+# Prints RESULT=, UNIT_STATE_BEFORE=, JOURNAL= and exits with the codes of
+# helper_apply (0 UPDATED/UPDATED_RESTARTED/NO_CHANGE, 1 FAILED, 2/3
+# REFUSED, 4 RESTORED, 5 ROLLBACK, 6 ROLLBACK_RESTART_FAILED, 7
+# ROLLBACK_FAILED) and 8 PENDING_RECOVERY (an interrupted operation must be
+# recovered first).
+helper_apply_docker() {
+  local unit="$1" restart="$2" src_sha="$3" now i spec path type sha fp alias reason rc props
+  local seen=" " names cn na nochange=0
+
+  H_NEWFP="$(helper_norm_fp "$4")"
+  shift 4
+  H_J=""; H_ACTIVE=""; HT_COUNT=0
+  HT_PATH=(); HT_TYPE=(); HT_OLDSHA=(); HT_OLDFP=(); HT_ALIAS=(); HT_ID=(); HT_UID=(); HT_GID=(); HT_MODE=(); HT_CTX=()
+  HT_NEWSHA=(); HT_EXPECT=(); HT_STATE=(); HT_PW=()
+  HELPER_READ_BS="$EZ_DC_MAX_STORE_BYTES"
+
+  # 1. Request syntax.
+  ez_unit_name_ok "$unit" && ! ez_unit_denied "$unit" || helper_refuse 2 "invalid or not allowed unit: $unit" || return
+  case "$restart" in yes|no) ;; *) helper_refuse 2 'restart must be yes or no' || return ;; esac
+  ez_digest_ok "$src_sha" && ez_fp_ok "$H_NEWFP" || helper_refuse 2 'invalid source SHA-256 or fingerprint' || return
+  [ "$#" -ge 1 ] && [ "$#" -le "$HELPER_DC_MAX_TARGETS" ] || helper_refuse 2 'invalid number of targets' || return
+  for spec in "$@"; do
+    ez_dc_target_spec_ok "$spec" || helper_refuse 2 "invalid target specification: $spec" || return
+    IFS='|' read -r path type sha fp alias <<EOF
+$spec
+EOF
+    case "$seen" in *" $path "*) helper_refuse 2 "target given twice: $path" || return ;; esac
+    seen="$seen$path "
+    fp="$(helper_norm_fp "$fp")"
+    [ "$fp" != "$H_NEWFP" ] || helper_refuse 2 "old and new fingerprints are identical: $path" || return
+    HT_PATH[$HT_COUNT]="$path"; HT_TYPE[$HT_COUNT]="$type"; HT_OLDSHA[$HT_COUNT]="$sha"; HT_OLDFP[$HT_COUNT]="$fp"
+    HT_ALIAS[$HT_COUNT]="$alias"; HT_STATE[$HT_COUNT]=prepared; HT_PW[$HT_COUNT]=""
+    HT_COUNT=$((HT_COUNT + 1))
+  done
+  helper_lock || helper_refuse 1 'cannot serialize the operation' || return
+  helper_journal_root || helper_refuse 1 'journal unavailable' || return
+  if [ -n "$(helper_journal_pending)" ]; then
+    helper_fail 'an interrupted Docker operation is not recovered yet; run "p1cert ezdrowie recover" first'
+    printf 'RESULT=PENDING_RECOVERY\n'
+    return 8
+  fi
+  helper_systemd_ready || helper_refuse 1 'systemd unavailable' || return
+  helper_tmpdir || { printf 'RESULT=FAILED\n'; return 1; }
+
+  # 2. The application, derived from the unit by the helper itself.
+  helper_dc_app "$unit" || helper_refuse 2 "the compose application of $unit cannot be verified" || return
+  helper_dc_single_unit "$unit" "$DCP_PROJDIR" || helper_refuse 2 'restart target is ambiguous' || return
+  # helper_dc_single_unit changes DCI_*/DCP_*: derive the application again.
+  helper_dc_app "$unit" || helper_refuse 2 "the compose application of $unit cannot be verified" || return
+  props="$H_PROPS"
+  # The state decides the restart: a unit in transition (starting,
+  # stopping, reloading) is not guessed about.
+  case "$H_ACTIVE" in
+    active|inactive|failed) ;;
+    *) helper_refuse 2 "unit $unit is in state ${H_ACTIVE:-unknown}; nothing changed, run again later" || return ;;
+  esac
+  H_SERVICES=""
+  if [ "$restart" = yes ] && [ "$H_ACTIVE" = active ]; then
+    helper_docker_ready || helper_refuse 1 'Docker unavailable: the restart could not be verified' || return
+    # The services running now must run again after the restart.
+    names="$(helper_dc_model_services)" || helper_refuse 2 'compose service names cannot be verified' || return
+    H_SERVICES="$(helper_dc_running_services "$DCP_PROJDIR" "$names")" ||
+      helper_refuse 1 'containers of the project cannot be inspected: the restart could not be verified' || return
+    [ -n "$H_SERVICES" ] ||
+      helper_refuse 2 "$unit is active but no container of $DCP_PROJDIR runs; the restart could not be verified" || return
+  fi
+
+  # 3. The approved source bytes.
+  now="$(date -u '+%s')"
+  helper_read_stdin_cert "$HELPER_TMP/new.in" || helper_refuse 2 'invalid certificate on stdin' || return
+  [ "$(ez_file_digest "$HELPER_TMP/new.in")" = "$src_sha" ] ||
+    helper_refuse 2 'new source file differs from the approved one (SHA-256)' || return
+  ez_cert_inspect "$HELPER_TMP/new.in"
+  rc=$?
+  [ "$rc" -eq 0 ] || helper_refuse 2 "new certificate is neither a single X.509 certificate nor a valid PEM chain (code $rc)" || return
+  ez_cert_save NEW
+  [ "$NEW_FP" = "$H_NEWFP" ] || helper_refuse 2 "new certificate fingerprint $NEW_FP differs from the expected $H_NEWFP" || return
+  if [ "$NEW_NB_EPOCH" -gt "$now" ] || [ "$NEW_NA_EPOCH" -le "$now" ]; then
+    helper_refuse 2 'new certificate is not currently valid' || return
+  fi
+
+  # 4. Every file: referenced by the application, exactly the approved bytes
+  #    and P1 entry, new content prepared and verified (root-private copies).
+  i=0
+  while [ "$i" -lt "$HT_COUNT" ]; do
+    path="${HT_PATH[$i]}"
+    helper_dc_check_target "$path" || helper_refuse 2 "invalid target: $path" || return
+    [ -n "$(helper_dc_refs "$path")" ] ||
+      helper_refuse 2 "$path is not referenced by the compose configuration of $unit (mount, secret or certificate variable)" || return
+    helper_enter_target_dir "$path" || helper_refuse 2 "unsafe target directory: $path" || return
+    HT_ID[$i]="$T_ID"; HT_UID[$i]="$T_UID"; HT_GID[$i]="$T_GID"; HT_MODE[$i]="$T_MODE"; HT_CTX[$i]="$T_CONTEXT"
+    helper_read_entry "$T_NAME" "$T_ID" "$HELPER_TMP/old-$i" || helper_refuse 2 "cannot read $path" || return
+    [ "$(ez_store_type "$HELPER_TMP/old-$i")" = "${HT_TYPE[$i]}" ] ||
+      helper_refuse 2 "$path is not a ${HT_TYPE[$i]} file" || return
+    if [ "$(ez_file_digest "$HELPER_TMP/old-$i")" != "${HT_OLDSHA[$i]}" ]; then
+      # Other bytes: fine only when the file already holds the new P1
+      # certificate (a second run of the same plan); anything else is a
+      # change since the plan.
+      if helper_dc_is_current "$i"; then
+        nochange=$((nochange + 1))
+        HT_STATE[$i]=current
+        i=$((i + 1))
+        continue
+      fi
+      helper_refuse 3 "current bytes of $path differ from the approved plan" || return
+    fi
+    case "${HT_TYPE[$i]}" in
+      PEM|DER)
+        ez_cert_inspect "$HELPER_TMP/old-$i" || helper_refuse 2 "$path is not a single certificate or valid chain" || return
+        ez_cert_save OLD
+        [ "$OLD_FP" = "${HT_OLDFP[$i]}" ] || {
+          if [ "$OLD_FP" = "$H_NEWFP" ]; then
+            nochange=$((nochange + 1))
+            HT_STATE[$i]=current
+            i=$((i + 1))
+            continue
+          fi
+          helper_refuse 3 "certificate in $path differs from the approved plan" || return
+        }
+        reason="$(ez_identity_compatible "$OLD_CN" "$OLD_NAMES" "$NEW_NAMES" "$NEW_IS_CA" "$NEW_SELF_SIGNED")" ||
+          helper_refuse 2 "$path: identity check failed: $reason" || return
+        [ "$NEW_NA_EPOCH" -gt "$OLD_NA_EPOCH" ] || helper_refuse 3 "$path: new certificate does not expire later" || return
+        reason="$(ez_replacement_format_ok "$OLD_FORMAT" "$OLD_COUNT" "$NEW_FORMAT" "$NEW_COUNT")" ||
+          helper_refuse 2 "$path: $reason" || return
+        helper_render_cert "$HELPER_TMP/new.in" "$NEW_FORMAT" "$NEW_COUNT" "$OLD_FORMAT" "$HELPER_TMP/new-$i" ||
+          helper_refuse 1 "$path: cannot encode the new certificate" || return
+        ez_cert_inspect "$HELPER_TMP/new-$i" && [ "$EZC_FP" = "$NEW_FP" ] && [ "$EZC_COUNT" = "$NEW_COUNT" ] ||
+          helper_refuse 1 "$path: encoded certificate verification failed" || return
+        ;;
+      JKS|PKCS12)
+        if [ "${HT_TYPE[$i]}" = PKCS12 ] && ! helper_p12_ready; then
+          helper_refuse 2 "$path: PKCS12 needs a Java 8+ runtime and the verified PKCS12 tool ($HELPER_P12_STATE); P1CERT never installs Java" || return
+        fi
+        helper_dc_password "$path" || helper_refuse 2 "$path: store password cannot be bound from the configuration" || return
+        HT_PW[$i]="$EZS_PASSWORD"
+        ez_store_open "$HELPER_TMP/old-$i" "${HT_TYPE[$i]}" yes || true
+        ez_store_p1
+        if [ "$EZS_STATUS" != OK ] || [ "$EZS_P1" != PEWNA ] || [ "${ES_ALIAS[$EZS_P1_ROW]}" != "${HT_ALIAS[$i]}" ]; then
+          helper_dc_finish
+          helper_refuse 3 "$path: store does not open with its configured password or has no unambiguous P1 entry ${HT_ALIAS[$i]}" || return
+        fi
+        if [ "${ES_FP[$EZS_P1_ROW]}" != "${HT_OLDFP[$i]}" ]; then
+          helper_dc_finish
+          helper_refuse 3 "$path: P1 entry differs from the approved plan" || return
+        fi
+        names="${ES_NAMES[$EZS_P1_ROW]}"; cn=""
+        na="$(ez_to_epoch "${ES_NOT_AFTER[$EZS_P1_ROW]}")"
+        reason="$(ez_identity_compatible "$cn" "$names" "$NEW_NAMES" "$NEW_IS_CA" "$NEW_SELF_SIGNED")" || {
+          helper_dc_finish
+          helper_refuse 2 "$path: identity check failed: $reason" || return
+        }
+        ez_epoch_ok "$na" && [ "$NEW_NA_EPOCH" -gt "$na" ] || { helper_dc_finish; helper_refuse 3 "$path: new certificate does not expire later" || return; }
+        if ! ez_dc_stage_store "$HELPER_TMP/old-$i" "${HT_TYPE[$i]}" "${HT_ALIAS[$i]}" "${HT_OLDFP[$i]}" \
+          "$HELPER_TMP/new.in" "$NEW_FORMAT" "$H_NEWFP" "$HELPER_TMP/new-$i"; then
+          helper_dc_finish
+          helper_refuse 2 "$path: $EZDS_REASON" || return
+        fi
+        HT_EXPECT[$i]="$EZDS_EXPECT"
+        EZS_PASSWORD=""
+        ;;
+    esac
+    HT_NEWSHA[$i]="$(ez_file_digest "$HELPER_TMP/new-$i")"
+    i=$((i + 1))
+  done
+  if [ "$nochange" -eq "$HT_COUNT" ]; then
+    helper_dc_finish
+    helper_dc_result NO_CHANGE
+    return 0
+  fi
+  [ "$nochange" -eq 0 ] || { helper_dc_finish; helper_refuse 3 'some files already hold the new certificate; create a new plan' || return; }
+
+  # 5. Journal, written and synced before the first file changes.
+  H_J="$(helper_fs "$HELPER_JOURNAL_DIR")/$(date '+%Y%m%d%H%M%S')-$$"
+  if ! ( umask 077 && mkdir -- "$H_J" ); then
+    helper_dc_finish
+    helper_refuse 1 'cannot create the journal' || return
+  fi
+  {
+    printf 'UNIT=%s\nPROJECT_DIR=%s\nUNIT_STATE_BEFORE=%s\nRESTART=%s\nSERVICES=%s\nSTARTED=%s\nNEW_FP=%s\nCOUNT=%s\n' \
+      "$unit" "$DCP_PROJDIR" "$H_ACTIVE" "$restart" "$H_SERVICES" "$now" "$H_NEWFP" "$HT_COUNT"
+    i=0
+    while [ "$i" -lt "$HT_COUNT" ]; do
+      printf 'TARGET_%s=%s|%s|%s|%s\n' "$i" "${HT_PATH[$i]}" "${HT_TYPE[$i]}" "${HT_OLDSHA[$i]}" "${HT_NEWSHA[$i]}"
+      i=$((i + 1))
+    done
+  } > "$H_J/manifest" || { helper_dc_finish; helper_refuse 1 'cannot write the journal' || return; }
+  i=0
+  while [ "$i" -lt "$HT_COUNT" ]; do
+    cp -- "$HELPER_TMP/old-$i" "$H_J/old-$i" && cp -- "$HELPER_TMP/new-$i" "$H_J/new-$i" &&
+      [ "$(ez_file_digest "$H_J/old-$i")" = "${HT_OLDSHA[$i]}" ] || { helper_dc_finish; helper_refuse 1 'cannot write the journal' || return; }
+    i=$((i + 1))
+  done
+  chmod 0600 "$H_J"/* 2>/dev/null
+  helper_journal_state "$H_J" PREPARED || { helper_dc_finish; helper_refuse 1 'cannot write the journal' || return; }
+
+  # 6. Commit.  From here on the operation completes (including any
+  #    rollback) even if the caller disconnects.
+  trap '' HUP INT TERM PIPE
+  helper_journal_state "$H_J" COMMITTING
+  i=0
+  while [ "$i" -lt "$HT_COUNT" ]; do
+    if ! helper_dc_install "$i" "$H_J/new-$i" "${HT_OLDSHA[$i]}" "${HT_ID[$i]}"; then
+      helper_fail "replacement of ${HT_PATH[$i]} failed"
+      # A failed rename leaves the original; installed but wrong bytes are
+      # undone with the others.
+      [ -z "$INSTALLED_ID" ] || HT_STATE[$i]=committed
+      helper_journal_state "$H_J" ROLLING_BACK
+      if helper_dc_rollback; then
+        helper_journal_state "$H_J" ROLLED_BACK
+        helper_dc_finish
+        helper_dc_result RESTORED
+        return 4
+      fi
+      helper_journal_state "$H_J" FAILED
+      helper_dc_finish
+      helper_dc_result ROLLBACK_FAILED
+      return 7
+    fi
+    HT_STATE[$i]=committed
+    i=$((i + 1))
+  done
+  helper_journal_state "$H_J" COMMITTED
+  i=0
+  while [ "$i" -lt "$HT_COUNT" ]; do
+    if ! helper_dc_verify "$i"; then
+      helper_fail "verification of ${HT_PATH[$i]} on disk failed; restoring all files"
+      helper_journal_state "$H_J" ROLLING_BACK
+      if helper_dc_rollback; then
+        helper_journal_state "$H_J" ROLLED_BACK
+        helper_dc_finish
+        helper_dc_result RESTORED
+        return 4
+      fi
+      helper_journal_state "$H_J" FAILED
+      helper_dc_finish
+      helper_dc_result ROLLBACK_FAILED
+      return 7
+    fi
+    i=$((i + 1))
+  done
+  helper_dc_finish
+
+  # 7. Restart: only the unit of this application, only when it was running
+  #    and the operator approved it; never a stopped unit.
+  if [ "$restart" != yes ] || [ "$H_ACTIVE" != active ]; then
+    helper_journal_state "$H_J" DONE
+    helper_journal_prune
+    helper_dc_result UPDATED
+    return 0
+  fi
+  if [ "$(helper_dc_unit_show "$unit")" != "$props" ]; then
+    helper_fail "unit $unit changed during the operation; no restart, restoring all files"
+    helper_journal_state "$H_J" ROLLING_BACK
+    if helper_dc_rollback; then
+      helper_journal_state "$H_J" ROLLED_BACK
+      helper_dc_result RESTORED
+      return 4
+    fi
+    helper_journal_state "$H_J" FAILED
+    helper_dc_result ROLLBACK_FAILED
+    return 7
+  fi
+  # From here on the containers may run with the new files: "recover"
+  # restarts the unit once after restoring them.
+  : > "$H_J/restarted" && helper_journal_state "$H_J" RESTARTING
+  if helper_dc_restart "$unit" "$DCP_PROJDIR" "$H_SERVICES"; then
+    helper_journal_state "$H_J" DONE
+    helper_journal_prune
+    helper_dc_result UPDATED_RESTARTED
+    return 0
+  fi
+  helper_fail 'restart with the new certificate failed; restoring all files'
+  helper_journal_state "$H_J" ROLLING_BACK
+  if ! helper_dc_rollback; then
+    helper_journal_state "$H_J" FAILED
+    helper_dc_result ROLLBACK_FAILED
+    return 7
+  fi
+  if helper_dc_restart "$unit" "$DCP_PROJDIR" "$H_SERVICES"; then
+    helper_journal_state "$H_J" ROLLED_BACK
+    helper_dc_result ROLLBACK
+    return 5
+  fi
+  helper_journal_state "$H_J" ROLLED_BACK
+  helper_fail 'restart with the original files failed too; manual action required'
+  helper_dc_result ROLLBACK_RESTART_FAILED
+  return 6
+}
+
+# --- recover -----------------------------------------------------------------
+
+# Undoes every unfinished Docker operation from its journal: a file that
+# holds the new bytes gets its original bytes back, a file with the original
+# bytes stays, a file with any other bytes is NOT touched (critical, manual
+# action).  When files were restored, the containers may have loaded the new
+# files (the restart of the operation had begun, or a container started
+# after the operation began: reboot, restart policy) and the unit is running
+# now, it is restarted once (and verified) - only when the operator had
+# approved the restart and the unit was running before the operation; a unit
+# that is not running is never started, an unapproved restart is only
+# reported.  Prints RECOVERY=NONE or one RECOVERY=RECOVERED|<id>|<detail> /
+# RECOVERY=FAILED|<id>|<detail> line per operation; exit 0 or 7 (at least
+# one failed).
+op_recover() {
+  local j id state line key value unit projdir before restart services started count i path type old new cur restored failed detail loaded rc=0 any=no
+
+  helper_lock || return 1
+  helper_journal_root || return 1
+  helper_tmpdir || return 1
+  HELPER_READ_BS="$EZ_DC_MAX_STORE_BYTES"
+  while IFS= read -r j; do
+    [ -n "$j" ] || continue
+    any=yes
+    id="${j##*/}"
+    state="$(head -n 1 -- "$j/state" 2>/dev/null)"
+    unit=""; projdir=""; before=""; restart=no; services=""; started=""; count=0
+    HT_COUNT=0; HT_PATH=(); HT_TYPE=(); HT_OLDSHA=(); HT_NEWSHA=(); HT_ID=(); HT_UID=(); HT_GID=(); HT_MODE=(); HT_CTX=(); HT_STATE=()
+    while IFS= read -r line; do
+      key="${line%%=*}"; value="${line#*=}"
+      case "$key" in
+        UNIT) unit="$value" ;;
+        PROJECT_DIR) projdir="$value" ;;
+        UNIT_STATE_BEFORE) before="$value" ;;
+        RESTART) restart="$value" ;;
+        SERVICES) services="$value" ;;
+        STARTED) started="$value" ;;
+        COUNT) count="$value" ;;
+        TARGET_*)
+          i="${key#TARGET_}"
+          IFS='|' read -r path type old new <<EOF
+$value
+EOF
+          HT_PATH[$i]="$path"; HT_TYPE[$i]="$type"; HT_OLDSHA[$i]="$old"; HT_NEWSHA[$i]="$new"; HT_STATE[$i]=unknown
+          ;;
+      esac
+    done < "$j/manifest"
+    H_J="$j"
+    restored=0; failed=""
+    i=0
+    while [ "$i" -lt "$count" ]; do
+      path="${HT_PATH[$i]:-}"
+      if [ -z "$path" ] || ! ez_dc_target_path_ok "$path" || ! helper_enter_target_dir "$path"; then
+        failed="${failed:+$failed, }${path:-?}"
+        i=$((i + 1))
+        continue
+      fi
+      HT_ID[$i]="$T_ID"; HT_UID[$i]="$T_UID"; HT_GID[$i]="$T_GID"; HT_MODE[$i]="$T_MODE"; HT_CTX[$i]="$T_CONTEXT"
+      cur=""
+      ! helper_read_entry "$T_NAME" "$T_ID" "$HELPER_TMP/recover-$i" || cur="$(ez_file_digest "$HELPER_TMP/recover-$i")"
+      if [ "$cur" = "${HT_OLDSHA[$i]}" ]; then
+        :
+      elif [ "$cur" = "${HT_NEWSHA[$i]}" ] && helper_dc_install "$i" "$j/old-$i" "${HT_NEWSHA[$i]}" "${HT_ID[$i]}"; then
+        restored=$((restored + 1))
+      else
+        failed="${failed:+$failed, }$path"
+      fi
+      i=$((i + 1))
+    done
+    HT_COUNT="$count"
+    if [ -n "$failed" ]; then
+      helper_journal_state "$j" FAILED
+      printf 'RECOVERY=FAILED|%s|%s: original bytes NOT restored: %s (copies in %s)\n' "$id" "$unit" "$failed" "$HELPER_JOURNAL_DIR/$id"
+      rc=7
+      continue
+    fi
+    detail="$unit: state $state, $restored file(s) restored"
+    if [ "$restored" -gt 0 ]; then
+      # Could the running containers hold the new files?
+      loaded=no
+      if [ -e "$j/restarted" ]; then
+        loaded=yes
+      elif ! ez_epoch_ok "$started" || ! helper_docker_ready || helper_dc_started_since "$projdir" "$started"; then
+        loaded=maybe
+      fi
+      if [ "$loaded" = no ]; then
+        detail="$detail, containers were not restarted during the operation (no restart needed)"
+      elif ! helper_systemctl is-active --quiet -- "$unit" 2>/dev/null; then
+        detail="$detail, $unit is not running and was not started"
+      elif [ "$restart" != yes ] || [ "$before" != active ] || [ -z "$services" ]; then
+        detail="$detail, containers may have loaded the new files; restart of $unit not approved - restart it manually"
+      elif helper_docker_ready && helper_dc_restart "$unit" "$projdir" "$services"; then
+        detail="$detail, $unit restarted with the original files"
+      else
+        detail="$detail, restart of $unit with the original files FAILED - manual check required"
+        rc=7
+      fi
+    fi
+    helper_journal_state "$j" RECOVERED
+    printf 'RECOVERY=RECOVERED|%s|%s\n' "$id" "$detail"
+  done <<EOF
+$(helper_journal_pending | LC_ALL=C sort)
+EOF
+  [ "$any" = yes ] || printf 'RECOVERY=NONE\n'
+  return "$rc"
+}
+
 helper_dispatch() {
   local op="${1:-}"
 
@@ -1159,6 +2125,8 @@ helper_dispatch() {
     apply:5) helper_apply none "$1" "$2" "$3" "$4" "$5" ;;
     apply-systemd:6) helper_apply systemd "$1" "$2" "$3" "$4" "$5" "$6" ;;
     apply-compose:7) helper_apply compose "$1" "$2" "$3" "$4" "$5" "$6" "$7" ;;
+    apply-docker:[5-9]|apply-docker:1[0-4]) helper_apply_docker "$@" ;;
+    recover:0) op_recover ;;
     schedule:2) op_schedule "$1" "$2" ;;
     schedule-cancel:0) op_schedule_cancel ;;
     *)

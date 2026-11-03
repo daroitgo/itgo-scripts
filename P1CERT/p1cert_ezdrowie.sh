@@ -64,7 +64,9 @@ EZ_HELPER='/usr/local/libexec/itgo-p1cert/p1cert-ezdrowie-helper'
 # with descriptor/inode bound replacement; an API 2 helper is refused.
 # 4: systemd binding through SSL.patch of the classic Integration Platform
 # (ez_systemd_bound rule C); helpers of API 1-3 are refused.
-EZ_HELPER_API=4
+# 5: Docker Compose applications (apply-docker, recover, plan version 3,
+# PKCS12 tool); helpers of API 1-4 are refused.
+EZ_HELPER_API=5
 EZ_SERVICE_UNIT='itgo-p1cert-ezdrowie.service'
 EZ_TIMER_UNIT='itgo-p1cert-ezdrowie.timer'
 # Trusted owner/group of target directories besides the P1CERT user itself
@@ -1171,6 +1173,1112 @@ ez_restart_label() {
 }
 
 # ---------------------------------------------------------------------------
+# Docker Compose discovery (read-only)
+# ---------------------------------------------------------------------------
+
+EZ_DC_SEP="$(printf '\034')"
+# Upper bound for the files listed from one bind-mounted directory.
+EZ_DC_DIR_SCAN_MAX=50
+
+ez_dc_unit_show() {
+  systemctl show --no-pager -p LoadState -p ActiveState -p FragmentPath -p DropInPaths \
+    -p WorkingDirectory -p ExecStart -p Environment -p EnvironmentFiles -- "$1" 2>/dev/null
+}
+
+# Note about a project (service "-") or a service: SERR (ambiguous), SWARN,
+# UNMAPPED, PW (password variable name), PROFILES.
+ez_dc_note() {
+  DN_PROJ[$DN_COUNT]="$1"; DN_SVC[$DN_COUNT]="$2"; DN_KIND[$DN_COUNT]="$3"; DN_TEXT[$DN_COUNT]="$4"
+  DN_COUNT=$((DN_COUNT + 1))
+}
+
+ez_dc_ref() {
+  DR_PROJ[$DR_COUNT]="$1"; DR_SVC[$DR_COUNT]="$2"; DR_HOST[$DR_COUNT]="$3"; DR_CONT[$DR_COUNT]="$4"; DR_ORIGIN[$DR_COUNT]="$5"
+  DR_COUNT=$((DR_COUNT + 1))
+}
+
+# Certificates and keystores inside a bind-mounted host directory that no
+# variable names explicitly (OLD archives are not descended).
+ez_dc_dir_refs() {
+  local p="$1" svc="$2" host="$3" cont="$4" fs prefix file logical n=0
+
+  ez_path_under_roots "$host" || return 0
+  ez_dc_path_in_old_dir "$host/x" && return 0
+  ez_path_no_symlinks "${P1CERT_FS_ROOT:-}" "$host" || return 0
+  fs="$(fs_path "$host")"
+  # A mounted file without a certificate extension counts only when its
+  # content is a certificate or keystore (configuration files are ignored).
+  if [ -f "$fs" ] && [ ! -L "$fs" ]; then
+    [ -r "$fs" ] && [ "$(ez_store_type "$fs")" != UNKNOWN ] || return 0
+    ez_dc_ref "$p" "$svc" "$host" "$cont" mount
+    return 0
+  fi
+  [ -d "$fs" ] && [ ! -L "$fs" ] || return 0
+  prefix="${P1CERT_FS_ROOT:-}"
+  prefix="${prefix%/}"
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    n=$((n + 1))
+    if [ "$n" -gt "$EZ_DC_DIR_SCAN_MAX" ]; then
+      ez_dc_note "$p" "$svc" SWARN "katalog $host zawiera więcej niż $EZ_DC_DIR_SCAN_MAX plików certyfikatów - pominięto resztę"
+      break
+    fi
+    logical="${file#"$prefix"}"
+    ez_dc_ref "$p" "$svc" "$logical" "$cont${logical#"$host"}" dir
+  done <<EOF
+$(find -P "$fs" -mindepth 1 -maxdepth 3 \( -type d \( -iname '*old*' -o -name .git -o -name node_modules \) -prune \) -o \
+    -type f \( -iname '*.pem' -o -iname '*.crt' -o -iname '*.cer' -o -iname '*.der' -o -iname '*.jks' \
+    -o -iname '*.p12' -o -iname '*.pfx' \) -print 2>/dev/null | LC_ALL=C sort)
+EOF
+}
+
+# Appends one compose project (DCI_* and DCP_* already set) to DP_* and its
+# references and notes to DR_* / DN_*.
+ez_dc_add_project() {
+  local unit="$1" active="$2" input="$3" p="$DP_COUNT" prefix t a b c d
+
+  prefix="${P1CERT_FS_ROOT:-}"
+  prefix="${prefix%/}"
+  DP_UNIT[$p]="$unit"; DP_ACTIVE[$p]="$active"; DP_VERSION[$p]="$DCI_VERSION"; DP_PROG[$p]="$DCI_PROG"
+  DP_SUB[$p]="$DCI_SUB"; DP_PROJDIR[$p]="$DCP_PROJDIR"; DP_FILES[$p]="$DCP_FILES"; DP_ENVFILE[$p]=""
+  DP_ERR[$p]="$DCP_ERR"; DP_PROFILES[$p]="$DCP_PROFILES"; DP_SERVICES[$p]=""
+  # What ez_dc_secret needs to read one value again later (in memory only).
+  DP_INPUT[$p]="$input"; DP_ENVCFG[$p]="$DCP_ENVFILE"; DP_ENVEXPL[$p]=0
+  [ -z "${DCI_ENVFILE:-}" ] || DP_ENVEXPL[$p]=1
+  DP_COUNT=$((DP_COUNT + 1))
+  if [ "$DCP_PROJDIR" != - ] && ez_dc_path_in_old_dir "$DCP_PROJDIR/x"; then
+    ez_dc_note "$p" - SWARN 'katalog projektu zawiera "OLD" w nazwie - jego pliki są pomijane'
+  fi
+  [ -n "$DCP_FILES" ] || return 0
+  while IFS="$EZ_DC_SEP" read -r t a b c d; do
+    case "$t" in
+      DOTENV) [ "$b" != used ] || DP_ENVFILE[$p]="$a" ;;
+      ERR) DP_ERR[$p]="${DP_ERR[$p]:-$b}" ;;
+      SVC)
+        ez_compose_service_ok "$a" || { DP_ERR[$p]="${DP_ERR[$p]:-nieobsługiwana nazwa usługi Compose}"; continue; }
+        DP_SERVICES[$p]="${DP_SERVICES[$p]:+${DP_SERVICES[$p]} }$a"
+        [ "$b" != profiles ] || ez_dc_note "$p" "$a" PROFILES 'usługa przypisana do profilu Compose'
+        ;;
+      SERR)
+        # One service that cannot be analysed makes the whole project
+        # uncertain: its unknown mounts may hide the same certificate.
+        ez_dc_note "$p" "$a" SERR "$b"
+        DP_ERR[$p]="${DP_ERR[$p]:-usługa $a: $b}"
+        ;;
+      SWARN) ez_dc_note "$p" "$a" SWARN "$b" ;;
+      ENVFILE) [ "$c" = used ] || ez_dc_note "$p" "$a" SWARN "brak opcjonalnego env_file $b" ;;
+      REF)
+        # A variable naming a mounted directory: covered by the DIR scan.
+        case "$d" in
+          env:*) [ ! -d "$(fs_path "$b")" ] || continue ;;
+        esac
+        ez_dc_ref "$p" "$a" "$b" "$c" "$d"
+        ;;
+      DIR) ez_dc_dir_refs "$p" "$a" "$b" "$c" ;;
+      UNMAPPED)
+        case "$d" in
+          relative) ez_dc_note "$p" "$a" UNMAPPED "$b=$c - ścieżka względna, nieznany katalog roboczy kontenera" ;;
+          *) ez_dc_note "$p" "$a" UNMAPPED "$b=$c - plik wewnątrz obrazu (brak wolumenu z hosta)" ;;
+        esac
+        ;;
+      PW)
+        ez_dc_note "$p" "$a" PW "$b ($c)"
+        DW_PROJ[$DW_COUNT]="$p"; DW_SVC[$DW_COUNT]="$a"; DW_NAME[$DW_COUNT]="$b"; DW_FILE[$DW_COUNT]="$d"
+        DW_UNAME[$DW_COUNT]="$(printf '%s' "$b" | tr '[:lower:]' '[:upper:]')"
+        DW_COUNT=$((DW_COUNT + 1))
+        ;;
+    esac
+  done <<EOF
+$(ez_dc_model "$prefix" "$input" 2>/dev/null)
+EOF
+}
+
+# Fills DP_* (compose projects: units running compose, then projects found
+# below the allowed roots that no unit runs), DR_* (certificate/keystore
+# references) and DN_* (notes).
+ez_dc_collect() {
+  local dir fsdir file unit seen=" " props active input prefix root i j
+
+  DP_COUNT=0; DP_UNIT=(); DP_ACTIVE=(); DP_VERSION=(); DP_PROG=(); DP_SUB=(); DP_PROJDIR=(); DP_FILES=()
+  DP_ENVFILE=(); DP_ERR=(); DP_PROFILES=(); DP_SERVICES=(); DP_INPUT=(); DP_ENVCFG=(); DP_ENVEXPL=()
+  DW_COUNT=0; DW_PROJ=(); DW_SVC=(); DW_NAME=(); DW_UNAME=(); DW_FILE=()
+  DR_COUNT=0; DR_PROJ=(); DR_SVC=(); DR_HOST=(); DR_CONT=(); DR_ORIGIN=()
+  DN_COUNT=0; DN_PROJ=(); DN_SVC=(); DN_KIND=(); DN_TEXT=()
+  prefix="${P1CERT_FS_ROOT:-}"
+  prefix="${prefix%/}"
+
+  if command -v systemctl >/dev/null 2>&1; then
+    for dir in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+      fsdir="$(fs_path "$dir")"
+      [ -d "$fsdir" ] || continue
+      for file in "$fsdir"/*.service; do
+        [ -f "$file" ] && [ ! -L "$file" ] || continue
+        unit="${file##*/}"
+        ez_unit_name_ok "$unit" || continue
+        case "$seen" in *" $unit "*) continue ;; esac
+        seen="$seen$unit "
+        ez_unit_denied "$unit" && continue
+        props="$(ez_dc_unit_show "$unit")" || continue
+        printf '%s\n' "$props" | grep -F -x -q 'LoadState=loaded' || continue
+        ez_dc_invocation "$props" || continue
+        active="$(printf '%s\n' "$props" | sed -n 's/^ActiveState=//p' | head -n 1)"
+        if [ "$DCI_VERSION" = '?' ]; then
+          # Not analysable: no project directory or file is guessed.
+          DCP_FILES=''; DCP_PROJDIR='-'; DCP_PROFILES=''; DCP_ERR="$DCI_ERR"
+          ez_dc_add_project "$unit" "${active:-unknown}" ""
+          continue
+        fi
+        input="$(ez_dc_unit_env_input "$props" "$DCI_ASSIGN")"
+        ez_dc_project "$prefix" "$input"
+        ez_dc_add_project "$unit" "${active:-unknown}" "$input"
+      done
+    done
+  fi
+
+  # One project run by several units: the restart target is ambiguous.
+  i=0
+  while [ "$i" -lt "$DP_COUNT" ]; do
+    j=0
+    while [ "$j" -lt "$DP_COUNT" ]; do
+      if [ "$i" -ne "$j" ] && [ "${DP_PROJDIR[$i]}" != - ] && [ "${DP_PROJDIR[$i]}" = "${DP_PROJDIR[$j]}" ]; then
+        DP_ERR[$i]="${DP_ERR[$i]:-projekt uruchamia kilka jednostek systemd (${DP_UNIT[$j]})}"
+      fi
+      j=$((j + 1))
+    done
+    i=$((i + 1))
+  done
+
+  for root in $EZ_ALLOWED_ROOTS; do
+    [ -d "$(fs_path "$root")" ] || continue
+    while IFS= read -r file; do
+      [ -n "$file" ] || continue
+      dir="${file#"$prefix"}"
+      dir="${dir%/*}"
+      ez_dc_path_ok "$dir" || continue
+      i=0
+      while [ "$i" -lt "$DP_COUNT" ]; do
+        [ "${DP_PROJDIR[$i]}" != "$dir" ] || break
+        i=$((i + 1))
+      done
+      [ "$i" -eq "$DP_COUNT" ] || continue
+      DCI_VERSION='-'; DCI_PROG=''; DCI_CWD="$dir"; DCI_FILES=''; DCI_PROJDIR=''; DCI_ENVFILE=''
+      DCI_NAME=''; DCI_PROFILES=''; DCI_SUB=''; DCI_ASSIGN=''; DCI_ERR=''
+      ez_dc_project "$prefix" ""
+      ez_dc_add_project - - ""
+    done <<EOF
+$(find -P "$(fs_path "$root")" -mindepth 1 -maxdepth 4 \( -type d \( -iname '*old*' -o -name .git -o -name node_modules \) -prune \) -o \
+    -type f \( -name compose.yaml -o -name compose.yml -o -name docker-compose.yaml -o -name docker-compose.yml \) \
+    -print 2>/dev/null | LC_ALL=C sort)
+EOF
+  done
+}
+
+# Classifies one referenced host file by its content (EZD_*):
+#   EZD_STATE  CERT (X.509 PEM/DER), STORE (JKS/PKCS12), MISSING or SKIP,
+#   EZD_TYPE   ez_store_type, EZD_REASON, and for CERT the leaf data and
+#   EZD_EZ (yes: an ezdrowie.gov.pl identity, e.g. *.ezdrowie.gov.pl).
+ez_dc_inspect() {
+  local path="$1" fs size rc identity
+
+  EZD_STATE=SKIP; EZD_REASON=""; EZD_TYPE=""; EZD_FP=""; EZD_SUBJECT=""; EZD_NOT_AFTER=""
+  EZD_NAMES=""; EZD_EZ=no; EZD_COUNT=0
+  if ! ez_dc_path_ok "$path"; then
+    EZD_REASON='ścieżka zawiera nieobsługiwane znaki'
+    return 0
+  fi
+  if ez_dc_path_in_old_dir "$path"; then
+    EZD_REASON='katalog z "OLD" w nazwie (archiwum) - wyłączony z obsługi'
+    return 0
+  fi
+  if ! ez_path_under_roots "$path"; then
+    EZD_REASON='poza katalogami /srv, /usr/local, /opt'
+    return 0
+  fi
+  fs="$(fs_path "$path")"
+  if [ ! -e "$fs" ] && [ ! -L "$fs" ]; then
+    EZD_STATE=MISSING
+    EZD_REASON='plik nie istnieje na hoście'
+    return 0
+  fi
+  if ! ez_path_no_symlinks "${P1CERT_FS_ROOT:-}" "$path"; then
+    EZD_REASON='ścieżka zawiera symlink'
+    return 0
+  fi
+  [ -f "$fs" ] || { EZD_REASON='nie jest zwykłym plikiem'; return 0; }
+  [ -r "$fs" ] || { EZD_REASON='brak uprawnień odczytu dla użytkownika P1CERT'; return 0; }
+  size="$(ez_file_size "$fs")"
+  if [ -z "$size" ] || [ "$size" -gt "$EZ_DC_MAX_STORE_BYTES" ]; then
+    EZD_REASON='plik jest zbyt duży'
+    return 0
+  fi
+  EZD_TYPE="$(ez_store_type "$fs")"
+  case "$EZD_TYPE" in
+    PEM|DER)
+      rc=0
+      ez_cert_inspect "$fs" || rc=$?
+      case "$rc" in
+        0)
+          EZD_STATE=CERT; EZD_FP="$EZC_FP"; EZD_SUBJECT="$EZC_SUBJECT"; EZD_NOT_AFTER="$EZC_NOT_AFTER"
+          EZD_NAMES="$EZC_NAMES"; EZD_COUNT="$EZC_COUNT"
+          if identity="$(ez_primary_identity "$EZC_CN" "$EZC_NAMES")"; then
+            EZD_EZ=yes
+            ! ez_is_nonprod_name "$identity" || EZD_REASON="tożsamość nieprodukcyjna ($identity)"
+          fi
+          ;;
+        3) EZD_REASON='zawiera klucz prywatny (materiał klienta TLS/WSS) - nie jest celem podmiany' ;;
+        4) EZD_REASON='plik certyfikatu jest zbyt duży' ;;
+        *) EZD_REASON="nie jest pojedynczym certyfikatem ani poprawnym łańcuchem PEM${EZC_REASON:+ ($EZC_REASON)}" ;;
+      esac
+      ;;
+    JKS|PKCS12) EZD_STATE=STORE ;;
+    JCEKS) EZD_REASON='magazyn JCEKS - nieobsługiwany (tylko JKS i PKCS12)' ;;
+    *) EZD_REASON='nierozpoznany format pliku' ;;
+  esac
+  return 0
+}
+
+# DT_SURE[$1] yes|no and DT_WHY[$1]: a file is a certain result only when
+# exactly one systemd unit runs the project(s) naming it, every such project
+# is unambiguous and at least one service names it explicitly (mount or
+# variable; a file merely present in a mounted directory is not enough).
+ez_dc_certainty() {
+  local t="$1" r p why="" explicit=no units=" " n=0
+
+  for r in ${DT_REFS[$t]}; do
+    p="${DR_PROJ[$r]}"
+    [ "${DR_ORIGIN[$r]}" = dir ] || explicit=yes
+    if [ -n "${DP_ERR[$p]}" ]; then
+      case "$why" in
+        *"[$((p + 1))]"*) ;;
+        *) why="${why:+$why, }niejednoznaczna konfiguracja projektu [$((p + 1))]" ;;
+      esac
+    fi
+    if [ "${DP_UNIT[$p]}" = - ]; then
+      case "$why" in *'brak jednostki'*) ;; *) why="${why:+$why, }brak jednostki systemd" ;; esac
+    elif ! ez_names_contain "$units" "${DP_UNIT[$p]}"; then
+      units="$units${DP_UNIT[$p]} "
+      n=$((n + 1))
+    fi
+  done
+  [ "$explicit" = yes ] || why="${why:+$why, }plik tylko w zamontowanym katalogu (brak odwołania w konfiguracji)"
+  [ "$n" -le 1 ] || why="${why:+$why, }plik używany przez kilka jednostek:${units% }"
+  DT_WHY[$t]="$why"
+  if [ -z "$why" ]; then DT_SURE[$t]=yes; else DT_SURE[$t]=no; fi
+}
+
+# Groups DR_* by host path into DT_* and inspects every file once.
+ez_dc_targets() {
+  local r t
+
+  DT_COUNT=0; DT_PATH=(); DT_REFS=(); DT_STATE=(); DT_TYPE=(); DT_REASON=(); DT_FP=(); DT_SUBJECT=()
+  DT_NOT_AFTER=(); DT_NAMES=(); DT_EZ=(); DT_NCERT=(); DT_SURE=(); DT_WHY=()
+  DT_SSTATUS=(); DT_SREASON=(); DT_SP1=(); DT_SP1WHY=(); DT_P1FP=(); DT_PWDESC=(); DT_SBLOCK=()
+  DT_P1ALIAS=(); DT_P1NAMES=(); DT_P1NA=(); DT_SHA=()
+  r=0
+  while [ "$r" -lt "$DR_COUNT" ]; do
+    t=0
+    while [ "$t" -lt "$DT_COUNT" ]; do
+      [ "${DT_PATH[$t]}" != "${DR_HOST[$r]}" ] || break
+      t=$((t + 1))
+    done
+    if [ "$t" -eq "$DT_COUNT" ]; then
+      DT_PATH[$t]="${DR_HOST[$r]}"; DT_REFS[$t]=""
+      DT_COUNT=$((DT_COUNT + 1))
+    fi
+    DT_REFS[$t]="${DT_REFS[$t]} $r"
+    r=$((r + 1))
+  done
+  t=0
+  while [ "$t" -lt "$DT_COUNT" ]; do
+    ez_dc_certainty "$t"
+    ez_dc_inspect "${DT_PATH[$t]}"
+    DT_STATE[$t]="$EZD_STATE"; DT_TYPE[$t]="$EZD_TYPE"; DT_REASON[$t]="$EZD_REASON"; DT_FP[$t]="$EZD_FP"
+    DT_SUBJECT[$t]="$EZD_SUBJECT"; DT_NOT_AFTER[$t]="$EZD_NOT_AFTER"; DT_NAMES[$t]="$EZD_NAMES"
+    DT_EZ[$t]="$EZD_EZ"; DT_NCERT[$t]="$EZD_COUNT"
+    DT_SSTATUS[$t]=""; DT_SREASON[$t]=""; DT_SP1[$t]=""; DT_SP1WHY[$t]=""; DT_PWDESC[$t]=""; DT_SBLOCK[$t]=""
+    DT_P1FP[$t]=""; DT_P1ALIAS[$t]=""; DT_P1NAMES[$t]=""; DT_P1NA[$t]=""; DT_SHA[$t]=""
+    case "$EZD_STATE" in
+      CERT|STORE) DT_SHA[$t]="$(ez_file_digest "$(fs_path "${DT_PATH[$t]}")")" ;;
+    esac
+    if [ "$EZD_STATE" = CERT ] && [ "$EZD_EZ" = yes ] && [ -z "$EZD_REASON" ]; then
+      DT_P1FP[$t]="$EZD_FP"
+    fi
+    [ "$EZD_STATE" != STORE ] || ez_dc_store "$t"
+    ez_log "docker target ${DT_PATH[$t]} state=$EZD_STATE type=$EZD_TYPE ezdrowie=$EZD_EZ certain=${DT_SURE[$t]}${EZD_FP:+ fp=$EZD_FP}${DT_SSTATUS[$t]:+ store=${DT_SSTATUS[$t]} p1=${DT_SP1[$t]}}${DT_P1FP[$t]:+ p1fp=${DT_P1FP[$t]}}"
+    t=$((t + 1))
+  done
+}
+
+# True when service $3 of project $1 names target $2 through a mount or a
+# variable (not only through a directory listing).
+ez_dc_named() {
+  local r
+  for r in ${DT_REFS[$2]}; do
+    [ "${DR_PROJ[$r]}" = "$1" ] && [ "${DR_SVC[$r]}" = "$3" ] && [ "${DR_ORIGIN[$r]}" != dir ] && return 0
+  done
+  return 1
+}
+
+# Password variables of the service behind reference $1 that the
+# configuration binds to the referenced store (PB_CANDS: DW_* indices,
+# PB_RULE: the rule; the rules ez_dc_pw_stem, ez_dc_pw_base and
+# ez_dc_pw_named are shared with the root helper).  Never by order or by
+# being the only password:
+#   1. the store is named by variable K: K without _FILE/_PATH/_LOCATION/
+#      _LOC/_NAME, followed by the password word (P1_KEYSTORE_PATH ->
+#      P1_KEYSTORE_PASSWORD, JAVAX_NET_SSL_TRUSTSTORE ->
+#      JAVAX_NET_SSL_TRUSTSTOREPASSWORD),
+#   2. otherwise the file name without extension (truststore.p12 ->
+#      TRUSTSTORE_PASSWORD or <PREFIX>_TRUSTSTORE_PASSWORD).
+ez_dc_pw_bind() {
+  local r="$1" p="${DR_PROJ[$1]}" svc="${DR_SVC[$1]}" origin="${DR_ORIGIN[$1]}" stem base w
+
+  PB_CANDS=""; PB_RULE=""
+  case "$origin" in
+    env:*)
+      stem="$(ez_dc_pw_stem "$origin")"
+      w=0
+      while [ "$w" -lt "$DW_COUNT" ]; do
+        if [ "${DW_PROJ[$w]}" = "$p" ] && [ "${DW_SVC[$w]}" = "$svc" ] && ez_dc_pw_named "${DW_UNAME[$w]}" "$stem"; then
+          PB_CANDS="$PB_CANDS $w"
+        fi
+        w=$((w + 1))
+      done
+      PB_RULE="nazwa zmiennej ścieżki ${origin#env:}"
+      ;;
+  esac
+  [ -z "$PB_CANDS" ] || return 0
+  base="$(ez_dc_pw_base "${DR_HOST[$r]}")"
+  w=0
+  while [ "$w" -lt "$DW_COUNT" ]; do
+    if [ "${DW_PROJ[$w]}" = "$p" ] && [ "${DW_SVC[$w]}" = "$svc" ] && ez_dc_pw_named "${DW_UNAME[$w]}" "$base" suffix; then
+      PB_CANDS="$PB_CANDS $w"
+    fi
+    w=$((w + 1))
+  done
+  PB_RULE="nazwa pliku ${DR_HOST[$r]##*/}"
+}
+
+# Prints the value of password variable DW $1: through ez_dc_secret, or the
+# first line of the host file a NAME_FILE variable points to.  Status 2 when
+# it cannot be read.  The value only goes to stdout (captured by $(...)).
+ez_dc_pw_value() {
+  local w="$1" p="${DW_PROJ[$1]}" prefix path fs size line=""
+
+  case "${DW_FILE[$w]}" in
+    '')
+      prefix="${P1CERT_FS_ROOT:-}"
+      prefix="${prefix%/}"
+      ez_dc_secret "$prefix" "${DP_INPUT[$p]}" "${DP_ENVCFG[$p]}" "${DP_ENVEXPL[$p]}" "${DP_FILES[$p]}" \
+        "${DP_PROJDIR[$p]}" "${DW_SVC[$w]}" "${DW_NAME[$w]}" || return 2
+      ;;
+    file:) return 2 ;;
+    file:*)
+      path="${DW_FILE[$w]#file:}"
+      ez_dc_path_ok "$path" && ! ez_dc_path_in_old_dir "$path" || return 2
+      ez_path_no_symlinks "${P1CERT_FS_ROOT:-}" "$path" || return 2
+      fs="$(fs_path "$path")"
+      [ -f "$fs" ] && [ -r "$fs" ] || return 2
+      size="$(ez_file_size "$fs")"
+      [ -n "$size" ] && [ "$size" -le 4096 ] || return 2
+      IFS= read -r line < "$fs" || [ -n "$line" ] || return 2
+      printf '%s' "${line%"$(printf '\r')"}"
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+# Short description of password variable DW $1 (name and origin, no value).
+ez_dc_pw_label() {
+  case "${DW_FILE[$1]}" in
+    file:?*) printf 'plik %s ze zmiennej %s usługi %s' "${DW_FILE[$1]#file:}" "${DW_NAME[$1]}" "${DW_SVC[$1]}" ;;
+    *) printf 'zmienna %s usługi %s' "${DW_NAME[$1]}" "${DW_SVC[$1]}" ;;
+  esac
+}
+
+# Opens keystore target $1 read-only: binds its password from the
+# configuration, verifies password and integrity, lists the entries and
+# identifies the P1 certificate.  Sets DT_SSTATUS, DT_SREASON, DT_SP1,
+# DT_SP1WHY, DT_P1FP, DT_PWDESC and DT_SBLOCK (report lines).  The password
+# lives only in local/EZS_PASSWORD variables and is cleared here.
+# Password of keystore target $1, bound by the configuration (see
+# ez_dc_pw_bind): EZS_PASSWORD (caller clears it), DSP_HAVE yes|no and, without
+# a usable password, DSP_STATUS/DSP_REASON.  Sets DT_PWDESC (names only).
+ez_dc_store_pw() {
+  local t="$1" r w bound="" nb=0 amb="" names value status="" reason="" have=no n
+
+  DT_PWDESC[$t]=""
+  for r in ${DT_REFS[$t]}; do
+    # A directory listing adds nothing when the service names the file.
+    [ "${DR_ORIGIN[$r]}" != dir ] || ! ez_dc_named "${DR_PROJ[$r]}" "$t" "${DR_SVC[$r]}" || continue
+    ez_dc_pw_bind "$r"
+    set -- $PB_CANDS
+    if [ "$#" -eq 1 ]; then
+      if ! ez_names_contain "$bound" "$1"; then
+        bound="$bound $1"
+        nb=$((nb + 1))
+        DT_PWDESC[$t]="${DT_PWDESC[$t]:+${DT_PWDESC[$t]}; }$(ez_dc_pw_label "$1") (powiązanie: $PB_RULE)"
+      fi
+    elif [ "$#" -gt 1 ]; then
+      names=""
+      for w in "$@"; do
+        names="${names:+$names, }${DW_NAME[$w]}"
+      done
+      amb="${amb:+$amb; }usługa ${DR_SVC[$r]}: $names"
+    fi
+  done
+  if [ -n "$amb" ]; then
+    status=HASLO_NIEJEDNOZNACZNE
+    reason="kilka zmiennych hasła pasuje do magazynu ($amb)"
+  elif [ "$nb" -eq 0 ]; then
+    status=BRAK_HASLA
+    reason='brak zmiennej hasła powiązanej z magazynem (nazwą zmiennej ścieżki lub nazwą pliku)'
+  else
+    EZS_PASSWORD=""
+    have=yes
+    n=0
+    for w in $bound; do
+      value=""
+      if ! value="$(ez_dc_pw_value "$w")"; then
+        status=HASLO_NIEJEDNOZNACZNE
+        reason="nie można odczytać wartości: $(ez_dc_pw_label "$w")"
+        have=no
+        break
+      fi
+      if [ "$n" -eq 0 ]; then
+        EZS_PASSWORD="$value"
+      elif [ "$value" != "$EZS_PASSWORD" ]; then
+        status=HASLO_NIEJEDNOZNACZNE
+        reason='zmienne hasła powiązane z magazynem mają różne wartości'
+        have=no
+        break
+      fi
+      n=$((n + 1))
+    done
+    value=""
+    [ "$have" = yes ] || EZS_PASSWORD=""
+  fi
+  DSP_HAVE="$have"; DSP_STATUS="$status"; DSP_REASON="$reason"
+}
+
+ez_dc_store() {
+  local t="$1" status reason have i n line block="" others=0 k fs
+
+  ez_dc_store_pw "$t"
+  have="$DSP_HAVE"; status="$DSP_STATUS"; reason="$DSP_REASON"
+
+  fs="$(fs_path "${DT_PATH[$t]}")"
+  ez_store_open "$fs" "${DT_TYPE[$t]}" "$have" || true
+  EZS_PASSWORD=""
+  if [ "$have" != yes ] && [ "$EZS_STATUS" = BRAK_HASLA ] && [ -n "$status" ]; then
+    EZS_STATUS="$status"
+    case "${DT_TYPE[$t]}" in
+      JKS) EZS_REASON="$reason - wpisy odczytane ze struktury, integralność niezweryfikowana" ;;
+      *) EZS_REASON="$reason" ;;
+    esac
+  fi
+  ez_store_p1
+  DT_SSTATUS[$t]="$EZS_STATUS"; DT_SREASON[$t]="$EZS_REASON"; DT_SP1[$t]="$EZS_P1"; DT_SP1WHY[$t]="$EZS_P1_WHY"
+  DT_P1FP[$t]=""; DT_P1ALIAS[$t]=""; DT_P1NAMES[$t]=""; DT_P1NA[$t]=""
+  if [ -n "$EZS_P1_ROW" ]; then
+    DT_P1FP[$t]="${ES_FP[$EZS_P1_ROW]}"; DT_P1ALIAS[$t]="${ES_ALIAS[$EZS_P1_ROW]}"
+    DT_P1NAMES[$t]="${ES_NAMES[$EZS_P1_ROW]}"; DT_P1NA[$t]="${ES_NOT_AFTER[$EZS_P1_ROW]}"
+  fi
+
+  # Report lines (built now: ES_* belong to the last opened store).
+  if [ "$EZS_ENTRIES" -gt 0 ] || [ -n "$EZS_FORMAT" ]; then
+    line="${EZS_FORMAT:-${DT_TYPE[$t]}}, wpisy: $EZS_ENTRIES (z kluczem prywatnym: $EZS_KEYS)"
+  else
+    line="${DT_TYPE[$t]}"
+  fi
+  block="          Format:     $line
+          Hasło:      ${DT_PWDESC[$t]:-nie powiązano}${DT_PWDESC[$t]:+ - wartość nie jest wyświetlana}
+"
+  if [ "$EZS_STATUS" = OK ]; then
+    block="$block          Magazyn:    OK - hasło poprawne, integralność potwierdzona
+"
+  else
+    block="$block          Magazyn:    $EZS_STATUS - $EZS_REASON
+"
+  fi
+  [ -z "$EZS_NOTE" ] || block="$block          Uwaga:      $EZS_NOTE
+"
+  if [ "$ES_COUNT" -gt 0 ]; then
+    block="$block          Wpisy:
+"
+    i=0
+    while [ "$i" -lt "$ES_COUNT" ]; do
+      if [ "${ES_KIND[$i]}" = PrivateKeyEntry ] && [ "${ES_POS[$i]}" = 1 ]; then
+        n=0
+        k=0
+        while [ "$k" -lt "$ES_COUNT" ]; do
+          [ "${ES_KIND[$k]}" != PrivateKeyEntry ] || [ "${ES_ENTRY[$k]}" != "${ES_ENTRY[$i]}" ] || n=$((n + 1))
+          k=$((k + 1))
+        done
+        block="$block            PrivateKeyEntry \"${ES_ALIAS[$i]}\" (łańcuch: $n): ${ES_SUBJECT[$i]:-nieczytelny certyfikat} - klucz prywatny, wpis nie będzie modyfikowany
+"
+      elif [ -n "${ES_ID[$i]}" ] || [ "${ES_OK[$i]}" != yes ]; then
+        block="$block            ${ES_KIND[$i]} \"${ES_ALIAS[$i]}\": "
+        if [ "${ES_OK[$i]}" != yes ]; then
+          block="${block}nieczytelny certyfikat
+"
+        else
+          block="$block${ES_NAMES[$i]}, ważny do ${ES_NOT_AFTER[$i]}, SHA-256 ${ES_FP[$i]}"
+          [ "${ES_NONPROD[$i]}" = no ] || block="$block (nieprodukcyjny)"
+          [ "${ES_CA[$i]}" = no ] || block="$block (CA)"
+          [ "${ES_POS[$i]}" = 1 ] || block="$block (pozycja ${ES_POS[$i]} w łańcuchu klucza)"
+          block="$block
+"
+        fi
+      elif [ "${ES_KIND[$i]}" != PrivateKeyEntry ]; then
+        others=$((others + 1))
+      fi
+      i=$((i + 1))
+    done
+    [ "$others" -eq 0 ] || block="$block            pozostałe certyfikaty niezwiązane z ezdrowie.gov.pl: $others
+"
+  fi
+  case "$EZS_P1" in
+    PEWNA)
+      block="$block          P1:         PEWNA - alias \"${ES_ALIAS[$EZS_P1_ROW]}\", SHA-256 ${ES_FP[$EZS_P1_ROW]}, ważny do ${ES_NOT_AFTER[$EZS_P1_ROW]}${EZS_P1_WHY:+ ($EZS_P1_WHY)}
+"
+      ;;
+    *) block="$block          P1:         $EZS_P1${EZS_P1_WHY:+ - $EZS_P1_WHY}
+" ;;
+  esac
+  DT_SBLOCK[$t]="$block"
+
+  # Certainty of the target: configuration (E1) and the store itself.
+  if [ "$EZS_STATUS" = OK ] && { [ "$EZS_P1" = BRAK ] || [ "$EZS_P1" = CHRONIONY ]; }; then
+    DT_SURE[$t]=na
+    DT_WHY[$t]='magazyn nie zawiera certyfikatu P1 do podmiany'
+  else
+    [ "$EZS_STATUS" = OK ] || DT_WHY[$t]="${DT_WHY[$t]:+${DT_WHY[$t]}, }magazyn: $EZS_STATUS"
+    [ "$EZS_P1" = PEWNA ] || DT_WHY[$t]="${DT_WHY[$t]:+${DT_WHY[$t]}, }identyfikacja P1: $EZS_P1"
+    [ -z "${DT_WHY[$t]}" ] || DT_SURE[$t]=no
+  fi
+  ez_store_reset
+}
+
+ez_dc_print_target() {
+  local p="$1" t="$2" r label="" others="" line
+
+  printf '      - %s\n' "$(ez_printable "${DT_PATH[$t]}")"
+  for r in ${DT_REFS[$t]}; do
+    if [ "${DR_PROJ[$r]}" != "$p" ]; then
+      ez_names_contain "$others" "$((DR_PROJ[$r] + 1))" || others="${others:+$others }$((DR_PROJ[$r] + 1))"
+      continue
+    fi
+    # The directory listing only matters when nothing names the file.
+    [ "${DR_ORIGIN[$r]}" != dir ] || ! ez_dc_named "$p" "$t" "${DR_SVC[$r]}" || continue
+    case "${DR_ORIGIN[$r]}" in
+      mount) label='wolumen' ;;
+      dir) label='plik w zamontowanym katalogu (bez odwołania w konfiguracji)' ;;
+      env:*) label="zmienna ${DR_ORIGIN[$r]#env:}" ;;
+      *) label="${DR_ORIGIN[$r]}" ;;
+    esac
+    printf '          Odwołanie:  usługa %s, %s -> %s\n' "${DR_SVC[$r]}" "$(ez_printable "$label")" "$(ez_printable "${DR_CONT[$r]}")"
+  done
+  [ -z "$others" ] || printf '          Uwaga:      plik używany także przez projekt(y) [%s]\n' "$others"
+  case "${DT_STATE[$t]}" in
+    CERT|STORE)
+      if [ "${DT_SURE[$t]}" = yes ]; then
+        printf '          Wynik:      PEWNY\n'
+      elif [ "${DT_SURE[$t]}" = na ]; then
+        printf '          Wynik:      NIE DOTYCZY - %s\n' "$(ez_printable "${DT_WHY[$t]}")"
+      else
+        printf '          Wynik:      NIEPEWNY - %s\n' "$(ez_printable "${DT_WHY[$t]}")"
+      fi
+      ;;
+  esac
+  case "${DT_STATE[$t]}" in
+    CERT)
+      if [ "${DT_NCERT[$t]}" -gt 1 ]; then
+        printf '          Format:     %s, łańcuch %s certyfikatów (dane certyfikatu końcowego)\n' "${DT_TYPE[$t]}" "${DT_NCERT[$t]}"
+      else
+        printf '          Format:     %s (X.509)\n' "${DT_TYPE[$t]}"
+      fi
+      printf '          SHA-256:    %s\n' "${DT_FP[$t]}"
+      printf '          Subject:    %s\n' "$(ez_printable "${DT_SUBJECT[$t]}")"
+      printf '          Not After:  %s\n' "${DT_NOT_AFTER[$t]}"
+      if [ "${DT_EZ[$t]}" = yes ]; then
+        printf '          ezdrowie:   TAK (%s)%s\n' "$(ez_printable "${DT_NAMES[$t]}")" "${DT_REASON[$t]:+ - ${DT_REASON[$t]}}"
+      else
+        printf '          ezdrowie:   NIE (%s)\n' "$(ez_printable "${DT_NAMES[$t]:-brak nazw DNS}")"
+      fi
+      ;;
+    STORE)
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        printf '%s\n' "$(ez_printable "$line")"
+      done <<EOF
+${DT_SBLOCK[$t]}
+EOF
+      ;;
+    MISSING) printf '          Status:     BRAK PLIKU (%s)\n' "${DT_REASON[$t]}" ;;
+    *) printf '          Status:     POMINIĘTO (%s)\n' "$(ez_printable "${DT_REASON[$t]}")" ;;
+  esac
+}
+
+ez_dc_print() {
+  local p=0 t r k shown n
+
+  printf 'Aplikacje Docker Compose i ich certyfikaty (tylko odczyt):\n'
+  if [ "$DP_COUNT" -eq 0 ]; then
+    printf '  nie znaleziono\n'
+    return 0
+  fi
+  while [ "$p" -lt "$DP_COUNT" ]; do
+    printf '\n[%s] ' "$((p + 1))"
+    if [ "${DP_UNIT[$p]}" = - ]; then
+      printf 'projekt bez jednostki systemd: %s\n' "$(ez_printable "${DP_PROJDIR[$p]}")"
+      printf '    Jednostka:  BRAK - P1CERT nie zrestartuje tej aplikacji\n'
+    else
+      printf 'jednostka systemd: %s (stan: %s)\n' "${DP_UNIT[$p]}" "$(ez_printable "${DP_ACTIVE[$p]}")"
+      case "${DP_VERSION[$p]}" in
+        v1) printf '    Compose:    v1 (docker-compose) %s\n' "$(ez_printable "${DP_SUB[$p]}")" ;;
+        v2) printf '    Compose:    v2 (docker compose) %s\n' "$(ez_printable "${DP_SUB[$p]}")" ;;
+        *) printf '    Compose:    nierozpoznane wywołanie\n' ;;
+      esac
+    fi
+    if [ "${DP_PROJDIR[$p]}" != - ]; then
+      printf '    Katalog:    %s\n' "$(ez_printable "${DP_PROJDIR[$p]}")"
+      if [ -n "${DP_FILES[$p]}" ]; then
+        printf '    Pliki:      %s\n' "$(ez_printable "$(printf '%s' "${DP_FILES[$p]}" | tr '\n' ' ')")"
+      fi
+      printf '    Zmienne:    %s\n' "$(ez_printable "${DP_ENVFILE[$p]:-brak pliku .env}")"
+    fi
+    [ -z "${DP_PROFILES[$p]}" ] || printf '    Profile:    %s\n' "$(ez_printable "${DP_PROFILES[$p]}")"
+    [ -z "${DP_SERVICES[$p]}" ] || printf '    Usługi:     %s\n' "$(ez_printable "${DP_SERVICES[$p]}")"
+    if [ -n "${DP_ERR[$p]}" ]; then
+      printf '    Status:     NIEJEDNOZNACZNA KONFIGURACJA - %s (podmiana będzie odrzucona)\n' "$(ez_printable "${DP_ERR[$p]}")"
+    else
+      printf '    Status:     OK\n'
+    fi
+    k=0
+    while [ "$k" -lt "$DN_COUNT" ]; do
+      if [ "${DN_PROJ[$k]}" = "$p" ]; then
+        case "${DN_KIND[$k]}" in
+          SERR) printf '    NIEJEDNOZNACZNE: usługa %s: %s\n' "${DN_SVC[$k]}" "$(ez_printable "${DN_TEXT[$k]}")" ;;
+          SWARN|PROFILES) printf '    Uwaga:      usługa %s: %s\n' "${DN_SVC[$k]}" "$(ez_printable "${DN_TEXT[$k]}")" ;;
+          UNMAPPED) printf '    Poza hostem: usługa %s: %s\n' "${DN_SVC[$k]}" "$(ez_printable "${DN_TEXT[$k]}")" ;;
+        esac
+      fi
+      k=$((k + 1))
+    done
+    printf '    Certyfikaty i magazyny:\n'
+    shown=0
+    t=0
+    while [ "$t" -lt "$DT_COUNT" ]; do
+      n=0
+      for r in ${DT_REFS[$t]}; do
+        [ "${DR_PROJ[$r]}" != "$p" ] || n=1
+      done
+      if [ "$n" -eq 1 ]; then
+        ez_dc_print_target "$p" "$t"
+        shown=$((shown + 1))
+      fi
+      t=$((t + 1))
+    done
+    [ "$shown" -gt 0 ] || printf '      brak odwołań do plików certyfikatów\n'
+    p=$((p + 1))
+  done
+}
+
+ez_discover() {
+  local t certs=0 ez=0 stores=0 opened=0 p1=0 unsure=0 fps="" nfps=0
+
+  ez_log_open discover || return 1
+  ez_dc_collect
+  ez_dc_targets
+  ez_dc_print
+  t=0
+  while [ "$t" -lt "$DT_COUNT" ]; do
+    case "${DT_STATE[$t]}" in
+      CERT|STORE)
+        [ "${DT_SURE[$t]}" = yes ] || [ "${DT_SURE[$t]}" = na ] || unsure=$((unsure + 1))
+        case "${DT_STATE[$t]}" in
+          CERT) certs=$((certs + 1)); [ "${DT_EZ[$t]}" != yes ] || ez=$((ez + 1)) ;;
+          *)
+            stores=$((stores + 1))
+            [ "${DT_SSTATUS[$t]}" != OK ] || opened=$((opened + 1))
+            [ "${DT_SP1[$t]}" != PEWNA ] || p1=$((p1 + 1))
+            ;;
+        esac
+        ;;
+    esac
+    if [ -n "${DT_P1FP[$t]}" ] && ! ez_names_contain "$fps" "${DT_P1FP[$t]}"; then
+      fps="$fps ${DT_P1FP[$t]}"
+      nfps=$((nfps + 1))
+    fi
+    t=$((t + 1))
+  done
+  printf '\nPodsumowanie: projekty %s, pliki %s (certyfikaty X.509 %s, w tym ezdrowie.gov.pl %s; magazyny JKS/PKCS12 %s, otwarte poprawnie %s, z jednoznacznym certyfikatem P1 %s; wyniki niepewne %s).\n' \
+    "$DP_COUNT" "$DT_COUNT" "$certs" "$ez" "$stores" "$opened" "$p1" "$unsure"
+  if [ "$nfps" -gt 0 ]; then
+    printf 'Odciski SHA-256 produkcyjnych certyfikatów ezdrowie.gov.pl w plikach i magazynach (%s):\n' "$nfps"
+    for t in $fps; do
+      printf '  %s\n' "$t"
+    done
+    [ "$nfps" -eq 1 ] || printf 'Uwaga: aplikacje używają różnych certyfikatów ezdrowie.gov.pl.\n'
+  fi
+  printf 'Polecenie niczego nie zmienia. Podmianę w aplikacjach Docker przygotowuje p1cert ezdrowie plan.\n'
+  ez_log "discover finished projects=$DP_COUNT files=$DT_COUNT certificates=$certs ezdrowie=$ez stores=$stores opened=$opened p1=$p1 uncertain=$unsure p1fps=$nfps"
+}
+
+# ---------------------------------------------------------------------------
+# Docker Compose applications in plan and run.  This unprivileged side only
+# decides and reports: files are written and units restarted exclusively by
+# the root helper (apply-docker), which derives the application, the files,
+# the passwords and the stores again on its own.
+# ---------------------------------------------------------------------------
+
+# ez_dc_app_decide <p>: the P1 files of compose project <p> (DP_*/DT_* from
+# ez_dc_collect and ez_dc_targets) and what the source certificate (R_*,
+# ez_fetch_remote) changes in them:
+#   DU_ALL  every P1 file (DT indices), DU_UPD the files to replace,
+#   DU_SRC  the selected source (R_* index), DU_DETAIL one line per file,
+#   DU_REASON why the application is refused (return 1).
+# Files: PEM/DER certificates with a production ezdrowie.gov.pl identity and
+# JKS/PKCS12 keystores whose P1 trustedCertEntry is certain.  The application
+# is refused as a whole when it has no systemd unit, an ambiguous
+# configuration, one uncertain P1 file, no usable source, files that would
+# need different sources or a format the source cannot keep.
+# PrivateKeyEntry entries, client keystores (no P1 certificate) and other
+# certificates are never targets.
+ez_dc_app_decide() {
+  local p="$1" t r mine names fp na action reason
+
+  DU_ALL=""; DU_UPD=""; DU_SRC=-1; DU_REASON=""; DU_DETAIL=""
+  [ "${DP_UNIT[$p]}" != - ] || { DU_REASON='projekt bez jednostki systemd'; return 1; }
+  [ -z "${DP_ERR[$p]}" ] || { DU_REASON="niejednoznaczna konfiguracja projektu: ${DP_ERR[$p]}"; return 1; }
+  t=0
+  while [ "$t" -lt "$DT_COUNT" ]; do
+    mine=no
+    for r in ${DT_REFS[$t]}; do
+      [ "${DR_PROJ[$r]}" != "$p" ] || mine=yes
+    done
+    if [ "$mine" = yes ]; then
+      case "${DT_STATE[$t]}" in
+        CERT)
+          if [ "${DT_EZ[$t]}" = yes ] && [ -z "${DT_REASON[$t]}" ]; then
+            [ "${DT_SURE[$t]}" = yes ] || { DU_REASON="${DT_PATH[$t]}: wynik niepewny (${DT_WHY[$t]})"; return 1; }
+            DU_ALL="$DU_ALL $t"
+          fi
+          ;;
+        STORE)
+          if [ "${DT_SURE[$t]}" != na ]; then
+            [ "${DT_SURE[$t]}" = yes ] || { DU_REASON="${DT_PATH[$t]}: wynik niepewny (${DT_WHY[$t]})"; return 1; }
+            ez_dc_alias_ok "${DT_P1ALIAS[$t]}" || { DU_REASON="${DT_PATH[$t]}: alias wpisu P1 zawiera nieobsługiwane znaki"; return 1; }
+            DU_ALL="$DU_ALL $t"
+          fi
+          ;;
+      esac
+    fi
+    t=$((t + 1))
+  done
+  [ -n "$DU_ALL" ] || { DU_REASON='aplikacja nie ma certyfikatu P1 do podmiany'; return 1; }
+
+  # One source certificate for all files; SHA-256 decides what changes.
+  for t in $DU_ALL; do
+    if [ "${DT_STATE[$t]}" = CERT ]; then
+      names="${DT_NAMES[$t]}"; fp="${DT_FP[$t]}"; na="$(ez_to_epoch "${DT_NOT_AFTER[$t]}")"
+    else
+      names="${DT_P1NAMES[$t]}"; fp="${DT_P1FP[$t]}"; na="$(ez_to_epoch "${DT_P1NA[$t]}")"
+    fi
+    ez_epoch_ok "$na" || { DU_REASON="${DT_PATH[$t]}: nieczytelna data ważności"; return 1; }
+    ez_select_remote "" "$names"
+    [ "$SEL_STATE" = VALID ] || { DU_REASON="${DT_PATH[$t]}: $SEL_REASON"; return 1; }
+    if [ "$DU_SRC" -lt 0 ]; then
+      DU_SRC="$SEL_INDEX"
+    elif [ "$DU_SRC" != "$SEL_INDEX" ]; then
+      DU_REASON='różne certyfikaty źródłowe dla plików jednej aplikacji'
+      return 1
+    fi
+    if [ "${DT_STATE[$t]}" = CERT ] &&
+      ! reason="$(ez_replacement_format_ok "${DT_TYPE[$t]}" "${DT_NCERT[$t]}" "${R_FMT[$DU_SRC]}" "${R_NCERT[$DU_SRC]}")"; then
+      DU_REASON="${DT_PATH[$t]}: $reason"
+      return 1
+    fi
+    action="$(ez_decide VALID "$fp" "$na" "${R_FP[$DU_SRC]}" "${R_NA[$DU_SRC]}")"
+    DU_DETAIL="$DU_DETAIL${DT_PATH[$t]}: $action (obecny SHA-256 $fp)
+"
+    [ "$action" != UPDATE ] || DU_UPD="$DU_UPD $t"
+  done
+  return 0
+}
+
+# Old fingerprint and alias of a target (the P1 entry of a keystore).
+ez_dc_target_fp() {
+  if [ "${DT_STATE[$1]}" = CERT ]; then printf '%s' "${DT_FP[$1]}"; else printf '%s' "${DT_P1FP[$1]}"; fi
+}
+
+# DC_APP_FILES: the P1 files of every unambiguous Docker application
+# (ez_dc_app_decide succeeds); the classic part of the plan leaves them to
+# the Docker part.  Files of refused applications keep the classic handling.
+ez_dc_app_files() {
+  local p=0 t
+
+  DC_APP_FILES=""
+  while [ "$p" -lt "$DP_COUNT" ]; do
+    if ez_dc_app_decide "$p"; then
+      for t in $DU_ALL; do
+        DC_APP_FILES="${DC_APP_FILES:+$DC_APP_FILES }${DT_PATH[$t]}"
+      done
+    fi
+    p=$((p + 1))
+  done
+}
+
+# Docker part of the plan: every application with P1 files is shown with
+# its files, the source, the state of its unit and the predicted restart;
+# the operator approves the replacement of ALL its files as one operation
+# and, separately, the restart of its unit.  Approved applications go to
+# PA_* (plan records APP and APP_TARGET).  DOCKER_CANDIDATES counts the
+# applications offered.  Needs ez_dc_collect/ez_dc_targets and R_*.
+ez_plan_docker() {
+  local p t caps p12=unknown reason state alias line k
+
+  PA_COUNT=0; PA_UNIT=(); PA_RESTART=(); PA_SFP=(); PA_SNA=(); PA_SDG=(); PA_TARGETS=()
+  DOCKER_CANDIDATES=0
+  [ "$DP_COUNT" -gt 0 ] || return 0
+  # PKCS12 is replaced by the root helper with its own Java runtime and its
+  # integrity-checked tool; it reports both in "ping".
+  if ez_helper_usable; then
+    caps="$(ez_helper_run ping 2>/dev/null)" || caps=""
+    case "$caps" in
+      *P12_TOOL=OK*) p12=yes ;;
+      *) p12=no ;;
+    esac
+  fi
+  printf '\nAplikacje Docker Compose:\n'
+  p=0
+  while [ "$p" -lt "$DP_COUNT" ]; do
+    if ! ez_dc_app_decide "$p"; then
+      [ "$DU_REASON" = 'aplikacja nie ma certyfikatu P1 do podmiany' ] ||
+        ez_say "  SKIP       [$((p + 1))] ${DP_UNIT[$p]} ${DP_PROJDIR[$p]}: $DU_REASON"
+      p=$((p + 1))
+      continue
+    fi
+    if [ -z "$DU_UPD" ]; then
+      ez_say "  NO CHANGE  [$((p + 1))] ${DP_UNIT[$p]}: certyfikaty P1 aplikacji są aktualne"
+      p=$((p + 1))
+      continue
+    fi
+    reason=""
+    for t in $DU_UPD; do
+      # A file approved above as a classic target (A_PATH of ez_plan) stays
+      # there: one file is never in two operations of the same plan.
+      if ez_names_contain "${A_PATH[*]:-}" "${DT_PATH[$t]}"; then
+        reason="${DT_PATH[$t]}: plik jest już zatwierdzony jako klasyczny target tego planu"
+        break
+      fi
+      if [ "${DT_TYPE[$t]}" = PKCS12 ] && [ "$p12" != yes ]; then
+        case "$p12" in
+          unknown) reason="${DT_PATH[$t]}: PKCS12 wymaga helpera P1CERT (niedostępny - nie można sprawdzić środowiska Java)" ;;
+          *) reason="${DT_PATH[$t]}: PKCS12 wymaga środowiska Java 8+ i sprawdzonego narzędzia p1cert-pkcs12.jar w helperze (P1CERT nie instaluje Javy)" ;;
+        esac
+        break
+      fi
+      if ! ez_target_dir_ok "$(fs_path "${DT_PATH[$t]%/*}")" "$EZ_TRUSTED_UID" "$EZ_TRUSTED_GID" "$(id -u)" "$(id -g)"; then
+        reason="${DT_PATH[$t]}: katalog nie należy do root ani do użytkownika P1CERT albo jest zapisywalny dla innych; helper odmówi - wymagana podmiana ręczna"
+        break
+      fi
+    done
+    if [ -n "$reason" ]; then
+      ez_warn "SKIP aplikacja [$((p + 1))] ${DP_UNIT[$p]}: $reason"
+      p=$((p + 1))
+      continue
+    fi
+
+    DOCKER_CANDIDATES=$((DOCKER_CANDIDATES + 1))
+    state="${DP_ACTIVE[$p]}"
+    printf '\n=== APLIKACJA DOCKER %s: %s ===\n' "$DOCKER_CANDIDATES" "${DP_UNIT[$p]}"
+    printf '  Jednostka:          %s (stan: %s)\n' "${DP_UNIT[$p]}" "$(ez_printable "$state")"
+    printf '  Projekt Compose:    %s\n' "$(ez_printable "${DP_PROJDIR[$p]}")"
+    printf '  Źródło:             %s (NotAfter %s)\n' "${R_NAME[$DU_SRC]}" "${R_NOT_AFTER[$DU_SRC]}"
+    printf '  Nowy SHA-256:       %s\n' "${R_FP[$DU_SRC]}"
+    printf '  Pliki (podmieniane razem, jedną operacją):\n'
+    for t in $DU_UPD; do
+      if [ "${DT_STATE[$t]}" = CERT ]; then
+        printf '    - %s (%s)\n' "$(ez_printable "${DT_PATH[$t]}")" "${DT_TYPE[$t]}"
+      else
+        printf '    - %s (%s, wpis "%s"; pozostałe wpisy i klucze prywatne bez zmian)\n' \
+          "$(ez_printable "${DT_PATH[$t]}")" "${DT_TYPE[$t]}" "${DT_P1ALIAS[$t]}"
+      fi
+      printf '        stary SHA-256: %s\n' "$(ez_dc_target_fp "$t")"
+    done
+    if [ "$state" = active ]; then
+      printf '  Przewidywany restart: systemctl restart %s (jednostka zarządza całym projektem Compose)\n' "${DP_UNIT[$p]}"
+    else
+      printf '  Przewidywany restart: brak - jednostka nie jest aktywna i nie zostanie uruchomiona\n'
+    fi
+    if ! ez_ask_yes "  Dopuścić PODMIANĘ certyfikatu P1 we wszystkich plikach aplikacji ${DP_UNIT[$p]}?"; then
+      ez_say "  operator odrzucił aplikację: ${DP_UNIT[$p]}"
+      p=$((p + 1))
+      continue
+    fi
+    k="$PA_COUNT"
+    PA_RESTART[$k]=no
+    if [ "$state" = active ] && ez_ask_yes "  Dopuścić RESTART: systemctl restart ${DP_UNIT[$p]}?"; then
+      PA_RESTART[$k]=yes
+    fi
+    PA_UNIT[$k]="${DP_UNIT[$p]}"; PA_SFP[$k]="${R_FP[$DU_SRC]}"; PA_SNA[$k]="${R_NA[$DU_SRC]}"
+    PA_SDG[$k]="$(ez_file_digest "${R_FILE[$DU_SRC]}")"
+    PA_TARGETS[$k]=""
+    for t in $DU_UPD; do
+      alias=-
+      [ "${DT_STATE[$t]}" = CERT ] || alias="${DT_P1ALIAS[$t]}"
+      line="${DT_PATH[$t]}|${DT_TYPE[$t]}|${DT_SHA[$t]}|$(ez_dc_target_fp "$t")|$alias"
+      PA_TARGETS[$k]="${PA_TARGETS[$k]:+${PA_TARGETS[$k]}
+}$line"
+    done
+    PA_COUNT=$((PA_COUNT + 1))
+    ez_say "  zaakceptowano aplikację: ${DP_UNIT[$p]} restart=${PA_RESTART[$k]}"
+    p=$((p + 1))
+  done
+}
+
+# Validates one plan target of a Docker application (same rule as the
+# helper): path|type|old-file-sha256|old-fp|alias.
+ez_plan_app_target_ok() {
+  ez_dc_target_spec_ok "$1"
+}
+
+# Runs one approved Docker application of the plan through the root helper
+# (T entry $1, PA_* index $2).
+ez_run_docker_app() {
+  local i="$1" k="$2" r=0 src=-1 out rc result state line t n=0 path type sha fp alias
+  local -a args=()
+
+  P_PATH[$i]="docker:${PA_UNIT[$k]}"
+  while [ "$r" -lt "$R_COUNT" ]; do
+    if [ "${R_STATE[$r]}" = VALID ] && [ "${R_FP[$r]}" = "${PA_SFP[$k]}" ] &&
+      [ "$(ez_file_digest "${R_FILE[$r]}")" = "${PA_SDG[$k]}" ]; then
+      src="$r"
+      break
+    fi
+    r=$((r + 1))
+  done
+  if [ "$src" -lt 0 ]; then
+    ez_set_result "$i" SKIP 'source certificate file differs from the accepted plan; create a new plan'
+    return 0
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    args[$n]="$line"
+    n=$((n + 1))
+  done <<EOF
+${PA_TARGETS[$k]}
+EOF
+  ez_say "Podmiana w aplikacji Docker: ${PA_UNIT[$k]} ($n plik(i), restart: ${PA_RESTART[$k]})"
+  out="$(ez_helper_run apply-docker "${PA_UNIT[$k]}" "${PA_RESTART[$k]}" "${PA_SDG[$k]}" "${PA_SFP[$k]}" "${args[@]}" < "${R_FILE[$src]}")"
+  rc=$?
+  ez_log "helper apply-docker ${PA_UNIT[$k]} rc=$rc: $(printf '%s' "$out" | tr '\n' ' ')"
+  result="$(printf '%s\n' "$out" | sed -n 's/^RESULT=//p' | head -n 1)"
+  state="$(printf '%s\n' "$out" | sed -n 's/^UNIT_STATE_BEFORE=//p' | head -n 1)"
+  case "$rc:$result" in
+    0:UPDATED_RESTARTED|0:UPDATED) ;;
+    0:NO_CHANGE) ez_set_result "$i" NO_CHANGE 'helper: all files already hold the source certificate'; return 0 ;;
+    2:*) ez_set_result "$i" REFUSED 'helper refused (plan, source, paths, application binding or stores did not verify); nothing changed'; return 0 ;;
+    3:*) ez_set_result "$i" SKIP 'a file changed since the accepted plan (exact bytes or fingerprint differ); nothing changed; create a new plan'; return 0 ;;
+    4:*) ez_set_result "$i" ERROR 'replacement undone by the helper before any restart (verification failed); original files restored'; return 0 ;;
+    5:*) ez_set_result "$i" ROLLBACK "restart of ${PA_UNIT[$k]} failed or did not restart the containers; original files restored; restart with them succeeded"; return 0 ;;
+    6:*) ez_set_result "$i" ROLLBACK_RESTART_FAILED "restart of ${PA_UNIT[$k]} failed; original files restored and verified, but the application still does not run correctly - manual intervention required"; return 0 ;;
+    7:*) ez_set_result "$i" CRITICAL "ROLLBACK FAILED - original files NOT restored; see the helper journal (p1cert ezdrowie recover)"; return 0 ;;
+    8:*) ez_set_result "$i" CRITICAL 'an interrupted operation is not recovered yet; run: p1cert ezdrowie recover'; return 0 ;;
+    *) ez_set_result "$i" ERROR "helper apply-docker failed (code $rc)"; return 0 ;;
+  esac
+
+  # Independent check of the files (as the P1CERT user).
+  while IFS='|' read -r path type sha fp alias; do
+    [ -n "$path" ] || continue
+    case "$type" in
+      PEM|DER)
+        if ! ez_cert_inspect "$(fs_path "$path")" || [ "$EZC_FP" != "${PA_SFP[$k]}" ]; then
+          ez_set_result "$i" ERROR "helper reported success but $path does not hold the source certificate - manual check required"
+          return 0
+        fi
+        ;;
+      *)
+        if [ "$(ez_file_digest "$(fs_path "$path")")" = "$sha" ]; then
+          ez_set_result "$i" ERROR "helper reported success but $path is unchanged - manual check required"
+          return 0
+        fi
+        ;;
+    esac
+  done <<EOF
+${PA_TARGETS[$k]}
+EOF
+  if [ "$result" = UPDATED_RESTARTED ]; then
+    ez_set_result "$i" UPDATED "$n file(s) replaced and verified; ${PA_UNIT[$k]} restarted, containers verified"
+  elif [ "${PA_RESTART[$k]}" = yes ]; then
+    ez_set_result "$i" UPDATED "$n file(s) replaced and verified; ${PA_UNIT[$k]} was ${state:-not active} before - not started"
+  else
+    ez_set_result "$i" UPDATED "$n file(s) replaced and verified; no restart approved (restart ${PA_UNIT[$k]} manually)"
+  fi
+}
+
+# True when the helper reports interrupted Docker operations (ping).
+ez_docker_pending() {
+  local n
+
+  n="$(ez_helper_run ping 2>/dev/null | sed -n 's/^DOCKER_PENDING=//p' | head -n 1)"
+  case "$n" in
+    ''|0|*[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Recovery of interrupted Docker operations by the root helper (journal);
+# each recovered or failed operation becomes a T entry.  Returns 1 when an
+# operation could not be recovered.
+ez_run_recover() {
+  local out line id kind detail rc=0
+
+  out="$(ez_helper_run recover)" || rc=1
+  while IFS= read -r line; do
+    case "$line" in
+      RECOVERY=RECOVERED\|*|RECOVERY=FAILED\|*) ;;
+      *) continue ;;
+    esac
+    line="${line#RECOVERY=}"
+    kind="${line%%|*}"; line="${line#*|}"; id="${line%%|*}"; detail="${line#*|}"
+    P_PATH[$T_COUNT]="recovery:$id"
+    T_RESULT[$T_COUNT]=PENDING; T_DETAIL[$T_COUNT]=''
+    if [ "$kind" = RECOVERED ]; then
+      ez_set_result "$T_COUNT" RECOVERED "interrupted Docker operation recovered: $detail"
+    else
+      ez_set_result "$T_COUNT" CRITICAL "interrupted Docker operation could NOT be recovered: $detail"
+      rc=1
+    fi
+    T_COUNT=$((T_COUNT + 1))
+  done <<EOF
+$out
+EOF
+  return "$rc"
+}
+
+ez_recover_body() {
+  local out rc
+
+  ez_require_helper || return 1
+  out="$(ez_helper_run recover)"
+  rc=$?
+  printf '%s\n' "$out" | sed -n 's/^RECOVERY=//p' | while IFS= read -r line; do
+    printf '  %s\n' "$(ez_printable "$line")"
+  done
+  ez_log "recover rc=$rc: $(printf '%s' "$out" | tr '\n' ' ')"
+  return "$rc"
+}
+
+ez_recover() {
+  ez_log_open recover || return 1
+  printf 'Odzyskiwanie przerwanych operacji Docker (dziennik helpera):\n'
+  ez_with_lock ez_recover_body
+}
+
+# ---------------------------------------------------------------------------
 # Plan
 # ---------------------------------------------------------------------------
 
@@ -1222,15 +2330,64 @@ ez_plan_load() {
   if [ "$rc" -ne 0 ]; then
     P_COUNT=0; P_ID=""
     P_PATH=(); P_LFP=(); P_LNA=(); P_LDG=(); P_RFP=(); P_RNA=(); P_RDG=(); P_KIND=(); P_A=(); P_B=()
+    PA_COUNT=0; PA_UNIT=(); PA_RESTART=(); PA_SFP=(); PA_SNA=(); PA_SDG=(); PA_TARGETS=()
   fi
   return "$rc"
 }
 
+# APP=<unit>|<restart yes|no>|<source-fp>|<source-notafter>|<source-file-sha256>
+ez_plan_parse_app() {
+  local unit restart sfp sna sdg separators k=0
+
+  separators="${1//[!|]/}"
+  [ "${#separators}" -eq 4 ] || return 1
+  IFS='|' read -r unit restart sfp sna sdg <<EOF
+$1
+EOF
+  ez_unit_name_ok "$unit" && ! ez_unit_denied "$unit" || return 1
+  case "$restart" in yes|no) ;; *) return 1 ;; esac
+  ez_fp_ok "$sfp" && ez_epoch_ok "$sna" && ez_digest_ok "$sdg" || return 1
+  while [ "$k" -lt "$PA_COUNT" ]; do
+    [ "${PA_UNIT[$k]}" != "$unit" ] || return 1
+    k=$((k + 1))
+  done
+  PA_UNIT[$PA_COUNT]="$unit"; PA_RESTART[$PA_COUNT]="$restart"; PA_SFP[$PA_COUNT]="$sfp"
+  PA_SNA[$PA_COUNT]="$sna"; PA_SDG[$PA_COUNT]="$sdg"; PA_TARGETS[$PA_COUNT]=""
+  PA_COUNT=$((PA_COUNT + 1))
+}
+
+# APP_TARGET=<unit>|<path>|<type>|<old-file-sha256>|<old-fp>|<alias|->
+# (after its APP record; a path appears once in the whole plan).
+ez_plan_parse_app_target() {
+  local unit="${1%%|*}" target="${1#*|}" k=0 found=-1 i path
+
+  ez_plan_app_target_ok "$target" || return 1
+  path="${target%%|*}"
+  while [ "$k" -lt "$PA_COUNT" ]; do
+    [ "${PA_UNIT[$k]}" != "$unit" ] || found="$k"
+    case "
+${PA_TARGETS[$k]}" in
+      *"
+$path|"*) return 1 ;;
+    esac
+    k=$((k + 1))
+  done
+  [ "$found" -ge 0 ] || return 1
+  i=0
+  while [ "$i" -lt "$P_COUNT" ]; do
+    [ "${P_PATH[$i]}" != "$path" ] || return 1
+    i=$((i + 1))
+  done
+  PA_TARGETS[$found]="${PA_TARGETS[$found]:+${PA_TARGETS[$found]}
+}$target"
+}
+
 ez_plan_load_records() {
-  local file="$1" line key value version=""
+  local file="$1" line key value version="" k
 
   P_COUNT=0; P_ID=""; P_CREATED_AT=""; P_CREATED_BY=""
   P_PATH=(); P_LFP=(); P_LNA=(); P_LDG=(); P_RFP=(); P_RNA=(); P_RDG=(); P_KIND=(); P_A=(); P_B=()
+  PA_COUNT=0; PA_UNIT=(); PA_RESTART=(); PA_SFP=(); PA_SNA=(); PA_SDG=(); PA_TARGETS=()
   [ -e "$file" ] || [ -L "$file" ] || return 2
   if [ -L "$file" ] || [ ! -f "$file" ] || ! ez_file_owner_ok "$file"; then
     return 1
@@ -1244,7 +2401,9 @@ ez_plan_load_records() {
     key="${line%%=*}"
     value="${line#*=}"
     case "$key" in
-      PLAN_VERSION) [ "$value" = 2 ] || return 1; version=2 ;;
+      PLAN_VERSION)
+        case "$value" in 2|3) version="$value" ;; *) return 1 ;; esac
+        ;;
       PLAN_ID)
         printf '%s\n' "$value" | grep -E -q '^[0-9]{14}-[0-9]+$' || return 1
         P_ID="$value"
@@ -1258,10 +2417,20 @@ ez_plan_load_records() {
         [ "$key" = HOST ] || P_CREATED_BY="$value"
         ;;
       TARGET) ez_plan_parse_target "$value" || return 1 ;;
+      APP) [ "$version" = 3 ] && ez_plan_parse_app "$value" || return 1 ;;
+      APP_TARGET) [ "$version" = 3 ] && ez_plan_parse_app_target "$value" || return 1 ;;
       *) return 1 ;;
     esac
   done < "$file"
-  [ "$version" = 2 ] && [ -n "$P_ID" ] || return 1
+  [ -n "$version" ] && [ -n "$P_ID" ] || return 1
+  # Version 3 exists only for Docker applications (a classic plan stays 2).
+  [ "$version" = 2 ] || [ "$PA_COUNT" -gt 0 ] || return 1
+  # Every approved application has at least one file.
+  k=0
+  while [ "$k" -lt "$PA_COUNT" ]; do
+    [ -n "${PA_TARGETS[$k]}" ] || return 1
+    k=$((k + 1))
+  done
   return 0
 }
 
@@ -1273,13 +2442,13 @@ ez_plan_load_reported() {
   case "$rc" in
     0) return 0 ;;
     2) ez_err "brak zaakceptowanego planu ($EZ_PLAN_FILE). Uruchom: p1cert ezdrowie plan" ;;
-    *) ez_err "plan $EZ_PLAN_FILE jest nieprawidłowy lub ma starszy format (wymagany PLAN_VERSION=2); utwórz nowy: p1cert ezdrowie plan" ;;
+    *) ez_err "plan $EZ_PLAN_FILE jest nieprawidłowy lub ma starszy format (wymagany PLAN_VERSION=2 lub 3); utwórz nowy: p1cert ezdrowie plan" ;;
   esac
   return "$rc"
 }
 
 ez_plan_print() {
-  local i=0
+  local i=0 k=0 path type sha fp alias
 
   printf 'Plan: %s\n  ID: %s\n  Utworzony: %s przez %s\n  Targety: %s\n' \
     "$EZ_PLAN_FILE" "$P_ID" "$P_CREATED_AT" "$P_CREATED_BY" "$P_COUNT"
@@ -1288,10 +2457,23 @@ ez_plan_print() {
       "${P_PATH[$i]}" "${P_LFP[$i]}" "${P_RFP[$i]}" "$(ez_restart_label "${P_KIND[$i]}" "${P_A[$i]}" "${P_B[$i]}")"
     i=$((i + 1))
   done
+  [ "${PA_COUNT:-0}" -gt 0 ] || return 0
+  printf '  Aplikacje Docker: %s\n' "$PA_COUNT"
+  while [ "$k" -lt "$PA_COUNT" ]; do
+    printf '  - %s (nowy SHA-256: %s; restart: %s)\n' "${PA_UNIT[$k]}" "${PA_SFP[$k]}" \
+      "$([ "${PA_RESTART[$k]}" = yes ] && printf 'systemctl restart %s, jeżeli jednostka będzie aktywna' "${PA_UNIT[$k]}" || printf 'brak')"
+    while IFS='|' read -r path type sha fp alias; do
+      [ -n "$path" ] || continue
+      printf '      %s (%s%s), stary SHA-256: %s\n' "$path" "$type" "$([ "$alias" = - ] || printf ', wpis %s' "$alias")" "$fp"
+    done <<EOF
+${PA_TARGETS[$k]}
+EOF
+    k=$((k + 1))
+  done
 }
 
 ez_plan() {
-  local i r decision approved=0 candidates=0 choice kind a b n issuer_note reason ldg rdg
+  local i r decision approved=0 candidates=0 choice kind a b n issuer_note reason ldg rdg line
   local -a A_PATH=() A_LFP=() A_LNA=() A_LDG=() A_RFP=() A_RNA=() A_RDG=() A_KIND=() A_A=() A_B=()
 
   ez_log_open plan || return 1
@@ -1307,11 +2489,23 @@ ez_plan() {
   fi
   ez_print_remote
 
+  # Docker Compose applications first: a file of an unambiguous application
+  # is replaced only together with its other files (one operation, one
+  # restart of its unit), never as a separate classic target.
+  ez_dc_collect
+  ez_dc_targets
+  ez_dc_app_files
+
   printf '\nDecyzje:\n'
   i=0
   while [ "$i" -lt "$L_COUNT" ]; do
     if [ "${L_STATE[$i]}" != OK ]; then
       ez_say "  SKIP       ${L_PATH[$i]} (${L_REASON[$i]})"
+      i=$((i + 1))
+      continue
+    fi
+    if ez_names_contain "$DC_APP_FILES" "${L_PATH[$i]}"; then
+      ez_say "  DOCKER     ${L_PATH[$i]} (plik aplikacji Docker - decyzja w części \"Aplikacje Docker Compose\")"
       i=$((i + 1))
       continue
     fi
@@ -1430,7 +2624,11 @@ ez_plan() {
     i=$((i + 1))
   done
 
-  printf '\nUPDATE CANDIDATES: %s, zaakceptowane: %s\n' "$candidates" "$approved"
+  # Docker Compose applications (one decision per application).
+  ez_plan_docker
+  candidates=$((candidates + DOCKER_CANDIDATES))
+
+  printf '\nUPDATE CANDIDATES: %s, zaakceptowane: %s\n' "$candidates" "$((approved + PA_COUNT))"
   if [ "$candidates" -eq 0 ]; then
     ez_say 'Brak kandydatów do aktualizacji; zapisany plan nie został zmieniony.'
     return 0
@@ -1439,7 +2637,8 @@ ez_plan() {
   ez_prepare_dir "$STATE_DIR" 0755 || return 1
   {
     printf '# P1CERT ezdrowie plan - generated by "p1cert ezdrowie plan". Do not edit.\n'
-    printf 'PLAN_VERSION=2\n'
+    # Version 3 only with Docker applications: a classic plan stays version 2.
+    if [ "$PA_COUNT" -gt 0 ]; then printf 'PLAN_VERSION=3\n'; else printf 'PLAN_VERSION=2\n'; fi
     printf 'PLAN_ID=%s-%s\n' "$(date '+%Y%m%d%H%M%S')" "$$"
     printf 'CREATED_AT=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
     printf 'CREATED_BY=%s\n' "$(printf '%s' "$(id -un 2>/dev/null)" | tr -c 'A-Za-z0-9._-' '_')"
@@ -1451,6 +2650,14 @@ ez_plan() {
         "${A_RFP[$n]}" "${A_RNA[$n]}" "${A_RDG[$n]}" "${A_KIND[$n]}" "${A_A[$n]}" "${A_B[$n]}"
       n=$((n + 1))
     done
+    n=0
+    while [ "$n" -lt "$PA_COUNT" ]; do
+      printf 'APP=%s|%s|%s|%s|%s\n' "${PA_UNIT[$n]}" "${PA_RESTART[$n]}" "${PA_SFP[$n]}" "${PA_SNA[$n]}" "${PA_SDG[$n]}"
+      printf '%s\n' "${PA_TARGETS[$n]}" | while IFS= read -r line; do
+        [ -z "$line" ] || printf 'APP_TARGET=%s|%s\n' "${PA_UNIT[$n]}" "$line"
+      done
+      n=$((n + 1))
+    done
   } | ez_write_atomic "$EZ_PLAN_FILE" || {
     ez_err "nie można zapisać planu: $EZ_PLAN_FILE"
     return 1
@@ -1459,7 +2666,7 @@ ez_plan() {
     ez_err 'zapisany plan nie przechodzi walidacji.'
     return 1
   fi
-  ez_say "Zapisano plan: $EZ_PLAN_FILE (ID $P_ID, targety: $P_COUNT)"
+  ez_say "Zapisano plan: $EZ_PLAN_FILE (ID $P_ID, targety: $P_COUNT, aplikacje Docker: $PA_COUNT)"
   if [ -f "$EZ_SCHEDULE_FILE" ]; then
     ez_warn 'istnieje zaplanowane uruchomienie dla poprzedniego planu; nie zostanie ono wykonane dla nowego planu. Użyj ponownie: p1cert ezdrowie schedule'
   fi
@@ -1754,7 +2961,7 @@ ez_run_body() {
   fi
 
   ez_plan_print
-  if [ "$P_COUNT" -eq 0 ]; then
+  if [ "$P_COUNT" -eq 0 ] && [ "$PA_COUNT" -eq 0 ]; then
     ez_say 'Plan nie zawiera targetów. NO CHANGE.'
     ez_last_run_write "$mode" NO_CHANGE
     [ "$mode" != scheduled ] || ez_schedule_consume
@@ -1773,23 +2980,35 @@ ez_run_body() {
     return 1
   fi
 
-  T_COUNT="$P_COUNT"
+  T_COUNT=$((P_COUNT + PA_COUNT))
   i=0
   while [ "$i" -lt "$T_COUNT" ]; do
     T_RESULT[$i]=PENDING; T_DETAIL[$i]=''
+    [ "$i" -lt "$P_COUNT" ] || P_PATH[$i]="docker:${PA_UNIT[$((i - P_COUNT))]}"
     i=$((i + 1))
   done
+  # An interrupted Docker operation is recovered (or reported) before
+  # anything else; the helper refuses new Docker operations until then.
+  # Without Docker applications in the plan the helper is asked whether one
+  # is pending (a plan made after the interruption).
+  if [ "$PA_COUNT" -gt 0 ] || ez_docker_pending; then
+    ez_run_recover || true
+  fi
 
   if ! ez_fetch_remote; then
     i=0
-    while [ "$i" -lt "$T_COUNT" ]; do
+    while [ "$i" -lt "$((P_COUNT + PA_COUNT))" ]; do
       ez_set_result "$i" SKIP 'remote source unavailable'
       i=$((i + 1))
     done
   else
     i=0
-    while [ "$i" -lt "$T_COUNT" ]; do
+    while [ "$i" -lt "$P_COUNT" ]; do
       ez_replace_one "$i"
+      i=$((i + 1))
+    done
+    while [ "$i" -lt "$((P_COUNT + PA_COUNT))" ]; do
+      ez_run_docker_app "$i" "$((i - P_COUNT))"
       i=$((i + 1))
     done
   fi
@@ -1975,12 +3194,15 @@ Polecenia:
   credentials       zapisz Nextcloud App Password (jedyna lokalna konfiguracja)
   test              sprawdź dostęp WebDAV do katalogu P1CERT_EZDROWIE
   scan              znajdź lokalne certyfikaty ezdrowie.gov.pl (tylko odczyt)
+  discover          aplikacje Docker Compose i używane przez nie certyfikaty
+                    oraz magazyny JKS/PKCS12 (tylko odczyt)
   plan              porównaj ze źródłem i zaakceptuj podmiany/restarty
   run [--yes]       wykonaj zaakceptowany plan
   schedule [YYYY-MM-DD HH:MM]
                     zaplanuj JEDNORAZOWE wykonanie zaakceptowanego planu
   schedule-status   pokaż plan, timer i wynik ostatniego run
   schedule-cancel   anuluj oczekujące uruchomienie (plan i backupy zostają)
+  recover           odzyskaj przerwaną operację Docker (przywraca oryginalne pliki)
   help              pokaż tę pomoc
 EOF
 }
@@ -2006,11 +3228,13 @@ ez_main() {
     credentials) [ "$#" -eq 0 ] || { ez_usage >&2; return 2; }; ez_credentials ;;
     test) [ "$#" -eq 0 ] || { ez_usage >&2; return 2; }; ez_test ;;
     scan) [ "$#" -eq 0 ] || { ez_usage >&2; return 2; }; ez_scan ;;
+    discover) [ "$#" -eq 0 ] || { ez_usage >&2; return 2; }; ez_discover ;;
     plan) [ "$#" -eq 0 ] || { ez_usage >&2; return 2; }; ez_with_lock ez_plan ;;
     run) ez_run "$@" ;;
     schedule) ez_schedule "$@" ;;
     schedule-status) [ "$#" -eq 0 ] || { ez_usage >&2; return 2; }; ez_schedule_status ;;
     schedule-cancel) [ "$#" -eq 0 ] || { ez_usage >&2; return 2; }; ez_schedule_cancel ;;
+    recover) [ "$#" -eq 0 ] || { ez_usage >&2; return 2; }; ez_recover ;;
     *)
       printf 'Nieznane polecenie ezdrowie: %s\n\n' "$(ez_printable "$command_name")" >&2
       ez_usage >&2

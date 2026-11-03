@@ -188,11 +188,13 @@ All commands run as the P1CERT user (`itgo`) and refuse to run as root.
 p1cert ezdrowie credentials
 p1cert ezdrowie test
 p1cert ezdrowie scan
+p1cert ezdrowie discover
 p1cert ezdrowie plan
 p1cert ezdrowie run [--yes]
 p1cert ezdrowie schedule [YYYY-MM-DD HH:MM]
 p1cert ezdrowie schedule-status
 p1cert ezdrowie schedule-cancel
+p1cert ezdrowie recover
 ```
 
 ### credentials
@@ -256,6 +258,310 @@ leaf fingerprint and the SHA-256 of the whole file. A chain is only written
 into a PEM target (never converted to DER), and a local chain is never
 replaced by a single certificate; a single PEM target may receive a chain.
 The chain length may change.
+
+### discover
+
+Read-only report of Docker Compose applications and the certificates and
+Java keystores they use. `discover` itself changes nothing; `plan` and `run`
+use the same analysis to replace the P1 certificate of unambiguous
+applications (see "Docker applications in plan and run" below).
+
+Applications are found in two ways:
+
+- systemd units (`/etc/systemd/system`, `/usr/lib/systemd/system`,
+  `/lib/systemd/system`; deny-listed units excluded) whose `ExecStart` runs
+  Docker Compose v1 (`docker-compose ...`) or v2 (`docker compose ...`),
+  directly or through `/usr/bin/env` (`/usr/bin/env docker compose up`,
+  `/usr/bin/env NAME=value docker-compose up`). Global options `-f/--file`,
+  `-p`, `--project-directory`, `--env-file` and `--profile` are evaluated;
+  relative values are relative to `WorkingDirectory` (`/` when not set),
+- compose projects below `/srv`, `/usr/local` and `/opt` (depth 4) that no
+  unit runs. They are listed with `Jednostka: BRAK`: P1CERT will never
+  restart them.
+
+The compose configuration is selected like docker compose does: `-f` files,
+otherwise `COMPOSE_FILE` (unit environment, then `.env`;
+`COMPOSE_PATH_SEPARATOR`), otherwise exactly one of `compose.yaml`,
+`compose.yml`, `docker-compose.yaml`, `docker-compose.yml` plus its override
+file. Later files override environment entries and mounts (by container
+path). Interpolation uses the unit environment (`Environment=`,
+`EnvironmentFile=`, `/usr/bin/env` assignments) before `.env`/`--env-file`
+and supports `$VAR`, `${VAR}`, `${VAR:-x}`, `${VAR-x}`, `${VAR:?x}`,
+`${VAR?x}`, `${VAR:+x}`, `${VAR+x}` and `$$`. Nothing is executed: no docker,
+no compose, no shell.
+
+For every service the container environment (`env_file` in order, then
+`environment`) and the mounts (bind mounts in short and long syntax, named
+volumes with a bind `device`, file based `secrets`/`configs`) are resolved to
+host paths:
+
+- a mount whose host or container path is a `.pem/.crt/.cer/.der/.jks/.p12/
+  .pfx` file, or a mounted file whose content is a certificate or keystore,
+- a variable whose value (also `file:` URLs) is such a file, or an absolute
+  path in a variable whose name names a certificate or keystore (`CERT`,
+  `TRUST`, `KEYSTORE`, `SSL`, `TLS`, `PEM`, `PKCS`, `P12`, `JKS`, `CA`),
+  mapped through the longest matching mount; relative values use the
+  service `working_dir`; a path without a host mount is reported as inside
+  the image,
+- certificate/keystore files in mounted directories (depth 3, at most 50
+  per directory).
+
+The file name never decides the type: the content is classified as PEM/DER
+X.509 (fingerprint, Subject, Not After, `ezdrowie: TAK` for an
+ezdrowie.gov.pl identity such as `*.ezdrowie.gov.pl`), JKS, PKCS12 (told
+from DER by its ASN.1 version, no password needed), JCEKS (not supported)
+or unknown. PEM files with a private key are client material and are never
+targets.
+
+JKS and PKCS12 keystores are opened read-only (see "Keystores" below).
+
+`discover` skips every directory whose name CONTAINS `old` in any case
+(`/srv/OLD`, `/srv/oldcerts`, `/srv/app_Old`, and also names such as
+`folder` or `gold`): such files are listed as skipped, such directories are
+not descended and compose projects in them are not listed. The file name
+itself does not count. This rule is deliberately broader than the one of
+`scan`/`plan`/`run`, which still skip only components named exactly `OLD`.
+
+A project or service is reported as
+ambiguous (`NIEJEDNOZNACZNA KONFIGURACJA` / `NIEJEDNOZNACZNE`) - and will be
+refused by any later replacement - when compose is started through a shell,
+with `docker` global options (`-H`, `--context`), remote daemon or unknown
+compose options, systemd variables in the command, several different
+compose commands, several units for one project, several default compose
+files, YAML anchors/aliases/merge keys, `extends`, `include`, block scalars
+or flow mappings in relevant keys, multi-line values, tabs, several YAML
+documents, a missing required `env_file`, an unresolved variable in a mount
+or in a certificate variable, or a certificate variable whose value is not
+a plain path (options, URLs, embedded passwords). One ambiguous service
+makes the whole project ambiguous.
+
+Every certificate or keystore gets `Wynik: PEWNY` only when exactly one
+systemd unit runs the project(s) naming it, these projects are unambiguous
+and a service names the file explicitly (mount or variable). Otherwise it is
+`Wynik: NIEPEWNY` with the reasons (ambiguous project, no unit, several
+units, file only present in a mounted directory).
+
+Environment values are evaluated only inside the parser: the output, the
+log and process arguments contain plain paths (characters
+`A-Z a-z 0-9 . _ / @ + -`) and variable names, never other values;
+`discover` writes no temporary files.
+
+#### Keystores (JKS, PKCS12)
+
+The store password is taken from the configuration of the service that
+uses the store and bound to that store by the configuration only (never by
+the order of variables, and never because a service has a single password):
+
+1. the store is named by variable `K`: the password variable is `K` without
+   a `_FILE`, `_PATH`, `_LOCATION`, `_LOC` or `_NAME` suffix, followed by
+   `PASSWORD`, `PASSWD`, `PASS`, `PWD` or `PASSPHRASE` with or without `_`
+   (`P1_KEYSTORE_PATH` -> `P1_KEYSTORE_PASSWORD`, `KEYSTORE_FILE` ->
+   `KEYSTORE_PASS`, `JAVAX_NET_SSL_TRUSTSTORE` ->
+   `JAVAX_NET_SSL_TRUSTSTOREPASSWORD`, `SERVER_SSL_KEY_STORE` ->
+   `SERVER_SSL_KEY_STORE_PASSWORD`),
+2. otherwise the file name without extension, optionally with a prefix
+   (`truststore.p12` -> `TRUSTSTORE_PASSWORD`, `P1_TRUSTSTORE_PASS`).
+
+The value comes from `environment`/`env_file` with the same interpolation as
+above (`.env`, unit environment), or from the file named by a `<NAME>_FILE`
+variable (for example a compose secret `/run/secrets/...`; its first line).
+Several matching variables, different values for one store or an unreadable
+value give `HASLO_NIEJEDNOZNACZNE`; no matching variable gives `BRAK_HASLA`.
+
+- JKS (versions 1 and 2, as written by Java 8) is parsed by P1CERT itself
+  (no keytool, no Java): aliases, entry types and certificates. The
+  password and the integrity are verified with the JKS digest (SHA-1 over
+  the password as UTF-16, the Java salt and the store); a wrong password and
+  changed bytes both give `HASLO_NIEPOPRAWNE`. Without a password the
+  entries are still listed, marked as not verified. Secret key entries
+  (JCEKS) are not supported.
+- PKCS12 is read with `openssl pkcs12 -nokeys` (private keys are never
+  decrypted or printed): the MAC verifies password and integrity; stores of
+  Java 8 (RC2-40/3DES) are read with `-legacy` on OpenSSL 3 and directly on
+  OpenSSL 1.x. A certificate with `localKeyID` belongs to a
+  `PrivateKeyEntry`, one with the Oracle trusted attribute is a
+  `trustedCertEntry`, any other is a chain certificate (not a Java entry).
+  A store without MAC gives `BRAK_INTEGRALNOSCI`.
+
+Store states: `OK`, `BRAK_HASLA`, `HASLO_NIEJEDNOZNACZNE`,
+`HASLO_NIEPOPRAWNE`, `USZKODZONY`, `NIEOBSLUGIWANY`, `BRAK_INTEGRALNOSCI`.
+
+The P1 certificate is a certificate with a production ezdrowie.gov.pl
+identity (DNS SANs, CN only without SANs; e.g. `*.ezdrowie.gov.pl`) that is
+neither a CA nor self-signed, identified by its SHA-256 fingerprint:
+
+- `P1: PEWNA` - exactly one `trustedCertEntry` holds it (alias, SHA-256,
+  Not After are shown),
+- `P1: NIEPEWNA` - several different ones, one certificate under several
+  aliases, a P1 certificate outside any entry, an unreadable certificate or
+  a store not verified with its password,
+- `P1: CHRONIONY` - only inside a `PrivateKeyEntry`; entries with private
+  keys are never modified,
+- `P1: BRAK` - none (non-production identities such as
+  `isus.ezdrowie.gov.pl` do not count).
+
+A store is `Wynik: PEWNY` only when the configuration is certain (above),
+the store is `OK` and `P1: PEWNA`; a verified store without a P1
+certificate is `Wynik: NIE DOTYCZY`. The summary lists the SHA-256 of every
+production ezdrowie.gov.pl certificate found in files and stores.
+
+Passwords exist only in shell variables of the `discover` process: they
+reach `openssl`, `iconv` and `openssl dgst` on standard input (`-passin
+stdin`), never as an argument, an environment variable, a temporary file, a
+log line or report text. `discover` never modifies keystores.
+
+#### Docker applications in plan and run
+
+`plan` and `run` handle Docker Compose applications next to the classic
+targets. The unprivileged side only decides and reports; files are written
+and units restarted exclusively by the root helper (`apply-docker`), which
+derives everything again on its own.
+
+`plan`:
+
+- runs the discovery above and, for every application with P1 files,
+  selects the source certificate from Nextcloud (`ez_fetch_remote`,
+  `ez_select_remote`; one source for all files of the application) and
+  compares it by SHA-256 and Not After (`ez_decide`);
+- offers an application only when it has exactly one systemd unit, an
+  unambiguous configuration and every P1 file `Wynik: PEWNY` (PEM/DER with a
+  production ezdrowie.gov.pl identity, JKS/PKCS12 with `P1: PEWNA`); client
+  keystores, `PrivateKeyEntry` entries and other certificates are never
+  targets. A PKCS12 file needs the helper's Java runtime and tool (`ping`
+  reports `P12_TOOL=OK`), otherwise the application is not offered;
+- a file of such an application is not offered again as a classic target
+  (it would split the application); files of applications that are refused
+  keep the classic handling;
+- shows the unit, its state, the project, all files (keystores with the P1
+  alias) and the predicted restart, and asks once per application for the
+  replacement of ALL its files and, only when the unit is active, for
+  `systemctl restart <unit>`;
+- writes `APP=<unit>|<restart yes|no>|<source fp>|<source NotAfter>|<source
+  file SHA-256>` and one `APP_TARGET=<unit>|<path>|<PEM|DER|JKS|PKCS12>|<file
+  SHA-256>|<old fp>|<alias|->` per file (`PLAN_VERSION=3`; a plan without
+  Docker applications stays `PLAN_VERSION=2`, and version 2 plans keep
+  working).
+
+`run` (also scheduled, with the same lock and one-shot timer):
+
+1. asks the helper to recover interrupted Docker operations (`recover`, see
+   below) and reports them;
+2. runs the classic targets exactly as before;
+3. for every application: the source file must be exactly the approved one
+   (fingerprint and SHA-256), then one helper call
+   `apply-docker <unit> <restart> <source sha256> <new fp> <file>...` with the
+   source on stdin; afterwards the PEM/DER files are checked again as the
+   P1CERT user.
+
+Results per application: `UPDATED`, `NO_CHANGE`, `SKIP` (a file changed
+since the plan), `REFUSED`, `ERROR` (undone before a restart), `ROLLBACK`,
+`ROLLBACK_RESTART_FAILED`, `CRITICAL` (not restored or an unrecovered
+operation).
+
+#### Root helper: apply-docker
+
+The helper trusts nothing from the caller. Before any change it:
+
+- reads the unit with `systemctl show` and requires root-controlled unit,
+  drop-in and environment files, a compose invocation it can analyse
+  (`ez_dc_invocation`), an unambiguous compose configuration (`ez_dc_project`,
+  `ez_dc_model`, no ambiguous service) and no other unit running the same
+  project;
+- requires every requested file to be referenced explicitly by that
+  configuration (mount, secret or certificate variable), below the allowed
+  roots, outside `old` directories, without symlinks, a single hard link, in
+  a directory owned by root or the P1CERT user (`ez_target_dir_ok`);
+- reads every file without following symlinks into its private directory,
+  requires exactly the approved bytes (SHA-256), type and P1 certificate
+  (fingerprint; keystores: the P1 alias, opened with the password it binds
+  and reads itself from the compose configuration with the rules of
+  `discover`), the approved source bytes, a valid, later-expiring source
+  with a compatible identity and a format the target can keep;
+- prepares and verifies every new file privately (`ez_dc_stage_store`: JKS
+  byte surgery, PKCS12 through the tool; PEM/DER as for classic targets).
+
+Then, as one operation:
+
+1. a journal in `/var/lib/itgo-p1cert/ezdrowie-journal/<id>/` (root, 0700;
+   files 0600, keystores included) gets the original and the new bytes and
+   the state, synced before the first file changes;
+2. every file is replaced with `helper_atomic_replace` (pinned directory,
+   descriptor-bound write, original owner, group, mode and SELinux context),
+   then all files are verified from disk (stores: password, entries, P1,
+   PKCS12 compared with the original by the tool); any failure restores all
+   files (`RESTORED`, exit 4) before any restart;
+3. the unit is restarted only when it was `active` before the operation and
+   the restart was approved; a stopped unit is never started, and a unit in
+   transition (`activating`, `deactivating`, `reloading`, ...) is refused
+   before any change. Before the change the helper records which services
+   of the compose model have a running container of the project (label
+   `com.docker.compose.project.working_dir`); an active unit without any is
+   refused (the restart could not be verified). The restart counts only when
+   the unit stays active and every one of these services runs again in a
+   container started after the restart, not restarting and not unhealthy
+   (stopped containers of these services must have exited 0 after the
+   restart): the exit code of `systemctl restart` alone proves nothing for
+   `docker compose up -d`. Containers of other services (orphans, inactive
+   profiles, services not running before) are not judged. Only this unit is
+   restarted; docker is only read (`ps`, `inspect`), never started or
+   stopped directly;
+4. if the restart is not effective, all files get their original bytes back
+   and the unit is restarted once more (`ROLLBACK`, exit 5, or
+   `ROLLBACK_RESTART_FAILED`, exit 6); a file that cannot be restored is
+   `ROLLBACK_FAILED` (exit 7).
+
+`recover` undoes every unfinished journal (SIGKILL, power loss, reboot): a
+file with the new bytes gets its original bytes back, a file with the
+original bytes stays, a file with other bytes is left alone and reported
+(`RECOVERY=FAILED`, critical, manual action). After restoring files the unit
+is restarted once (and verified like above) only when the containers may
+have loaded the new files (the restart of the operation had begun, or a
+container of the project started after the operation began: reboot, restart
+policy), the restart had been approved, the unit was running before the
+operation and is running now. A unit that is not running is never started;
+when the restart was not approved this is only reported. While a journal is
+unfinished, `apply-docker` refuses (exit 8); `run` calls `recover` first
+(also with a plan without Docker applications: `ping` reports
+`DOCKER_PENDING=<n>`), and the operator can run `p1cert ezdrowie recover`.
+Recovery is not started automatically at boot. The newest 20 finished
+journals stay as root-only backups.
+
+#### PKCS12 tool
+
+PKCS12 uses the Java KeyStore API through `p1cert-pkcs12.jar` (source
+`java/P1certPkcs12.java`), because an OpenSSL export/import does not keep
+the store (tested: OpenSSL 3 writes PBES2/AES that Java 8 cannot open; with
+`-legacy` the Oracle trusted attribute, and with it the `trustedCertEntry`,
+is lost, and friendly names, MAC parameters and the encryption of private
+keys change). The tool:
+
+- reads the store password from standard input (never an argument or an
+  environment variable) and replaces only the certificate of the P1
+  `trustedCertEntry`, keeping its attributes;
+- never decrypts private keys: the PKCS12 provider writes the encrypted key
+  bags it read back unchanged, so no key password is needed (keys with
+  their own password are carried over too) and none is guessed;
+- asks the runtime for the algorithms of the original (certificate
+  encryption, MAC; honoured by Java 8u301+, 11.0.12+ and 17+) and proves the
+  result: same aliases and entry types, same certificate chains and
+  attributes, the encrypted private key bags and their attributes byte for
+  byte, same algorithms. Otherwise it refuses (a secret key entry, key bags
+  inside an encrypted part, BER encoding, a runtime that would change the
+  algorithms or cannot open the store).
+
+Delivery: the jar is built once with `java/build.sh` (any JDK 8+, Java 8
+class files; a JDK is never needed on a server), committed as
+`p1cert-pkcs12.jar`, listed in `p1cert.payload` and `release.manifest.psd1`
+and pinned by its SHA-256 in the installer (`EZ_P12_JAR_SHA256`) and the
+helper (`HELPER_P12_JAR_SHA256`). The installer installs it root-owned as
+`/usr/local/libexec/itgo-p1cert/p1cert-pkcs12.jar` only with exactly these
+bytes; the helper checks the file (root-owned, not writable by others) and
+its SHA-256 before every use, and uses a Java runtime 8+ only from
+root-controlled locations (`/usr/bin/java` and `/usr/lib/jvm`, `/usr/java`).
+P1CERT never installs Java. Without a runtime or with another jar,
+`ping` reports `P12_TOOL=NO_JAVA|NO_JAR|BAD_JAR` and applications with a
+PKCS12 file are refused as a whole. Rebuilding the jar changes its SHA-256:
+both pins must be updated (the tests refuse a mismatch).
 
 ### plan
 

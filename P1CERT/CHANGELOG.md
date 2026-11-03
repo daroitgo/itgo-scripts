@@ -2,6 +2,89 @@
 
 ## Unreleased
 
+- Docker Compose applications in `plan`, `run` and the root helper (stage
+  E4; helper/library API 5, plan version 3 only for plans with Docker
+  applications). `plan` offers each unambiguous application once (all its
+  PEM/DER/JKS/PKCS12 P1 files together, restart only for an active unit)
+  and keeps its files out of the classic targets. `run` recovers
+  interrupted operations, then calls the new helper operation
+  `apply-docker`, which re-derives the application from the unit, the files,
+  the store passwords and contents itself, writes all files of the
+  application as one journaled operation (`/var/lib/itgo-p1cert`, root-only,
+  original owner/mode/SELinux context, descriptor-bound replacement),
+  verifies them, restarts only the bound unit when it was running and checks
+  that every compose service that ran before runs again in a container
+  started after the restart (orphans and services not running before are not
+  judged; an active unit without running containers and a unit in
+  transition are refused); any failure restores all files (and restarts
+  once with them). New helper operation and command `recover` for
+  interrupted operations (SIGKILL, reboot): it restarts the unit only when
+  the containers may have loaded the new files and the restart was
+  approved, and never starts a stopped unit; `run` recovers first, also
+  with a plan without Docker applications (`ping`: `DOCKER_PENDING`). The PKCS12 tool `p1cert-pkcs12.jar` is shipped in the
+  payload, pinned by SHA-256 in installer and helper and installed
+  root-owned; Java is never installed. The unprivileged E3 writer
+  (`ez_dc_update_project`, `ez_tx_*`) is removed: only the helper writes.
+  Classic targets, version 2 plans and the classic helper operations are
+  unchanged.
+- Docker Compose applications: PKCS12 keystores in the replacement mechanism
+  (stage E3.1, still not connected to `run`). New Java 8 tool
+  `java/P1certPkcs12.java` (`p1cert-pkcs12.jar`, built by `java/build.sh`)
+  replaces the P1 `trustedCertEntry` through the Java KeyStore API: password
+  on stdin, private keys never decrypted (encrypted key bags written back
+  byte for byte, no key passwords needed), attributes and algorithms of the
+  original kept and verified; refuses what it cannot carry over unchanged.
+  PEM and PKCS12 of one application are updated as one operation with the
+  E3 transaction. Needs a Java 8+ runtime on the server (never installed by
+  P1CERT); otherwise PKCS12 targets are refused.
+- Docker Compose applications: replacement mechanism for the P1 certificate
+  (stage E3, not connected to `run`, the plan or restarts yet;
+  `ez_dc_update_project`, library `ez_tx_*`, `ez_jks_replace_cert`). Uses the
+  Nextcloud source and SHA-256 comparison of `plan`; replaces PEM (bytes of
+  the source, chains kept), DER and the P1 `trustedCertEntry` of JKS
+  keystores byte by byte (alias, other entries, private keys and password
+  kept, digest recomputed); all files of one application as one operation
+  with verified backups, atomic renames, verification from disk and full
+  rollback; refuses the whole application for uncertain files, unusable
+  sources and PKCS12 keystores (an OpenSSL export/import does not keep a
+  Java 8 PKCS12 store; documented by tests). New test
+  `tests/test_ezdrowie_docker_update.sh`; the JKS test builder moved to
+  `tests/ezdrowie_fixtures.sh`.
+- `p1cert ezdrowie discover`: read-only inspection of JKS and PKCS12
+  keystores (stage E2). The store password is bound to the store by the
+  compose configuration (password variable named after the variable that
+  names the store or after the file, `<NAME>_FILE` secret files), read from
+  `environment`/`env_file`/`.env` in memory only and passed to `openssl`/
+  `iconv` on standard input. JKS v1/v2 (Java 8) is parsed without keytool
+  and verified with its integrity digest; PKCS12 through `openssl pkcs12`
+  (MAC, Java 8 RC2/3DES via `-legacy` on OpenSSL 3). Lists aliases,
+  `PrivateKeyEntry`/`trustedCertEntry` and certificates, identifies the
+  production `*.ezdrowie.gov.pl` certificate by identity and SHA-256
+  (`P1: PEWNA/NIEPEWNA/CHRONIONY/BRAK`) and reports readable states
+  (`BRAK_HASLA`, `HASLO_NIEJEDNOZNACZNE`, `HASLO_NIEPOPRAWNE`, `USZKODZONY`,
+  `NIEOBSLUGIWANY`, `BRAK_INTEGRALNOSCI`). Nothing is modified; helper API
+  4 and the classic Integration Platform handling are unchanged.
+- `p1cert ezdrowie discover` (new, read-only): Docker Compose applications
+  and the certificates/keystores they use. Detects compose v1
+  (`docker-compose`) and v2 (`docker compose`) in systemd units, also
+  through `/usr/bin/env`, plus compose projects no unit runs; selects the
+  compose files like compose (`-f`, `COMPOSE_FILE`, default file +
+  override), interpolates with the unit environment, `.env`/`--env-file`,
+  resolves `env_file`, `environment`, bind mounts, named bind volumes and
+  file secrets/configs to host paths, independent of application and file
+  names; classifies files by content (PEM/DER X.509 with ezdrowie identity,
+  JKS, PKCS12, JCEKS); lists password variable names, never values, and
+  prints values only as plain paths; skips every directory whose name
+  contains `old` (any case; `scan` keeps its exact `OLD` rule); refuses
+  ambiguous configurations (shell, remote daemon options, several units per
+  project, several default files, YAML anchors/merge keys, `extends`,
+  `include`, multi-line values, unresolved variables, ...), and an
+  ambiguous service makes its project ambiguous; every file is rated
+  `PEWNY`/`NIEPEWNY`. No docker or compose
+  command is run and nothing is changed. `scan`, `plan`, `run`, the helper
+  and its API 4 are unchanged; Docker targets are not yet replaceable.
+  New library section in `p1cert_ezdrowie_lib.sh` (`ez_dc_*`,
+  `ez_store_type`) and tests `tests/test_ezdrowie_docker.sh`.
 - `p1cert ezdrowie`: classic Integration Platform (Tomcat `p1-war`) support
   for certificates outside the installation. A systemd unit is detected and
   may be restarted when `SSL.patch` in

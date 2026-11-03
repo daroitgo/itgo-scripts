@@ -11,8 +11,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # match HELPER_API_VERSION in p1cert_ezdrowie_helper.sh and EZ_HELPER_API in
 # p1cert_ezdrowie.sh (this is not the P1CERT release version).  3 since the
 # target directory policy (ez_target_dir_ok); 4 since the classic Integration
-# Platform SSL.patch binding; helpers of API 1-3 are incompatible.
-EZ_HELPER_API=4
+# Platform SSL.patch binding; 5 since Docker Compose applications
+# (apply-docker, recover); helpers of API 1-4 are incompatible.
+EZ_HELPER_API=5
+# PKCS12 tool of the helper (built by java/build.sh): installed only with
+# exactly these bytes; the helper checks the same SHA-256 before each use.
+EZ_P12_JAR_SHA256=8e439c107ace7e148153fb47a62ff3302ea5cf6d721413b57744aea16b762c9c
 
 # Test fixtures may mirror the system paths below a prefix and use their own
 # uid/gid as "root"; always empty/0 when the installer is executed.
@@ -25,6 +29,7 @@ HELPER_PARENT_DIR="/usr/local/libexec"
 HELPER_DIR="${HELPER_PARENT_DIR}/itgo-p1cert"
 HELPER_PATH="${HELPER_DIR}/p1cert-ezdrowie-helper"
 HELPER_LIB_PATH="${HELPER_DIR}/p1cert_ezdrowie_lib.sh"
+HELPER_P12_JAR_PATH="${HELPER_DIR}/p1cert-pkcs12.jar"
 SUDOERS_MAIN="/etc/sudoers"
 SUDOERS_DIR="/etc/sudoers.d"
 SUDOERS_FILE="${SUDOERS_DIR}/itgo-p1cert-ezdrowie"
@@ -226,6 +231,33 @@ install_ezdrowie_helper() {
   # library, which the helper itself refuses (library API check).
   install_root_file "${SCRIPT_DIR}/p1cert_ezdrowie_lib.sh" "$HELPER_LIB_PATH" 0644 || return 1
   install_root_file "${SCRIPT_DIR}/p1cert_ezdrowie_helper.sh" "$HELPER_PATH" 0755 || return 1
+  install_ezdrowie_p12_tool
+}
+
+# PKCS12 tool for Docker applications: installed root-owned next to the
+# helper only when its SHA-256 is exactly EZ_P12_JAR_SHA256.  Without it (or
+# without a Java 8+ runtime on the server, which P1CERT never installs) the
+# helper refuses applications with PKCS12 keystores; everything else works.
+install_ezdrowie_p12_tool() {
+  local source="${SCRIPT_DIR}/p1cert-pkcs12.jar" digest
+
+  if [ ! -f "$source" ] || [ -L "$source" ]; then
+    inst_warn 'p1cert-pkcs12.jar missing from the package; PKCS12 keystores in Docker applications will not be updated'
+    return 0
+  fi
+  digest="$(openssl dgst -sha256 < "$source" 2>/dev/null | awk '{ print $NF }')"
+  if [ "$digest" != "$EZ_P12_JAR_SHA256" ]; then
+    inst_warn "p1cert-pkcs12.jar has an unexpected SHA-256 ($digest); not installed"
+    inst_issue 'p1cert-pkcs12.jar failed its integrity check and was not installed'
+    return 0
+  fi
+  install_root_file "$source" "$HELPER_P12_JAR_PATH" 0644 || {
+    inst_issue "p1cert-pkcs12.jar could not be installed: $HELPER_P12_JAR_PATH"
+    return 0
+  }
+  if ! command -v java >/dev/null 2>&1; then
+    printf 'note: no Java runtime in PATH; PKCS12 keystores in Docker applications need Java 8 or newer (not installed by P1CERT)\n'
+  fi
 }
 
 # True when helper "ping" output reports exactly the expected API version.
@@ -552,6 +584,7 @@ installer_uninstall() {
       inst_remove_managed "$HELPER_PATH" 'root helper' '# P1CERT ezdrowie privileged helper.' 'HELPER_API_VERSION=' || true
       inst_remove_managed "$HELPER_LIB_PATH" 'root helper library' \
         '# Shared, side-effect free helpers for the P1CERT ezdrowie namespace.' 'EZ_LIB_API=' || true
+      inst_remove_managed "$HELPER_P12_JAR_PATH" 'PKCS12 tool' 'P1certPkcs12.class' || true
       if rmdir -- "$helper_dir" 2>/dev/null; then
         printf 'removed: %s\n' "$HELPER_DIR"
       elif [ -d "$helper_dir" ]; then
