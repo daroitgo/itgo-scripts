@@ -3094,7 +3094,9 @@ ez_schedule_body() {
   local when="$1" day time out epoch at sha
 
   ez_plan_load_reported || return 1
-  if [ "$P_COUNT" -eq 0 ]; then
+  # Approved Docker applications (PA_*) are targets too: a plan may have
+  # only them.
+  if [ "$P_COUNT" -eq 0 ] && [ "$PA_COUNT" -eq 0 ]; then
     ez_err 'zaakceptowany plan nie zawiera targetów; nie ma czego planować.'
     return 1
   fi
