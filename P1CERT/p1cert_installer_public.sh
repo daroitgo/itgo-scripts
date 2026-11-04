@@ -12,11 +12,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # p1cert_ezdrowie.sh (this is not the P1CERT release version).  3 since the
 # target directory policy (ez_target_dir_ok); 4 since the classic Integration
 # Platform SSL.patch binding; 5 since Docker Compose applications
-# (apply-docker, recover); helpers of API 1-4 are incompatible.
-EZ_HELPER_API=5
+# (apply-docker, recover); 6 since several P1 entries per keystore and the
+# Tomcat instance binding; helpers of API 1-5 are incompatible.
+EZ_HELPER_API=6
 # PKCS12 tool of the helper (built by java/build.sh): installed only with
 # exactly these bytes; the helper checks the same SHA-256 before each use.
-EZ_P12_JAR_SHA256=8e439c107ace7e148153fb47a62ff3302ea5cf6d721413b57744aea16b762c9c
+EZ_P12_JAR_SHA256=385c8d32d494ac07bcfe536c41c19255deac32b212ba327e27618a76e2fc4e95
 
 # Test fixtures may mirror the system paths below a prefix and use their own
 # uid/gid as "root"; always empty/0 when the installer is executed.
@@ -236,28 +237,279 @@ install_ezdrowie_helper() {
 
 # PKCS12 tool for Docker applications: installed root-owned next to the
 # helper only when its SHA-256 is exactly EZ_P12_JAR_SHA256.  Without it (or
-# without a Java 8+ runtime on the server, which P1CERT never installs) the
-# helper refuses applications with PKCS12 keystores; everything else works.
+# without a Java 8+ runtime, see installer_java) the helper refuses
+# applications with PKCS12 keystores; everything else works.  A missing or
+# damaged tool is reported as an integration issue.
 install_ezdrowie_p12_tool() {
   local source="${SCRIPT_DIR}/p1cert-pkcs12.jar" digest
 
   if [ ! -f "$source" ] || [ -L "$source" ]; then
     inst_warn 'p1cert-pkcs12.jar missing from the package; PKCS12 keystores in Docker applications will not be updated'
+    inst_issue 'PKCS12 tool: p1cert-pkcs12.jar missing from the package (incomplete payload)'
     return 0
   fi
   digest="$(openssl dgst -sha256 < "$source" 2>/dev/null | awk '{ print $NF }')"
   if [ "$digest" != "$EZ_P12_JAR_SHA256" ]; then
     inst_warn "p1cert-pkcs12.jar has an unexpected SHA-256 ($digest); not installed"
-    inst_issue 'p1cert-pkcs12.jar failed its integrity check and was not installed'
+    inst_issue 'PKCS12 tool: p1cert-pkcs12.jar failed its integrity check and was not installed'
     return 0
   fi
   install_root_file "$source" "$HELPER_P12_JAR_PATH" 0644 || {
-    inst_issue "p1cert-pkcs12.jar could not be installed: $HELPER_P12_JAR_PATH"
+    inst_issue "PKCS12 tool: p1cert-pkcs12.jar could not be installed: $HELPER_P12_JAR_PATH"
     return 0
   }
-  if ! command -v java >/dev/null 2>&1; then
-    printf 'note: no Java runtime in PATH; PKCS12 keystores in Docker applications need Java 8 or newer (not installed by P1CERT)\n'
+}
+
+# --- Java runtime and required tools -----------------------------------------
+
+# Java locations the helper accepts (helper_java_find): root-controlled only.
+INST_JAVA_CANDIDATES='/usr/bin/java
+/usr/lib/jvm/*/bin/java
+/usr/lib/jvm/*/jre/bin/java
+/usr/java/*/bin/java'
+INST_JAVA=""
+INST_JAVA_MAJOR=""
+
+# Major version of a Java runtime ("8" for 1.8.x); fails when it does not run.
+inst_java_major() {
+  local v
+
+  v="$(env -u JAVA_TOOL_OPTIONS -u _JAVA_OPTIONS -u JDK_JAVA_OPTIONS "$1" -version 2>&1 |
+    awk -F'"' '/ version "/ { print $2; exit }')"
+  case "$v" in
+    1.*) v="${v#1.}" ;;
+  esac
+  v="${v%%[!0-9]*}"
+  case "$v" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s' "$v"
+}
+
+# Every component of a resolved (logical) path is root-owned and not
+# group/world writable, as helper_path_trusted requires.
+inst_path_trusted() {
+  local rest="${1#/}" current="" part
+
+  inst_node_trusted "$(inst_fs /)" d || return 1
+  while [ -n "$rest" ]; do
+    part="${rest%%/*}"
+    if [ "$part" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+    current="$current/$part"
+    if [ -n "$rest" ]; then
+      inst_node_trusted "$(inst_fs "$current")" d || return 1
+    else
+      inst_node_trusted "$(inst_fs "$current")" f || return 1
+    fi
+  done
+}
+
+# The Java 8+ runtime the helper will use (same locations and trust rule as
+# helper_java_find): INST_JAVA / INST_JAVA_MAJOR.  INST_JAVA_SEEN lists every
+# Java found, also unusable ones ("<path> (<why>)").
+inst_java_find() {
+  local fs real major
+
+  INST_JAVA=""; INST_JAVA_MAJOR=""; INST_JAVA_SEEN=""
+  for fs in $(inst_java_globs); do
+    [ -e "$fs" ] || continue
+    real="$(readlink -f -- "$fs" 2>/dev/null)" || continue
+    real="${real#"$SYS_ROOT"}"
+    if ! major="$(inst_java_major "$(inst_fs "$real")")"; then
+      INST_JAVA_SEEN="${INST_JAVA_SEEN:+$INST_JAVA_SEEN, }$real (does not run)"
+      continue
+    fi
+    if [ "$major" -lt 8 ]; then
+      INST_JAVA_SEEN="${INST_JAVA_SEEN:+$INST_JAVA_SEEN, }$real (Java $major)"
+      continue
+    fi
+    if ! inst_path_trusted "$real"; then
+      INST_JAVA_SEEN="${INST_JAVA_SEEN:+$INST_JAVA_SEEN, }$real (Java $major, path not controlled by root only)"
+      continue
+    fi
+    INST_JAVA="$real"; INST_JAVA_MAJOR="$major"
+    return 0
+  done
+  return 1
+}
+
+# Any Java at all on the system: one of the helper locations exists or a
+# "java" is in PATH.  Such a runtime belongs to the operator or a vendor and is
+# never updated, replaced or switched (no alternatives) by P1CERT.
+inst_java_present() {
+  local fs
+
+  for fs in $(inst_java_globs); do
+    if [ -e "$fs" ] || [ -L "$fs" ]; then
+      return 0
+    fi
+  done
+  command -v java >/dev/null 2>&1
+}
+
+# The candidate locations below SYS_ROOT, glob patterns expanded there (one
+# per line; an unmatched pattern stays as it is and does not exist).
+inst_java_globs() {
+  local pat
+
+  while IFS= read -r pat; do
+    [ -n "$pat" ] || continue
+    # shellcheck disable=SC2086 # the glob is expanded on purpose
+    printf '%s
+' $(inst_fs "$pat")
+  done <<EOF
+$INST_JAVA_CANDIDATES
+EOF
+}
+
+# Supported distribution family from /etc/os-release: debian or rhel.
+inst_os_family() {
+  local ids
+
+  ids="$(
+    # shellcheck disable=SC1090
+    [ -r "$(inst_fs /etc/os-release)" ] && . "$(inst_fs /etc/os-release)" 2>/dev/null
+    printf ' %s %s ' "${ID:-}" "${ID_LIKE:-}"
+  )"
+  ids="$(printf '%s' "$ids" | tr 'A-Z' 'a-z')"
+  case "$ids" in
+    *' rhel '*|*' fedora '*|*' centos '*|*' rocky '*|*' almalinux '*|*' ol '*|*' oracle '*) printf 'rhel' ;;
+    *' debian '*|*' ubuntu '*) printf 'debian' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Package candidates of a headless Java runtime, newest first (the first one
+# the repositories know is installed).
+inst_java_packages() {
+  case "$1" in
+    debian) printf '%s\n' default-jre-headless openjdk-21-jre-headless openjdk-17-jre-headless openjdk-11-jre-headless openjdk-8-jre-headless ;;
+    rhel) printf '%s\n' java-21-openjdk-headless java-17-openjdk-headless java-11-openjdk-headless java-1.8.0-openjdk-headless ;;
+  esac
+}
+
+# inst_pkg_install <family> <package>: one non-interactive installation.
+inst_pkg_install() {
+  case "$1" in
+    debian)
+      command -v apt-get >/dev/null 2>&1 || return 1
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$2"
+      ;;
+    rhel)
+      if command -v dnf >/dev/null 2>&1; then
+        dnf -y install "$2"
+      elif command -v yum >/dev/null 2>&1; then
+        yum -y install "$2"
+      else
+        return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+INST_APT_UPDATED=no
+
+# Refreshes the apt package lists once per installer run (Debian/Ubuntu).
+inst_apt_update() {
+  [ "$INST_APT_UPDATED" = no ] || return 0
+  INST_APT_UPDATED=yes
+  command -v apt-get >/dev/null 2>&1 || return 0
+  apt-get update >/dev/null 2>&1 || inst_warn 'apt-get update failed; using the cached package lists'
+}
+
+# Java 8+ for the PKCS12 tool of the helper.  A usable runtime is kept as it
+# is; an existing but unusable one (too old, outside root-controlled
+# locations, broken) is reported and never changed; only a system without
+# any Java gets the distribution's headless OpenJDK package.
+# P1CERT_JAVA_INSTALL=no skips the installation (only the check is done).
+installer_java() {
+  local family pkg
+
+  if inst_java_find; then
+    printf 'Java runtime for the PKCS12 tool: %s (Java %s)\n' "$INST_JAVA" "$INST_JAVA_MAJOR"
+    return 0
   fi
+  if inst_java_present; then
+    inst_warn "an existing Java runtime cannot be used by the helper: ${INST_JAVA_SEEN:-$(command -v java 2>/dev/null)}; it is not changed by P1CERT"
+    inst_issue "Java: no usable Java 8+ in a root-controlled location (${INST_JAVA_SEEN:-java in PATH only: $(command -v java 2>/dev/null)}); existing Java left unchanged - install Java 8+ below /usr/lib/jvm or /usr/java manually; PKCS12 keystores are not updated until then"
+    return 1
+  fi
+  if [ "${P1CERT_JAVA_INSTALL:-yes}" = no ]; then
+    inst_issue 'Java: no Java runtime; installation skipped (P1CERT_JAVA_INSTALL=no); PKCS12 keystores are not updated'
+    return 1
+  fi
+  if ! family="$(inst_os_family)"; then
+    inst_issue 'Java: no Java runtime and unsupported distribution (Debian/Ubuntu or RHEL/Oracle Linux family required); install Java 8+ manually'
+    return 1
+  fi
+  [ "$family" != debian ] || inst_apt_update
+  for pkg in $(inst_java_packages "$family"); do
+    printf 'Java runtime missing: installing %s\n' "$pkg"
+    if inst_pkg_install "$family" "$pkg"; then
+      if inst_java_find; then
+        printf 'Java runtime installed: %s (Java %s, package %s)\n' "$INST_JAVA" "$INST_JAVA_MAJOR" "$pkg"
+        return 0
+      fi
+      inst_issue "Java: package $pkg installed, but no usable Java 8+ was found afterwards (${INST_JAVA_SEEN:-nothing})"
+      return 1
+    fi
+  done
+  inst_issue "Java: none of the packages could be installed ($(inst_java_packages "$family" | tr '\n' ' ')); check the package repositories"
+  return 1
+}
+
+# Commands the ezdrowie integration needs: "<command> <debian-package>
+# <rhel-package>".  flock comes from util-linux, iconv from the C library.
+INST_TOOLS='openssl openssl openssl
+curl curl curl
+unzip unzip unzip
+sudo sudo sudo
+visudo sudo sudo
+flock util-linux util-linux
+iconv libc-bin glibc-common
+od coreutils coreutils
+stat coreutils coreutils
+awk gawk gawk
+sed sed sed
+grep grep grep
+find findutils findutils
+dd coreutils coreutils'
+
+# Missing required commands are installed from the distribution packages;
+# what is still missing afterwards is an integration issue.
+installer_tools() {
+  local cmd deb rpm family="" missing="" pkgs="" pkg
+
+  while read -r cmd deb rpm; do
+    [ -n "$cmd" ] || continue
+    command -v "$cmd" >/dev/null 2>&1 && continue
+    missing="${missing:+$missing }$cmd"
+    family="${family:-$(inst_os_family || true)}"
+    case "$family" in
+      debian) pkg="$deb" ;;
+      rhel) pkg="$rpm" ;;
+      *) pkg="" ;;
+    esac
+    case " $pkgs " in
+      *" $pkg "*) ;;
+      *) [ -z "$pkg" ] || pkgs="${pkgs:+$pkgs }$pkg" ;;
+    esac
+  done <<EOF
+$INST_TOOLS
+EOF
+  [ -n "$missing" ] || return 0
+  printf 'missing commands: %s\n' "$missing"
+  if [ -n "$pkgs" ]; then
+    [ "$family" != debian ] || inst_apt_update
+    for pkg in $pkgs; do
+      printf 'installing package %s\n' "$pkg"
+      inst_pkg_install "$family" "$pkg" || inst_warn "package $pkg could not be installed"
+    done
+  fi
+  for cmd in $missing; do
+    command -v "$cmd" >/dev/null 2>&1 || inst_issue "required command missing: $cmd"
+  done
 }
 
 # True when helper "ping" output reports exactly the expected API version.
@@ -275,16 +527,37 @@ EOF
   [ "$ok" = yes ] && [ "$api" = "$EZ_HELPER_API" ]
 }
 
-# The installed helper, run as root (it performs its own integrity checks).
+# The installed helper, run as root (it performs its own integrity checks);
+# its diagnostics are part of the output.
 inst_helper_ping() {
-  "$(inst_fs "$HELPER_PATH")" ping 2>/dev/null
+  "$(inst_fs "$HELPER_PATH")" ping 2>&1
 }
 
+# The installed helper answers ping with exactly EZ_HELPER_API.  On failure
+# INST_HELPER_PROBLEM says why: missing, wrong owner/mode, refused to start
+# (its own integrity check) or another API.  INST_PING keeps the answer.
 inst_helper_compatible() {
-  local out
+  local fs api
 
-  out="$(inst_helper_ping)" || return 1
-  inst_ping_api_ok "$out"
+  INST_HELPER_PROBLEM=""; INST_PING=""
+  fs="$(inst_fs "$HELPER_PATH")"
+  if [ ! -e "$fs" ] && [ ! -L "$fs" ]; then
+    INST_HELPER_PROBLEM="helper missing: $HELPER_PATH"
+    return 1
+  fi
+  if ! inst_node_trusted "$fs" f || [ ! -x "$fs" ]; then
+    INST_HELPER_PROBLEM="helper has a wrong owner or mode (must be a root-owned 0755 regular file, not a symlink): $HELPER_PATH ($(stat -c '%U:%G %a %F' -- "$fs" 2>/dev/null))"
+    return 1
+  fi
+  if ! INST_PING="$(inst_helper_ping)"; then
+    INST_HELPER_PROBLEM="helper refused to start: $(printf '%s\n' "$INST_PING" | grep -m 1 . || printf 'no message')"
+    return 1
+  fi
+  if ! inst_ping_api_ok "$INST_PING"; then
+    api="$(printf '%s\n' "$INST_PING" | sed -n 's/^API_VERSION=//p' | head -n 1)"
+    INST_HELPER_PROBLEM="installed helper does not answer ping with API_VERSION=$EZ_HELPER_API (reported: ${api:-none})"
+    return 1
+  fi
 }
 
 # Only the helper is allowed, without a password, for the P1CERT user.  The
@@ -358,16 +631,21 @@ install_ezdrowie_sudoers() {
 }
 
 # Verifies that TARGET_USER can really run the helper with "sudo -n".
-# Returns 0 verified, 1 refused, 2 could not be verified from here (e.g. the
-# outer "sudo -u" is blocked by requiretty).  No shell, no string commands.
+# Returns 0 verified, 1 refused by sudo, 2 could not be verified from here
+# (e.g. the outer "sudo -u" is blocked by requiretty), 3 sudo missing, 4 the
+# helper answers through sudo with another API.  INST_SUDO_DETAIL: the first
+# message line.  No shell, no string commands.
 inst_verify_sudo() {
   local out
 
-  command -v sudo >/dev/null 2>&1 || return 2
-  if out="$(sudo -n -u "$TARGET_USER" -- sudo -n -- "$HELPER_PATH" ping 2>/dev/null)"; then
+  INST_SUDO_DETAIL=""
+  command -v sudo >/dev/null 2>&1 || return 3
+  if out="$(sudo -n -u "$TARGET_USER" -- sudo -n -- "$HELPER_PATH" ping 2>&1)"; then
     inst_ping_api_ok "$out" && return 0
-    return 1
+    INST_SUDO_DETAIL="API_VERSION=$(printf '%s\n' "$out" | sed -n 's/^API_VERSION=//p' | head -n 1)"
+    return 4
   fi
+  INST_SUDO_DETAIL="$(printf '%s\n' "$out" | grep -m 1 . || true)"
   # Can root switch to the user at all?  If not, the result says nothing.
   sudo -n -u "$TARGET_USER" -- true >/dev/null 2>&1 || return 2
   return 1
@@ -426,10 +704,13 @@ inst_systemd_running() {
   [ -d "$(inst_fs /run/systemd/system)" ]
 }
 
-# Installs helper, sudoers entry and service.  Existing operator data and an
-# armed timer are never touched.  Prints READY or INCOMPLETE.
+# Installs required tools, Java (when missing), helper, sudoers entry and
+# service, then verifies them.  Existing operator data, an existing Java and
+# an armed timer are never touched.  Prints READY or INCOMPLETE with one line
+# per problem (helper missing / wrong owner or mode / refused to start / API,
+# sudo missing / refused / not verifiable, PKCS12 tool or Java).
 installer_system_integration() {
-  local helper_ok=no rc
+  local helper_ok=no rc p12
 
   INTEGRATION_ISSUES=""
   if [ "$(id -u)" -ne 0 ]; then
@@ -440,6 +721,8 @@ installer_system_integration() {
     inst_warn "unsupported primary group name of $TARGET_USER; ezdrowie system components not installed"
     inst_issue "unsupported primary group name of $TARGET_USER"
   else
+    installer_tools
+    installer_java || true
     if install_ezdrowie_helper; then
       printf 'ezdrowie helper installed: %s\n' "$HELPER_PATH"
     else
@@ -447,8 +730,16 @@ installer_system_integration() {
     fi
     if inst_helper_compatible; then
       helper_ok=yes
+      p12="$(printf '%s\n' "$INST_PING" | sed -n 's/^P12_TOOL=//p' | head -n 1)"
+      case "$p12" in
+        OK) printf 'ezdrowie PKCS12 tool ready (Java %s)\n' "${INST_JAVA_MAJOR:-8+}" ;;
+        NO_JAVA) inst_issue 'PKCS12 tool: the helper finds no Java 8+ runtime in a root-controlled location (P12_TOOL=NO_JAVA)' ;;
+        NO_JAR) inst_issue "PKCS12 tool: $HELPER_P12_JAR_PATH missing or not root-owned (P12_TOOL=NO_JAR)" ;;
+        BAD_JAR) inst_issue "PKCS12 tool: $HELPER_P12_JAR_PATH has an unexpected SHA-256 (P12_TOOL=BAD_JAR)" ;;
+        *) inst_issue "PKCS12 tool: state not reported by the helper (P12_TOOL=${p12:-none})" ;;
+      esac
     else
-      inst_issue "installed helper does not answer ping with API_VERSION=$EZ_HELPER_API"
+      inst_issue "$INST_HELPER_PROBLEM"
     fi
     if [ "$helper_ok" = yes ]; then
       if install_ezdrowie_sudoers; then
@@ -456,11 +747,13 @@ installer_system_integration() {
       else
         inst_issue "sudoers entry $SUDOERS_FILE not installed or reverted"
       fi
-      inst_verify_sudo
-      rc=$?
+      rc=0
+      inst_verify_sudo || rc=$?
       case "$rc" in
         0) printf 'ezdrowie sudo access verified for %s\n' "$TARGET_USER" ;;
-        1) inst_issue "$TARGET_USER cannot run the helper with sudo -n" ;;
+        1) inst_issue "sudo refused: $TARGET_USER cannot run the helper with sudo -n (${INST_SUDO_DETAIL:-no message}); check $SUDOERS_FILE and #includedir in $SUDOERS_MAIN" ;;
+        3) inst_issue 'sudo missing: the sudo command is not installed' ;;
+        4) inst_issue "the helper answers through sudo with another API (${INST_SUDO_DETAIL}); another helper path in sudoers?" ;;
         *)
           inst_warn "passwordless sudo of $TARGET_USER could not be verified from the installer; check: sudo -u $TARGET_USER sudo -n $HELPER_PATH ping"
           inst_issue "sudo access of $TARGET_USER not verified"
@@ -490,7 +783,8 @@ installer_system_integration() {
   fi
   printf 'P1CERT ezdrowie system integration: INCOMPLETE\n'
   printf '%s' "$INTEGRATION_ISSUES"
-  printf '  p1cert ezdrowie credentials/test/scan/plan remain usable; run/schedule need a compatible helper and sudoers entry.\n'
+  printf '  p1cert ezdrowie credentials/test/scan/plan remain usable; run/schedule need a compatible helper and sudoers entry\n'
+  printf '  (PKCS12 keystores also Java 8+ and the PKCS12 tool).  Diagnosis as %s: p1cert ezdrowie check\n' "$TARGET_USER"
   return 1
 }
 
@@ -640,7 +934,7 @@ installer_usage() {
 }
 
 installer_main() {
-  local action=install
+  local action=install rc
 
   set -eu
   case "${1:-}" in
@@ -656,10 +950,16 @@ installer_main() {
     return
   fi
   installer_user_install
-  # An incomplete ezdrowie integration does not fail the P1CERT installation
-  # (P1 CA commands do not need it); the status line says what is missing.
-  installer_system_integration || true
+  # The P1CERT files are installed either way (P1 CA commands do not need the
+  # ezdrowie integration), but an incomplete integration is not a success:
+  # exit status 3 tells the caller (MASTER) what the status lines say.
+  rc=0
+  installer_system_integration || rc=3
   "${BIN_DIR}/p1cert" version
+  if [ "$rc" -ne 0 ]; then
+    printf 'ERROR: P1CERT installed, but the ezdrowie system integration is INCOMPLETE (exit status 3); see the lines above\n' >&2
+  fi
+  return "$rc"
 }
 
 if [ "${P1CERT_INSTALLER_LIB_ONLY:-0}" != 1 ]; then

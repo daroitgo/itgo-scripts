@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+- Fix (production hardening, helper/library API 6; helpers and libraries of
+  API 1-5 are refused): several e-Zdrowie server certificates in one
+  JKS/PKCS12 no longer block the update. The only valid P1
+  `trustedCertEntry` (or, when all have expired, the one with the latest
+  NotAfter) is the current entry and is replaced; the other P1
+  `trustedCertEntry` entries have all expired and are removed with the
+  approved update (shown in `plan`, bound by their SHA-256 in the optional
+  6th field of `APP_TARGET`, re-proven by the helper on exactly the approved
+  bytes). JKS: byte surgery, every other entry byte for byte; PKCS12:
+  `p1cert-pkcs12.jar` (new SHA-256 pinned in installer and helper) removes
+  only the named `trustedCertEntry` entries. Private keys (TLS/WSS), CA and
+  all other entries stay unchanged; backup, journal, verification and
+  rollback as before. Two valid P1 certificates in one store are never
+  guessed: `NO CHANGE` when one of them already is the source certificate,
+  otherwise a manual decision. Plans without the 6th field keep working.
+- Fix: file names `*ezdrowie*` (any case; previously `*ezdrowiegovpl*`) are
+  candidates, aliases `*ezdrowie*` are shown in `discover`/`plan`; the X.509
+  content alone decides (an alias never makes an entry P1).
+- Fix (classic Integration Platform): every service systemd knows is
+  examined (`systemctl list-units`/`list-unit-files`, unit directories), not
+  only regular files below the systemd directories. `SSL.patch` is read from
+  the Tomcat instance the unit runs (`CATALINA_BASE`/`CATALINA_HOME`, or the
+  directory above `bin` of `startup.sh`/`catalina.sh`/`daemon.sh` in
+  `ExecStart`, e.g. `apache-tomcat-9.x`), also for installations without
+  `IntegrationPlatform` in the path; the application tree may belong to
+  root, the unit user or the P1CERT user (e.g. `pi_eusl.service` run as root
+  with an `itgo:itgo` installation). A bound unit the helper cannot verify is
+  shown as manual restart; with several bound applications no restart is
+  offered (previously the operator chose one). Vendor configuration is never
+  changed.
+- Fix (installer): an incomplete ezdrowie integration is no longer ignored
+  (`installer_system_integration || true`): the installer exits with status
+  3 and names every problem (required command missing, Java/PKCS12 tool,
+  helper missing / wrong owner or mode / refused to start / other API, sudo
+  missing / refused with its message / other API through sudo). New command
+  `p1cert ezdrowie check` (same diagnosis as the P1CERT user); `run`/`plan`
+  name the exact helper problem.
+- Java: the installer (directly and through MASTER) checks for a Java 8+
+  runtime in the locations the helper accepts and, only on a system without
+  any Java, installs the distribution's headless OpenJDK (Debian/Ubuntu,
+  RHEL/Oracle Linux); an existing Java is never updated, replaced or
+  switched; missing required commands (openssl, curl, unzip, sudo, flock,
+  iconv, ...) are installed from the distribution packages.
 - Fix (Docker discovery): a relative certificate/keystore path of a service
   without `working_dir` is resolved when exactly one host file is reachable
   through a mount of that service (otherwise still reported as unmapped);

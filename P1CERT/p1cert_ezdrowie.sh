@@ -66,7 +66,11 @@ EZ_HELPER='/usr/local/libexec/itgo-p1cert/p1cert-ezdrowie-helper'
 # (ez_systemd_bound rule C); helpers of API 1-3 are refused.
 # 5: Docker Compose applications (apply-docker, recover, plan version 3,
 # PKCS12 tool); helpers of API 1-4 are refused.
-EZ_HELPER_API=5
+# 6: several P1 entries per JKS/PKCS12 (expired ones removed with the update,
+# 6th APP_TARGET field), Tomcat instance from ExecStart/CATALINA_BASE, the
+# operator as a principal of the application tree; helpers of API 1-5 are
+# refused.
+EZ_HELPER_API=6
 EZ_SERVICE_UNIT='itgo-p1cert-ezdrowie.service'
 EZ_TIMER_UNIT='itgo-p1cert-ezdrowie.timer'
 # Trusted owner/group of target directories besides the P1CERT user itself
@@ -83,6 +87,7 @@ EZ_TMP=""
 EZ_PASSWORD=""
 EZ_CRED_MODE=""
 EZ_HELPER_STATE=unknown
+EZ_HELPER_DETAIL=""
 
 # ---------------------------------------------------------------------------
 # Generic helpers
@@ -272,6 +277,20 @@ ez_helper_installed() {
   return 0
 }
 
+# Why the helper cannot be used (EZ_HELPER_STATE) as one line for the
+# operator; EZ_HELPER_DETAIL carries the first diagnostic line, if any.
+ez_helper_state_text() {
+  case "$EZ_HELPER_STATE" in
+    missing) printf 'brak helpera %s (instalacja niekompletna)' "$EZ_HELPER" ;;
+    unsafe) printf 'helper %s ma niewłaściwego właściciela lub uprawnienia (wymagany root, bez zapisu dla grupy/innych, nie symlink): %s' "$EZ_HELPER" "$EZ_HELPER_DETAIL" ;;
+    nosudo) printf 'brak polecenia sudo' ;;
+    denied) printf 'sudo odmawia uruchomienia helpera bez hasła (wpis /etc/sudoers.d/itgo-p1cert-ezdrowie brak lub nieaktywny): %s' "$EZ_HELPER_DETAIL" ;;
+    error) printf 'helper odmówił startu (kontrola integralności katalogów, plików lub biblioteki): %s' "$EZ_HELPER_DETAIL" ;;
+    api) printf 'helper ma niezgodną wersję API (%s, wymagana %s)' "${EZ_HELPER_DETAIL:-brak}" "$EZ_HELPER_API" ;;
+    *) printf 'stan helpera nieznany' ;;
+  esac
+}
+
 ez_helper() {
   sudo -n -- "$EZ_HELPER" "$@"
 }
@@ -309,19 +328,51 @@ EOF
   [ "$ok" = yes ] && [ -n "$api" ] && [ "$api" = "$EZ_HELPER_API" ]
 }
 
-# EZ_HELPER_STATE: unknown | yes | no (missing/sudo) | api (incompatible).
+# EZ_HELPER_STATE: unknown | yes | missing | unsafe (owner/mode/symlink) |
+# nosudo | denied (sudo refuses: no or inactive sudoers entry, password
+# required) | error (the helper itself refused to start) | api (incompatible
+# API).  EZ_HELPER_DETAIL: the first diagnostic line or the reported API.
 ez_helper_usable() {
-  local out
+  local out err rc=0
 
   case "$EZ_HELPER_STATE" in
     yes) return 0 ;;
-    no|api) return 1 ;;
+    unknown|'') ;;
+    *) return 1 ;;
   esac
-  EZ_HELPER_STATE=no
-  ez_helper_installed && command -v sudo >/dev/null 2>&1 || return 1
-  out="$(ez_helper ping 2>/dev/null)" || return 1
+  EZ_HELPER_DETAIL=""
+  if [ ! -e "$EZ_HELPER" ] && [ ! -L "$EZ_HELPER" ]; then
+    EZ_HELPER_STATE=missing
+    return 1
+  fi
+  if ! ez_helper_installed; then
+    EZ_HELPER_STATE=unsafe
+    EZ_HELPER_DETAIL="$(stat -c '%U:%G %a %F' -- "$EZ_HELPER" 2>/dev/null)"
+    return 1
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    EZ_HELPER_STATE=nosudo
+    return 1
+  fi
+  ez_tmpdir || return 1
+  out="$(ez_helper ping 2>"$EZ_TMP/ping.err")" || rc=$?
+  err="$(head -n 1 "$EZ_TMP/ping.err" 2>/dev/null)"
+  rm -f -- "$EZ_TMP/ping.err"
+  if [ "$rc" -ne 0 ]; then
+    # sudo reports its own refusals as "sudo: ..."; anything else comes from
+    # the helper (fail-closed self check).
+    case "$err" in
+      sudo:*|*'password is required'*|*'not allowed to execute'*|*'not in the sudoers'*|*'may not run sudo'*)
+        EZ_HELPER_STATE=denied ;;
+      *) EZ_HELPER_STATE=error ;;
+    esac
+    EZ_HELPER_DETAIL="${err:-kod $rc}"
+    ez_log "helper ping failed rc=$rc: $err"
+    return 1
+  fi
   if ! ez_helper_ping_ok "$out"; then
     EZ_HELPER_STATE=api
+    EZ_HELPER_DETAIL="$(printf '%s\n' "$out" | sed -n 's/^API_VERSION=//p' | head -n 1)"
     return 1
   fi
   EZ_HELPER_STATE=yes
@@ -329,12 +380,34 @@ ez_helper_usable() {
 
 ez_require_helper() {
   ez_helper_usable && return 0
-  if [ "$EZ_HELPER_STATE" = api ]; then
-    ez_err "uprzywilejowany helper ma niezgodną wersję API (wymagana $EZ_HELPER_API); uruchom ponownie instalator P1CERT."
-  else
-    ez_err "uprzywilejowany helper P1CERT jest niedostępny ($EZ_HELPER lub wpis sudoers). Uruchom ponownie instalator P1CERT."
-  fi
+  ez_err "uprzywilejowany helper P1CERT jest niedostępny: $(ez_helper_state_text). Uruchom ponownie instalator P1CERT (jako root) i sprawdź: p1cert ezdrowie check"
   return 1
+}
+
+# p1cert ezdrowie check: read-only diagnosis of the system integration
+# (helper, sudo, API, PKCS12 tool and Java of the helper, timer state).
+# Exit 0 when run/schedule can work, 1 otherwise.
+ez_check() {
+  local caps p12 rc=0
+
+  printf 'Helper:        %s\n' "$EZ_HELPER"
+  if ez_helper_usable; then
+    printf 'Stan:          OK (sudo -n, API %s)\n' "$EZ_HELPER_API"
+    caps="$(ez_helper_run ping 2>/dev/null)" || caps=""
+    p12="$(printf '%s\n' "$caps" | sed -n 's/^P12_TOOL=//p' | head -n 1)"
+    case "$p12" in
+      OK) printf 'PKCS12:        OK (Java 8+ i sprawdzone narzędzie p1cert-pkcs12.jar)\n' ;;
+      NO_JAVA) printf 'PKCS12:        BRAK JAVA - brak środowiska Java 8+ w lokalizacji kontrolowanej przez root (/usr/bin/java, /usr/lib/jvm, /usr/java); magazyny PKCS12 nie będą aktualizowane\n' ;;
+      NO_JAR) printf 'PKCS12:        BRAK NARZĘDZIA - brak lub niewłaściwe uprawnienia p1cert-pkcs12.jar; magazyny PKCS12 nie będą aktualizowane\n' ;;
+      BAD_JAR) printf 'PKCS12:        NIEZGODNE NARZĘDZIE - SHA-256 p1cert-pkcs12.jar różni się od oczekiwanego; magazyny PKCS12 nie będą aktualizowane\n' ;;
+      *) printf 'PKCS12:        nieznany stan (%s)\n' "${p12:-brak}" ;;
+    esac
+    printf 'Przerwane operacje Docker: %s\n' "$(printf '%s\n' "$caps" | sed -n 's/^DOCKER_PENDING=//p' | head -n 1)"
+  else
+    printf 'Stan:          BŁĄD - %s\n' "$(ez_helper_state_text)"
+    rc=1
+  fi
+  return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -887,67 +960,148 @@ ez_scan() {
 # Application / service detection
 # ---------------------------------------------------------------------------
 
-# appConfig.properties of the IntegrationPlatform installation a unit runs
-# from (ez_systemd_ip_root), printed only when it satisfies the same narrow
-# policy the root helper enforces (ez_pi_appconfig_trusted with the unit's
-# User=); nothing otherwise.
+# appConfig.properties of the Tomcat instance of the classic Integration
+# Platform installation a unit runs from (ez_systemd_pi_instance), printed
+# only when it satisfies the same narrow policy the root helper enforces
+# (ez_pi_appconfig_trusted with the unit's User= and this P1CERT user, the
+# operator of the helper); nothing otherwise.  Why an existing file was not
+# used is logged (the helper would refuse it too).
 ez_detect_pi_appconfig() {
-  local props="$1" root ids auid agid file
+  local props="$1" inst root ids auid agid logical file
 
-  root="$(ez_systemd_ip_root "$props")" || return 1
-  file="$(fs_path "$root/$EZ_PI_APPCONFIG_REL")"
+  inst="$(ez_systemd_pi_instance "$props")" || return 1
+  root="${inst%%|*}"; logical="${inst#*|}"
+  file="$(fs_path "$logical")"
   [ -e "$file" ] || [ -L "$file" ] || return 1
-  ids="$(ez_systemd_app_ids "$props" "$EZ_TRUSTED_UID" "$EZ_TRUSTED_GID")" || return 1
+  ids="$(ez_systemd_app_ids "$props" "$EZ_TRUSTED_UID" "$EZ_TRUSTED_GID")" || {
+    ez_log "User= of the unit cannot be resolved; $logical is not used for detection"
+    return 1
+  }
   read -r auid agid <<EOF
 $ids
 EOF
-  ez_pi_appconfig_trusted "${P1CERT_FS_ROOT:-}" "$root" "$EZ_TRUSTED_UID" "$EZ_TRUSTED_GID" "$auid" "$agid" || {
-    ez_log "appConfig.properties of $root is not controlled only by root and the unit user; not used for detection"
+  ez_pi_appconfig_trusted "${P1CERT_FS_ROOT:-}" "$root" "$EZ_TRUSTED_UID" "$EZ_TRUSTED_GID" "$auid" "$agid" \
+    "$logical" "$(id -u)" "$(id -g)" || {
+    ez_log "$logical or one of its directories is not controlled only by root, the unit user (uid $auid) and the P1CERT user, is a symlink or has several links; not used for detection"
     return 1
   }
   ez_pi_appconfig_load "$file"
+}
+
+# Unit names systemd knows (loaded or installed, any location, any name),
+# then unit files found in the standard directories (also without systemd
+# answering, e.g. in a container); each name once.
+ez_systemd_unit_names() {
+  local dir fsdir file
+
+  {
+    systemctl list-units --type=service --all --plain --no-legend --no-pager 2>/dev/null | awk '{ print $1 }'
+    systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{ print $1 }'
+    for dir in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+      fsdir="$(fs_path "$dir")"
+      [ -d "$fsdir" ] || continue
+      for file in "$fsdir"/*.service; do
+        [ -e "$file" ] || [ -L "$file" ] || continue
+        printf '%s\n' "${file##*/}"
+      done
+    done
+  } | awk '!seen[$0]++'
+}
+
+# True when the root helper will read unit $1 (props $2) as root-controlled
+# configuration (same rule as helper_systemd_bound): the unit file below
+# /etc/systemd/system, /usr/lib/systemd/system or /lib/systemd/system, unit
+# and drop-in files and every directory above them owned by root, not
+# group/world writable, not symlinks.  EZ_UNIT_NOTE says why not.
+ez_unit_files_root_controlled() {
+  local props="$2" fragment kind file
+
+  EZ_UNIT_NOTE=""
+  fragment="$(printf '%s\n' "$props" | sed -n 's/^FragmentPath=//p' | head -n 1)"
+  case "$fragment" in
+    /etc/systemd/system/*|/usr/lib/systemd/system/*|/lib/systemd/system/*) ;;
+    *) EZ_UNIT_NOTE="plik jednostki poza katalogami systemd (${fragment:-brak})"; return 1 ;;
+  esac
+  while IFS=' ' read -r kind file; do
+    [ -n "$file" ] || continue
+    case "$kind:$file" in
+      F:/etc/systemd/system/*|F:/usr/lib/systemd/system/*|F:/lib/systemd/system/*|F:/run/systemd/system/*|E:/*) ;;
+      *) EZ_UNIT_NOTE="nieoczekiwana ścieżka konfiguracji jednostki: $file"; return 1 ;;
+    esac
+    [ "$kind" = F ] || continue
+    ez_path_chars_ok "$file" && ez_path_root_controlled "$file" || {
+      EZ_UNIT_NOTE="plik $file (lub katalog nad nim) nie należy wyłącznie do root albo jest symlinkiem"
+      return 1
+    }
+  done <<EOF
+$(ez_systemd_config_files "$props")
+EOF
+  return 0
+}
+
+# A logical path whose every component (directories and the file) is owned
+# by root (EZ_TRUSTED_UID), not group/world writable and not a symlink.
+ez_path_root_controlled() {
+  local rest="${1#/}" current="" part meta
+
+  ez_dir_safe "$(fs_path /)" "$EZ_TRUSTED_UID" || return 1
+  while [ -n "$rest" ]; do
+    part="${rest%%/*}"
+    if [ "$part" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+    current="$current/$part"
+    if [ -n "$rest" ]; then
+      ez_dir_safe "$(fs_path "$current")" "$EZ_TRUSTED_UID" || return 1
+    else
+      [ -f "$(fs_path "$current")" ] && [ ! -L "$(fs_path "$current")" ] || return 1
+      meta="$(stat -c '%u %a' -- "$(fs_path "$current")" 2>/dev/null)" || return 1
+      case "$meta" in *[!0-9\ ]*|'') return 1 ;; esac
+      [ "${meta%% *}" = "$EZ_TRUSTED_UID" ] && [ $((8#${meta#* } & 8#022)) -eq 0 ] || return 1
+    fi
+  done
 }
 
 # Prints "systemd|<unit>|<reason>" for units that satisfy the same binding
 # rule the root helper enforces before a restart (ez_systemd_bound): the unit
 # configuration names the exact certificate path, the unit runs from the
 # same IntegrationPlatform installation directory that contains the file, or
-# SSL.patch in appConfig.properties of the installation the unit runs from
-# names exactly the certificate.  Denied system units are never offered.
+# SSL.patch in appConfig.properties of the Tomcat instance the unit runs
+# (ExecStart/CATALINA_BASE) names exactly the certificate.  Every service
+# systemd knows is examined, whatever its name or unit file location
+# (ez_systemd_unit_names); denied system units are never offered.  A bound
+# unit whose configuration the helper would not accept as root-controlled is
+# printed as "manual|<unit>|<reason>" (relation shown, no automatic restart).
 ez_detect_systemd() {
-  local cert="$1" dir fsdir file unit seen=" " props config kind path reason appcfg
+  local cert="$1" unit props config kind path reason appcfg
 
   command -v systemctl >/dev/null 2>&1 || return 0
-  for dir in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
-    fsdir="$(fs_path "$dir")"
-    [ -d "$fsdir" ] || continue
-    for file in "$fsdir"/*.service; do
-      [ -f "$file" ] && [ ! -L "$file" ] || continue
-      unit="${file##*/}"
-      ez_unit_name_ok "$unit" || continue
-      case "$seen" in *" $unit "*) continue ;; esac
-      seen="$seen$unit "
-      ez_unit_denied "$unit" && continue
+  while IFS= read -r unit; do
+    ez_unit_name_ok "$unit" || continue
+    ez_unit_denied "$unit" && continue
 
-      props="$(systemctl show --no-pager -p LoadState -p FragmentPath -p DropInPaths \
-        -p WorkingDirectory -p ExecStart -p Environment -p EnvironmentFiles -p User -- "$unit" 2>/dev/null)" || continue
-      printf '%s\n' "$props" | grep -F -x -q 'LoadState=loaded' || continue
-      config=""
-      while IFS=' ' read -r kind path; do
-        [ -n "$path" ] || continue
-        ez_path_chars_ok "$path" || continue
-        path="$(fs_path "$path")"
-        [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ] || continue
-        config="$config
+    props="$(systemctl show --no-pager -p LoadState -p FragmentPath -p DropInPaths \
+      -p WorkingDirectory -p ExecStart -p Environment -p EnvironmentFiles -p User -- "$unit" 2>/dev/null)" || continue
+    printf '%s\n' "$props" | grep -F -x -q 'LoadState=loaded' || continue
+    config=""
+    while IFS=' ' read -r kind path; do
+      [ -n "$path" ] || continue
+      ez_path_chars_ok "$path" || continue
+      path="$(fs_path "$path")"
+      [ -f "$path" ] && [ -r "$path" ] || continue
+      config="$config
 $(cat -- "$path" 2>/dev/null)"
-      done <<EOF
+    done <<EOF
 $(ez_systemd_config_files "$props")
 EOF
-      appcfg="$(ez_detect_pi_appconfig "$props")" || appcfg=""
-      reason="$(ez_systemd_bound "$cert" "$props" "$config" "$appcfg")" || continue
+    appcfg="$(ez_detect_pi_appconfig "$props")" || appcfg=""
+    reason="$(ez_systemd_bound "$cert" "$props" "$config" "$appcfg")" || continue
+    if ez_unit_files_root_controlled "$unit" "$props"; then
       printf 'systemd|%s|%s\n' "$unit" "$reason"
-    done
-  done
+    else
+      printf 'manual|%s|%s; helper nie zrestartuje: %s\n' "$unit" "$reason" "$EZ_UNIT_NOTE"
+    fi
+  done <<EOF
+$(ez_systemd_unit_names)
+EOF
 }
 
 EZ_COMPOSE_AWK='
@@ -1140,7 +1294,7 @@ ez_detect_targets() {
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     case "$line" in
-      systemd\|*)
+      systemd\|*|manual\|*)
         IFS='|' read -r kind a reason <<EOF
 $line
 EOF
@@ -1167,6 +1321,7 @@ EOF
 ez_restart_label() {
   case "$1" in
     systemd) printf 'systemctl restart %s' "$2" ;;
+    manual) printf 'restart ręczny %s (bez automatycznego restartu)' "$2" ;;
     compose) printf 'restart kontenerów usługi Compose %s (katalog %s)' "$3" "$2" ;;
     *) printf 'brak restartu' ;;
   esac
@@ -1503,6 +1658,7 @@ ez_dc_targets() {
     DT_EZ[$t]="$EZD_EZ"; DT_NCERT[$t]="$EZD_COUNT"
     DT_SSTATUS[$t]=""; DT_SREASON[$t]=""; DT_SP1[$t]=""; DT_SP1WHY[$t]=""; DT_PWDESC[$t]=""; DT_SBLOCK[$t]=""
     DT_P1FP[$t]=""; DT_P1ALIAS[$t]=""; DT_P1NAMES[$t]=""; DT_P1NA[$t]=""; DT_SHA[$t]=""
+    DT_P1DROP[$t]=""; DT_P1LIVE[$t]=""; DT_P1LIVENAMES[$t]=""
     case "$EZD_STATE" in
       CERT|STORE) DT_SHA[$t]="$(ez_file_digest "$(fs_path "${DT_PATH[$t]}")")" ;;
     esac
@@ -1697,9 +1853,24 @@ ez_dc_store() {
   ez_store_p1
   DT_SSTATUS[$t]="$EZS_STATUS"; DT_SREASON[$t]="$EZS_REASON"; DT_SP1[$t]="$EZS_P1"; DT_SP1WHY[$t]="$EZS_P1_WHY"
   DT_P1FP[$t]=""; DT_P1ALIAS[$t]=""; DT_P1NAMES[$t]=""; DT_P1NA[$t]=""
+  DT_P1DROP[$t]=""; DT_P1LIVE[$t]=""; DT_P1LIVENAMES[$t]=""
   if [ -n "$EZS_P1_ROW" ]; then
     DT_P1FP[$t]="${ES_FP[$EZS_P1_ROW]}"; DT_P1ALIAS[$t]="${ES_ALIAS[$EZS_P1_ROW]}"
     DT_P1NAMES[$t]="${ES_NAMES[$EZS_P1_ROW]}"; DT_P1NA[$t]="${ES_NOT_AFTER[$EZS_P1_ROW]}"
+    # Expired P1 entries removed with an approved update (6th plan field).
+    DT_P1DROP[$t]="$(ez_store_p1_drop_fps)"
+  elif [ -n "$EZS_P1_LIVE" ]; then
+    # Several valid P1 entries: fine only when one of them already is the
+    # source certificate (ez_dc_app_decide); identities of the first one.
+    DT_P1LIVE[$t]="$EZS_P1_LIVE"
+    i=0
+    while [ "$i" -lt "$ES_COUNT" ]; do
+      if [ "${ES_KIND[$i]}" = trustedCertEntry ] && ez_names_contain "$EZS_P1_LIVE" "${ES_FP[$i]}"; then
+        DT_P1LIVENAMES[$t]="${ES_NAMES[$i]}"
+        break
+      fi
+      i=$((i + 1))
+    done
   fi
 
   # Report lines (built now: ES_* belong to the last opened store).
@@ -1720,6 +1891,8 @@ ez_dc_store() {
   fi
   [ -z "$EZS_NOTE" ] || block="$block          Uwaga:      $EZS_NOTE
 "
+  [ -z "$EZS_P1_NOTE" ] || block="$block          Uwaga:      alias wskazuje e-Zdrowie, ale certyfikat nie ma produkcyjnej tożsamości ezdrowie.gov.pl (nie jest P1): $EZS_P1_NOTE
+"
   if [ "$ES_COUNT" -gt 0 ]; then
     block="$block          Wpisy:
 "
@@ -1734,7 +1907,7 @@ ez_dc_store() {
         done
         block="$block            PrivateKeyEntry \"${ES_ALIAS[$i]}\" (łańcuch: $n): ${ES_SUBJECT[$i]:-nieczytelny certyfikat} - klucz prywatny, wpis nie będzie modyfikowany
 "
-      elif [ -n "${ES_ID[$i]}" ] || [ "${ES_OK[$i]}" != yes ]; then
+      elif [ -n "${ES_ID[$i]}" ] || [ "${ES_OK[$i]}" != yes ] || ez_alias_matches "${ES_ALIAS[$i]}"; then
         block="$block            ${ES_KIND[$i]} \"${ES_ALIAS[$i]}\": "
         if [ "${ES_OK[$i]}" != yes ]; then
           block="${block}nieczytelny certyfikat
@@ -1772,7 +1945,13 @@ ez_dc_store() {
   else
     [ "$EZS_STATUS" = OK ] || DT_WHY[$t]="${DT_WHY[$t]:+${DT_WHY[$t]}, }magazyn: $EZS_STATUS"
     [ "$EZS_P1" = PEWNA ] || DT_WHY[$t]="${DT_WHY[$t]:+${DT_WHY[$t]}, }identyfikacja P1: $EZS_P1"
-    [ -z "${DT_WHY[$t]}" ] || DT_SURE[$t]=no
+    if [ -n "${DT_WHY[$t]}" ]; then
+      DT_SURE[$t]=no
+      # Only the configuration was certain and the store holds several valid
+      # P1 entries: decided against the source in ez_dc_app_decide.
+      [ "${DT_WHY[$t]}" != "identyfikacja P1: $EZS_P1" ] || [ -z "$EZS_P1_LIVE" ] || DT_SURE[$t]=multi
+      [ "${DT_SURE[$t]}" != multi ] || DT_WHY[$t]="${DT_WHY[$t]} ($EZS_P1_WHY)"
+    fi
   fi
   ez_store_reset
 }
@@ -1966,7 +2145,7 @@ ez_discover() {
 ez_dc_app_decide() {
   local p="$1" t r mine names fp na action reason
 
-  DU_ALL=""; DU_UPD=""; DU_SRC=-1; DU_REASON=""; DU_DETAIL=""; DU_SKIP=""
+  DU_ALL=""; DU_UPD=""; DU_SRC=-1; DU_REASON=""; DU_DETAIL=""; DU_SKIP=""; DU_CURRENT=""
   [ "${DP_UNIT[$p]}" != - ] || { DU_REASON='projekt bez jednostki systemd'; return 1; }
   [ -z "${DP_ERR[$p]}" ] || { DU_REASON="niejednoznaczna konfiguracja projektu: ${DP_ERR[$p]}"; return 1; }
   t=0
@@ -1992,7 +2171,20 @@ ez_dc_app_decide() {
           fi
           ;;
         STORE)
-          if [ "${DT_SURE[$t]}" != na ]; then
+          if [ "${DT_SURE[$t]}" = multi ]; then
+            # Several valid P1 entries are never touched; the store is up to
+            # date when one of them is the source certificate selected for
+            # them, otherwise which entry to replace is a guess.
+            ez_select_remote "" "${DT_P1LIVENAMES[$t]:-}"
+            if [ "$SEL_STATE" = VALID ] && ez_names_contain "${DT_P1LIVE[$t]:-}" "${R_FP[$SEL_INDEX]}"; then
+              DU_CURRENT="$DU_CURRENT $t"
+              DU_DETAIL="$DU_DETAIL${DT_PATH[$t]}: NO_CHANGE (jeden z kilku ważnych wpisów ezdrowie.gov.pl to już certyfikat źródłowy ${R_NAME[$SEL_INDEX]})
+"
+            else
+              DU_REASON="${DT_PATH[$t]}: wynik niepewny (${DT_WHY[$t]}; żaden z nich nie jest certyfikatem źródłowym - wymagana decyzja ręczna)"
+              return 1
+            fi
+          elif [ "${DT_SURE[$t]}" != na ]; then
             [ "${DT_SURE[$t]}" = yes ] || { DU_REASON="${DT_PATH[$t]}: wynik niepewny (${DT_WHY[$t]})"; return 1; }
             ez_dc_alias_ok "${DT_P1ALIAS[$t]}" || { DU_REASON="${DT_PATH[$t]}: alias wpisu P1 zawiera nieobsługiwane znaki"; return 1; }
             DU_ALL="$DU_ALL $t"
@@ -2002,7 +2194,7 @@ ez_dc_app_decide() {
     fi
     t=$((t + 1))
   done
-  [ -n "$DU_ALL" ] || { DU_REASON='aplikacja nie ma certyfikatu P1 do podmiany'; return 1; }
+  [ -n "$DU_ALL" ] || [ -n "$DU_CURRENT" ] || { DU_REASON='aplikacja nie ma certyfikatu P1 do podmiany'; return 1; }
 
   # One source certificate for all files; SHA-256 decides what changes.
   for t in $DU_ALL; do
@@ -2113,7 +2305,7 @@ ez_plan_docker() {
       if [ "${DT_TYPE[$t]}" = PKCS12 ] && [ "$p12" != yes ]; then
         case "$p12" in
           unknown) reason="${DT_PATH[$t]}: PKCS12 wymaga helpera P1CERT (niedostępny - nie można sprawdzić środowiska Java)" ;;
-          *) reason="${DT_PATH[$t]}: PKCS12 wymaga środowiska Java 8+ i sprawdzonego narzędzia p1cert-pkcs12.jar w helperze (P1CERT nie instaluje Javy)" ;;
+          *) reason="${DT_PATH[$t]}: PKCS12 wymaga środowiska Java 8+ i sprawdzonego narzędzia p1cert-pkcs12.jar w helperze (stan: $(ez_helper_run ping 2>/dev/null | sed -n 's/^P12_TOOL=//p' | head -n 1); uruchom ponownie instalator P1CERT, który instaluje brakującą Javę)" ;;
         esac
         break
       fi
@@ -2142,6 +2334,9 @@ ez_plan_docker() {
       else
         printf '    - %s (%s, wpis "%s"; pozostałe wpisy i klucze prywatne bez zmian)\n' \
           "$(ez_printable "${DT_PATH[$t]}")" "${DT_TYPE[$t]}" "${DT_P1ALIAS[$t]}"
+        if [ -n "${DT_P1DROP[$t]:-}" ]; then
+          printf '        usuwane wygasłe wpisy ezdrowie.gov.pl (SHA-256): %s\n' "$(printf '%s' "${DT_P1DROP[$t]}" | sed 's/,/, /g')"
+        fi
       fi
       printf '        stary SHA-256: %s\n' "$(ez_dc_target_fp "$t")"
     done
@@ -2167,6 +2362,7 @@ ez_plan_docker() {
       alias=-
       [ "${DT_STATE[$t]}" = CERT ] || alias="${DT_P1ALIAS[$t]}"
       line="${DT_PATH[$t]}|${DT_TYPE[$t]}|${DT_SHA[$t]}|$(ez_dc_target_fp "$t")|$alias"
+      [ "${DT_STATE[$t]}" = CERT ] || [ -z "${DT_P1DROP[$t]:-}" ] || line="$line|${DT_P1DROP[$t]}"
       PA_TARGETS[$k]="${PA_TARGETS[$k]:+${PA_TARGETS[$k]}
 }$line"
     done
@@ -2228,8 +2424,10 @@ EOF
   esac
 
   # Independent check of the files (as the P1CERT user).
-  while IFS='|' read -r path type sha fp alias; do
-    [ -n "$path" ] || continue
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    ez_dc_target_spec_fields "$line"
+    path="$EZT_PATH"; type="$EZT_TYPE"; sha="$EZT_SHA"
     case "$type" in
       PEM|DER)
         if ! ez_cert_inspect "$(fs_path "$path")" || [ "$EZC_FP" != "${PA_SFP[$k]}" ]; then
@@ -2485,7 +2683,7 @@ ez_plan_load_reported() {
 }
 
 ez_plan_print() {
-  local i=0 k=0 path type sha fp alias
+  local i=0 k=0 line
 
   printf 'Plan: %s\n  ID: %s\n  Utworzony: %s przez %s\n  Targety: %s\n' \
     "$EZ_PLAN_FILE" "$P_ID" "$P_CREATED_AT" "$P_CREATED_BY" "$P_COUNT"
@@ -2499,9 +2697,12 @@ ez_plan_print() {
   while [ "$k" -lt "$PA_COUNT" ]; do
     printf '  - %s (nowy SHA-256: %s; restart: %s)\n' "${PA_UNIT[$k]}" "${PA_SFP[$k]}" \
       "$([ "${PA_RESTART[$k]}" = yes ] && printf 'systemctl restart %s, jeżeli jednostka będzie aktywna' "${PA_UNIT[$k]}" || printf 'brak')"
-    while IFS='|' read -r path type sha fp alias; do
-      [ -n "$path" ] || continue
-      printf '      %s (%s%s), stary SHA-256: %s\n' "$path" "$type" "$([ "$alias" = - ] || printf ', wpis %s' "$alias")" "$fp"
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      ez_dc_target_spec_fields "$line"
+      printf '      %s (%s%s), stary SHA-256: %s\n' "$EZT_PATH" "$EZT_TYPE" \
+        "$([ "$EZT_ALIAS" = - ] || printf ', wpis %s' "$EZT_ALIAS")" "$EZT_FP"
+      [ -z "$EZT_DROPS" ] || printf '        usuwane wygasłe wpisy ezdrowie.gov.pl (SHA-256): %s\n' "$(printf '%s' "$EZT_DROPS" | sed 's/,/, /g')"
     done <<EOF
 ${PA_TARGETS[$k]}
 EOF
@@ -2617,10 +2818,16 @@ ez_plan() {
         printf '    %s) %s - %s\n' "$((n + 1))" "$(ez_restart_label "${C_KIND[$n]}" "${C_A[$n]}" "${C_B[$n]}")" "${C_REASON[$n]}"
         n=$((n + 1))
       done
-      if [ "$C_COUNT" -eq 1 ]; then
+      if [ "$C_COUNT" -eq 1 ] && [ "${C_KIND[0]}" != manual ]; then
         printf '  Przewidywany restart: %s\n' "$(ez_restart_label "${C_KIND[0]}" "${C_A[0]}" "${C_B[0]}")"
+      elif [ "$C_COUNT" -eq 1 ]; then
+        printf '  Przewidywany restart: brak - helper nie może potwierdzić konfiguracji jednostki; zrestartuj %s ręcznie po weryfikacji\n' "${C_A[0]}"
       else
-        printf '  Przewidywany restart: NIEJEDNOZNACZNY - wymagany wybór operatora\n'
+        # Several applications use the file: restarting one of them is a
+        # guess, so nothing is restarted automatically.
+        printf '  Przewidywany restart: NIEJEDNOZNACZNY - żadna usługa nie zostanie zrestartowana automatycznie;\n'
+        printf '         zrestartuj ręcznie właściwe usługi po weryfikacji\n'
+        ez_log "ambiguous restart for ${L_PATH[$i]}: $C_COUNT candidates, no automatic restart"
       fi
       case " ${C_KIND[*]} " in
         *' compose '*)
@@ -2635,21 +2842,11 @@ ez_plan() {
       i=$((i + 1))
       continue
     fi
-    if [ "$C_COUNT" -eq 1 ]; then
+    # A restart is offered only for one unambiguous, helper-verifiable
+    # application.
+    if [ "$C_COUNT" -eq 1 ] && [ "${C_KIND[0]}" != manual ]; then
       if ez_ask_yes "  Dopuścić RESTART: $(ez_restart_label "${C_KIND[0]}" "${C_A[0]}" "${C_B[0]}")?"; then
         kind="${C_KIND[0]}"; a="${C_A[0]}"; b="${C_B[0]}"
-      fi
-    elif [ "$C_COUNT" -gt 1 ]; then
-      choice=""
-      read -r -p "  Wybierz numer usługi do restartu (1-$C_COUNT) albo 0, aby odrzucić restart: " choice || choice=0
-      case "$choice" in
-        ''|*[!0-9]*) choice=0 ;;
-      esac
-      if [ "$choice" -ge 1 ] && [ "$choice" -le "$C_COUNT" ]; then
-        n=$((choice - 1))
-        if ez_ask_yes "  Potwierdź RESTART: $(ez_restart_label "${C_KIND[$n]}" "${C_A[$n]}" "${C_B[$n]}")?"; then
-          kind="${C_KIND[$n]}"; a="${C_A[$n]}"; b="${C_B[$n]}"
-        fi
       fi
     fi
     ez_say "  zaakceptowano: ${L_PATH[$i]} restart=$(ez_restart_label "$kind" "$a" "$b")"
@@ -3242,6 +3439,7 @@ Polecenia:
   schedule-status   pokaż plan, timer i wynik ostatniego run
   schedule-cancel   anuluj oczekujące uruchomienie (plan i backupy zostają)
   recover           odzyskaj przerwaną operację Docker (przywraca oryginalne pliki)
+  check             diagnostyka integracji: helper, sudo, API, Java i narzędzie PKCS12
   help              pokaż tę pomoc
 EOF
 }
@@ -3274,6 +3472,7 @@ ez_main() {
     schedule-status) [ "$#" -eq 0 ] || { ez_usage >&2; return 2; }; ez_schedule_status ;;
     schedule-cancel) [ "$#" -eq 0 ] || { ez_usage >&2; return 2; }; ez_schedule_cancel ;;
     recover) [ "$#" -eq 0 ] || { ez_usage >&2; return 2; }; ez_recover ;;
+    check) [ "$#" -eq 0 ] || { ez_usage >&2; return 2; }; ez_check ;;
     *)
       printf 'Nieznane polecenie ezdrowie: %s\n\n' "$(ez_printable "$command_name")" >&2
       ez_usage >&2

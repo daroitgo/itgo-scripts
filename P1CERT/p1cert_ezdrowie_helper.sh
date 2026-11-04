@@ -76,7 +76,12 @@ export LC_ALL
 #    application tree policy); API 1-3 components are incompatible.
 # 5: Docker Compose applications (apply-docker, recover, PKCS12 tool, plan
 #    version 3); API 1-4 components are incompatible.
-HELPER_API_VERSION=5
+# 6: several P1 entries in one JKS/PKCS12 (apply-docker removes the expired
+#    ones named by the optional 6th target field), Tomcat instance of the
+#    classic Integration Platform from ExecStart/CATALINA_BASE, the calling
+#    operator as a principal of the application tree; API 1-5 components are
+#    incompatible.
+HELPER_API_VERSION=6
 
 HELPER_DIR=/usr/local/libexec/itgo-p1cert
 HELPER_SELF="$HELPER_DIR/p1cert-ezdrowie-helper"
@@ -639,9 +644,9 @@ helper_path_trusted() {
 # another regular file in after the pre-open check and back before the
 # post-read check (A-B-A); see README.  Needs HELPER_TMP.
 helper_pi_appconfig() {
-  local root="$1" props="$2" file ids auid agid fs dir copy id
+  local root="$1" props="$2" file="${3:-$1/$EZ_PI_APPCONFIG_REL}" ids auid agid fs dir copy id
+  local op_uid="${SUDO_UID:-}" op_gid="${SUDO_GID:-}"
 
-  file="$root/$EZ_PI_APPCONFIG_REL"
   fs="$(helper_fs "$file")"
   ids="$(ez_systemd_app_ids "$props" "$HELPER_TRUSTED_UID" "$HELPER_TRUSTED_GID")" || {
     helper_info "User= of the unit cannot be resolved; $file is not used as evidence"
@@ -650,8 +655,14 @@ helper_pi_appconfig() {
   read -r auid agid <<EOF
 $ids
 EOF
-  ez_pi_appconfig_trusted "$HELPER_FS_ROOT" "$root" "$HELPER_TRUSTED_UID" "$HELPER_TRUSTED_GID" "$auid" "$agid" || {
-    helper_info "$file or one of its directories is not controlled only by root and the unit user (uid $auid), is a symlink, has several links or is too large; not used as evidence"
+  # The operator (sudo caller, set by sudo itself) is the third principal of
+  # the application tree, as for target directories.
+  case "$op_uid:$op_gid" in
+    *[!0-9:]*|:*|*:) op_uid=""; op_gid="" ;;
+  esac
+  ez_pi_appconfig_trusted "$HELPER_FS_ROOT" "$root" "$HELPER_TRUSTED_UID" "$HELPER_TRUSTED_GID" "$auid" "$agid" \
+    "$file" "$op_uid" "$op_gid" || {
+    helper_info "$file or one of its directories is not controlled only by root, the unit user (uid $auid) and the P1CERT user, is a symlink, has several links or is too large; not used as evidence"
     return 1
   }
   helper_entry_meta "$fs" || return 1
@@ -661,7 +672,7 @@ EOF
   rm -f -- "$copy"
   (
     cd -P -- "$dir" 2>/dev/null && [ "$(pwd -P)" = "$dir" ] || exit 1
-    ez_target_dir_ok . "$HELPER_TRUSTED_UID" "$HELPER_TRUSTED_GID" "$auid" "$agid" || exit 1
+    ez_pi_node_ok . d "$HELPER_TRUSTED_UID $auid $op_uid" "$HELPER_TRUSTED_GID $agid $op_gid" || exit 1
     [ "$(helper_entry_id appConfig.properties)" = "$id" ] || exit 1
     dd if=appConfig.properties of="$copy" iflag=nofollow,nonblock,noctty bs="$EZ_PI_APPCONFIG_MAX_BYTES" count=2 2>/dev/null || exit 1
     [ "$(helper_entry_id appConfig.properties)" = "$id" ] || exit 1
@@ -725,13 +736,15 @@ $(cat -- "$fs" 2>/dev/null)"
   done <<EOF
 $(ez_systemd_config_files "$props")
 EOF
-  # Classic Integration Platform: SSL.patch of the installation the unit
-  # runs from (never of the installation the certificate lies in).
-  if root="$(ez_systemd_ip_root "$props")"; then
-    fs="$(helper_fs "$root/$EZ_PI_APPCONFIG_REL")"
+  # Classic Integration Platform: SSL.patch of the Tomcat instance of the
+  # installation the unit runs from (never of the installation the
+  # certificate lies in).
+  if root="$(ez_systemd_pi_instance "$props")"; then
+    file="${root#*|}"; root="${root%%|*}"
+    fs="$(helper_fs "$file")"
     if [ -e "$fs" ] || [ -L "$fs" ]; then
       helper_tmpdir || return 1
-      appcfg="$(helper_pi_appconfig "$root" "$props")" || appcfg=""
+      appcfg="$(helper_pi_appconfig "$root" "$props" "$file")" || appcfg=""
     fi
   fi
   reason="$(ez_systemd_bound "$target" "$props" "$config" "$appcfg")" || {
@@ -1191,13 +1204,14 @@ HELPER_DC_MAX_TARGETS=10
 # PKCS12 tool shipped with P1CERT (java/P1certPkcs12.java) and its SHA-256;
 # the installer refuses another file, the helper re-checks it before use.
 HELPER_P12_JAR="$HELPER_DIR/p1cert-pkcs12.jar"
-HELPER_P12_JAR_SHA256=8e439c107ace7e148153fb47a62ff3302ea5cf6d721413b57744aea16b762c9c
+HELPER_P12_JAR_SHA256=385c8d32d494ac07bcfe536c41c19255deac32b212ba327e27618a76e2fc4e95
 # Bytes read from a target (helper_read_entry); keystores may be larger
 # than single certificates.
 HELPER_READ_BS=""
 
 # Java runtime 8+ for the PKCS12 tool, only from root-controlled locations
-# (the resolved binary and every directory above it); never installed.
+# (the resolved binary and every directory above it); the P1CERT installer
+# installs one only when the system has no Java at all.
 helper_java_find() {
   local c real major
 
@@ -1539,8 +1553,15 @@ helper_dc_verify() {
       ez_cert_inspect "$copy" && [ "$EZC_FP" = "$H_NEWFP" ] && [ "$EZC_FORMAT" = "${HT_TYPE[$i]}" ]
       ;;
     *)
+      local -a removed=()
+      local a
+      while IFS= read -r a; do
+        [ -z "$a" ] || removed[${#removed[@]}]="$a"
+      done <<EOF
+${HT_DROPALIASES[$i]}
+EOF
       EZS_PASSWORD="${HT_PW[$i]}"
-      ez_dc_verify_store "$copy" "${HT_TYPE[$i]}" "${HT_ALIAS[$i]}" "$H_NEWFP" "${HT_EXPECT[$i]}" "$H_J/old-$i" || rc=1
+      ez_dc_verify_store "$copy" "${HT_TYPE[$i]}" "${HT_ALIAS[$i]}" "$H_NEWFP" "${HT_EXPECT[$i]}" "$H_J/old-$i" ${removed[@]+"${removed[@]}"} || rc=1
       EZS_PASSWORD=""
       return "$rc"
       ;;
@@ -1735,7 +1756,7 @@ helper_apply_docker() {
   shift 4
   H_J=""; H_ACTIVE=""; HT_COUNT=0
   HT_PATH=(); HT_TYPE=(); HT_OLDSHA=(); HT_OLDFP=(); HT_ALIAS=(); HT_ID=(); HT_UID=(); HT_GID=(); HT_MODE=(); HT_CTX=()
-  HT_NEWSHA=(); HT_EXPECT=(); HT_STATE=(); HT_PW=()
+  HT_NEWSHA=(); HT_EXPECT=(); HT_STATE=(); HT_PW=(); HT_DROPS=(); HT_DROPALIASES=()
   HELPER_READ_BS="$EZ_DC_MAX_STORE_BYTES"
 
   # 1. Request syntax.
@@ -1745,15 +1766,18 @@ helper_apply_docker() {
   [ "$#" -ge 1 ] && [ "$#" -le "$HELPER_DC_MAX_TARGETS" ] || helper_refuse 2 'invalid number of targets' || return
   for spec in "$@"; do
     ez_dc_target_spec_ok "$spec" || helper_refuse 2 "invalid target specification: $spec" || return
-    IFS='|' read -r path type sha fp alias <<EOF
-$spec
-EOF
+    ez_dc_target_spec_fields "$spec"
+    path="$EZT_PATH"; type="$EZT_TYPE"; sha="$EZT_SHA"; fp="$EZT_FP"; alias="$EZT_ALIAS"
     case "$seen" in *" $path "*) helper_refuse 2 "target given twice: $path" || return ;; esac
     seen="$seen$path "
     fp="$(helper_norm_fp "$fp")"
     [ "$fp" != "$H_NEWFP" ] || helper_refuse 2 "old and new fingerprints are identical: $path" || return
+    case ",$EZT_DROPS," in
+      *",$H_NEWFP,"*) helper_refuse 2 "the new certificate cannot be an entry to remove: $path" || return ;;
+    esac
     HT_PATH[$HT_COUNT]="$path"; HT_TYPE[$HT_COUNT]="$type"; HT_OLDSHA[$HT_COUNT]="$sha"; HT_OLDFP[$HT_COUNT]="$fp"
     HT_ALIAS[$HT_COUNT]="$alias"; HT_STATE[$HT_COUNT]=prepared; HT_PW[$HT_COUNT]=""
+    HT_DROPS[$HT_COUNT]="$EZT_DROPS"; HT_DROPALIASES[$HT_COUNT]=""
     HT_COUNT=$((HT_COUNT + 1))
   done
   helper_lock || helper_refuse 1 'cannot serialize the operation' || return
@@ -1853,7 +1877,7 @@ EOF
         ;;
       JKS|PKCS12)
         if [ "${HT_TYPE[$i]}" = PKCS12 ] && ! helper_p12_ready; then
-          helper_refuse 2 "$path: PKCS12 needs a Java 8+ runtime and the verified PKCS12 tool ($HELPER_P12_STATE); P1CERT never installs Java" || return
+          helper_refuse 2 "$path: PKCS12 needs a Java 8+ runtime and the verified PKCS12 tool ($HELPER_P12_STATE); run the P1CERT installer again" || return
         fi
         helper_dc_password "$path" || helper_refuse 2 "$path: store password cannot be bound from the configuration" || return
         HT_PW[$i]="$EZS_PASSWORD"
@@ -1874,12 +1898,17 @@ EOF
           helper_refuse 2 "$path: identity check failed: $reason" || return
         }
         ez_epoch_ok "$na" && [ "$NEW_NA_EPOCH" -gt "$na" ] || { helper_dc_finish; helper_refuse 3 "$path: new certificate does not expire later" || return; }
+        # The expired P1 entries named by the plan are removed with it; the
+        # library proves they still are expired P1 entries of these bytes.
         if ! ez_dc_stage_store "$HELPER_TMP/old-$i" "${HT_TYPE[$i]}" "${HT_ALIAS[$i]}" "${HT_OLDFP[$i]}" \
-          "$HELPER_TMP/new.in" "$NEW_FORMAT" "$H_NEWFP" "$HELPER_TMP/new-$i"; then
+          "$HELPER_TMP/new.in" "$NEW_FORMAT" "$H_NEWFP" "$HELPER_TMP/new-$i" "${HT_DROPS[$i]}"; then
           helper_dc_finish
           helper_refuse 2 "$path: $EZDS_REASON" || return
         fi
         HT_EXPECT[$i]="$EZDS_EXPECT"
+        HT_DROPALIASES[$i]="$EZDS_DROP_ALIASES"
+        [ -z "$EZDS_DROP_ALIASES" ] ||
+          helper_info "$path: expired ezdrowie.gov.pl entries removed with the update: $(printf '%s' "$EZDS_DROP_ALIASES" | tr '\n' ',' )"
         EZS_PASSWORD=""
         ;;
     esac

@@ -66,15 +66,39 @@ The installer ends with one of:
   answers with the expected API version, `sudo -n` of the helper as the
   P1CERT user was verified (`sudo -u <user> sudo -n <helper> ping`) and the
   service unit is installed when systemd is available,
-- `P1CERT ezdrowie system integration: INCOMPLETE` - followed by the reasons.
+- `P1CERT ezdrowie system integration: INCOMPLETE` - followed by one line
+  per problem: required command missing (installed from the distribution
+  packages when possible), Java/PKCS12 tool (`P12_TOOL=NO_JAVA|NO_JAR|BAD_JAR`),
+  helper missing, helper with a wrong owner or mode, helper refused to start
+  (its own integrity check, with its message), another helper API (with the
+  reported version), sudo missing, sudo refused (with sudo's message),
+  another API through sudo, sudoers entry not installed or reverted.
   `credentials`, `test`, `scan` and `plan` still work; `run` and `schedule`
   need a compatible helper and sudoers entry. If the passwordless sudo
   access cannot be verified from the installer (for example because root's
   own `sudo -u` is blocked by `requiretty`), the result is INCOMPLETE with
   the command to check it manually.
 
-An incomplete integration does not fail the installation of the P1 CA
-commands. An upgrade keeps credentials, config, the accepted plan, schedule
+The P1CERT files (P1 CA commands) are installed either way, but an
+incomplete integration is not reported as success: the installer exits with
+status 3 (other failures: 1). MASTER reports it as `P1CERT: ERROR
+(installed, ezdrowie integration INCOMPLETE ...)` in the summary, still
+handles the remaining modules and exits non-zero; a P1CERT installation
+without the root helper or its sudoers entry counts as `BROKEN` for MASTER
+and is repaired by the installer. `p1cert ezdrowie check` (as the P1CERT
+user) shows the same diagnosis at any time: helper missing / wrong owner or
+mode / refused to start / API, sudo missing / refused, PKCS12 tool and Java.
+
+Java: the PKCS12 tool of the helper needs a Java runtime 8+ in a
+root-controlled location (`/usr/bin/java`, `/usr/lib/jvm/*`, `/usr/java/*`,
+the same rule as the helper). The installer (directly and through MASTER)
+keeps a usable runtime as it is; an existing but unusable Java (older than 8,
+in a location writable by others, broken) is reported and never updated,
+replaced or switched (no alternatives); only a system without any Java gets
+the distribution's headless OpenJDK (Debian/Ubuntu: `default-jre-headless`,
+then `openjdk-21/17/11/8-jre-headless`; RHEL/Oracle Linux:
+`java-21/17/11-openjdk-headless`, then `java-1.8.0-openjdk-headless`; the
+first package the repositories know). `P1CERT_JAVA_INSTALL=no` only checks. An upgrade keeps credentials, config, the accepted plan, schedule
 state, last run, backups, logs and an armed timer (`config/` and `backups/`
 are never changed recursively). The installer never creates, enables or
 modifies `itgo-p1cert-ezdrowie.timer`.
@@ -171,8 +195,10 @@ above. It only replaces files that
   `/srv/backup_old/` or the file name `old-ezdrowie.gov.pl-2025.crt`, are not
   affected,
 - have a `.pem`, `.crt` or `.cer` name that, without the extension,
-  lowercased and with `.`, `_` and `-` removed, contains `ezdrowiegovpl`
-  (e.g. `ezdrowiegovpl.pem`, `ezdrowie.gov.pl.pem`, `ezdrowie_gov_pl.crt`),
+  lowercased and with `.`, `_` and `-` removed, contains `ezdrowie` (pattern
+  `*ezdrowie*` in any case, e.g. `ezdrowiegovpl_2026.pem`, `EZdrowie.cer`,
+  `e-zdrowie-p1.crt`); the name only selects candidates, every decision is
+  taken from the X.509 content,
 - contain either exactly one X.509 certificate (PEM or DER, no data after a
   DER certificate) or a valid PEM certificate chain (see below), never a
   private key or another PEM block, with an ezdrowie.gov.pl identity,
@@ -398,11 +424,22 @@ The P1 certificate is a certificate with a production ezdrowie.gov.pl
 identity (DNS SANs, CN only without SANs; e.g. `*.ezdrowie.gov.pl`) that is
 neither a CA nor self-signed, identified by its SHA-256 fingerprint:
 
-- `P1: PEWNA` - exactly one `trustedCertEntry` holds it (alias, SHA-256,
-  Not After are shown),
-- `P1: NIEPEWNA` - several different ones, one certificate under several
-  aliases, a P1 certificate outside any entry, an unreadable certificate or
-  a store not verified with its password,
+- `P1: PEWNA` - one `trustedCertEntry` is the current P1 entry (alias,
+  SHA-256, Not After are shown): the only one, or - with several P1 entries
+  in one store - the only one still valid, or, when all have expired, the
+  one with the latest Not After. The other P1 `trustedCertEntry` entries have
+  all expired: the plan lists them (`usuwane wygasłe wpisy ezdrowie.gov.pl`)
+  and the approved update removes exactly those (optional 6th field of
+  `APP_TARGET`: their SHA-256); the helper proves before the change that they
+  still are expired P1 entries of exactly the approved bytes. Private keys
+  (TLS/WSS), CA, non-production and every other entry are never removed or
+  changed,
+- `P1: NIEPEWNA` - several P1 certificates that are still valid (also one
+  under several aliases; valid entries are never removed; when one of them
+  already is the selected source certificate the application is `NO
+  CHANGE`, otherwise a manual decision is required), a P1 certificate
+  outside any entry, an unreadable certificate or a store not verified with
+  its password,
 - `P1: CHRONIONY` - only inside a `PrivateKeyEntry`; entries with private
   keys are never modified,
 - `P1: BRAK` - none (non-production identities such as
@@ -570,7 +607,8 @@ helper (`HELPER_P12_JAR_SHA256`). The installer installs it root-owned as
 bytes; the helper checks the file (root-owned, not writable by others) and
 its SHA-256 before every use, and uses a Java runtime 8+ only from
 root-controlled locations (`/usr/bin/java` and `/usr/lib/jvm`, `/usr/java`).
-P1CERT never installs Java. Without a runtime or with another jar,
+The installer installs Java only on a system without any Java (see
+Install layout). Without a runtime or with another jar,
 `ping` reports `P12_TOOL=NO_JAVA|NO_JAR|BAD_JAR` and applications with a
 PKCS12 file are refused as a whole. Rebuilding the jar changes its SHA-256:
 both pins must be updated (the tests refuse a mismatch).
@@ -643,8 +681,24 @@ Service detection offers only restarts the root helper can prove later:
 - a systemd unit of the classic Integration Platform (Tomcat `p1-war`) when
   the certificate lies outside the installation (e.g.
   `/srv/CERTYFIKATY/ezdrowieGovPl.cer`) and is named by `SSL.patch` in
-  `<installation>/apache-tomcat/webapps/p1-war/WEB-INF/appConfig.properties`
-  of exactly the IntegrationPlatform installation the unit runs from
+  `<tomcat>/webapps/p1-war/WEB-INF/appConfig.properties` of the Tomcat
+  instance the unit runs (`CATALINA_BASE`/`CATALINA_HOME` of `Environment=`,
+  or the directory above `bin` of an `ExecStart` `startup.sh`, `catalina.sh`
+  or `daemon.sh`; all must agree, e.g. `apache-tomcat-9.0.85`; without an
+  instance `<installation>/apache-tomcat`) of exactly the installation the
+  unit runs from. An installation named freely (no `IntegrationPlatform` in
+  the path, e.g. `/srv/PI_EUSL/apache-tomcat`) is the directory above the
+  Tomcat instance. Every service systemd knows is examined (`systemctl
+  list-units`/`list-unit-files` and the unit directories), whatever its name
+  (e.g. `pi_eusl.service` with
+  `ExecStart=/srv/IntegrationPlatform_EUSL/apache-tomcat/bin/startup.sh` and
+  `SSL.patch=/srv/CERTYFIKATY/P1/ezdrowiegovpl_2026.pem`). The installation
+  tree and `appConfig.properties` may belong to root, the unit's `User=` or
+  the P1CERT user (an owner of the installation the unit runs from already
+  controls what it executes). A bound unit whose unit files the helper would
+  not accept as root-controlled (unit file outside the systemd directories,
+  symlink, writable by others) is shown as `restart ręczny` without an
+  automatic restart. The binding holds for exactly the installation
   (`WorkingDirectory` / `ExecStart`, e.g.
   `WorkingDirectory=/srv/IntegrationPlatform_TST/apache-tomcat` and
   `ExecStart=/srv/IntegrationPlatform_TST/apache-tomcat/bin/startup.sh`).
@@ -699,8 +753,12 @@ Service detection offers only restarts the root helper can prove later:
   compose file). Before a restart the helper additionally requires that the
   running containers of the service bind-mount the certificate.
 
-An ambiguous result lists all candidates; the operator picks one or rejects
-the restart. Nothing is approved automatically. A target whose directory is
+An ambiguous result (several applications use the file) lists all
+candidates and offers no restart at all: `NIEJEDNOZNACZNY - żadna usługa
+nie zostanie zrestartowana automatycznie`; the replacement can still be
+approved and the services are restarted manually. A restart is offered only
+for one unambiguous, helper-verifiable unit or service. Nothing is approved
+automatically. A target whose directory is
 not owned by root or is writable by group/others is skipped with a warning:
 the helper would refuse to replace it (manual replacement required).
 

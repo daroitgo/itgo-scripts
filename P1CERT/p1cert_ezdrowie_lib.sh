@@ -25,7 +25,13 @@
 # 5: Docker Compose applications: discovery, password binding, keystore
 # staging/verification shared with the helper operations apply-docker and
 # recover.  Helpers of API 1-4 refuse it.
-EZ_LIB_API=5
+# 6: several P1 trustedCertEntry in one JKS/PKCS12 (ez_store_p1 picks the
+# current entry, expired ones are removed with the approved update: optional
+# 6th field of a Docker target spec), Tomcat instance of a classic Integration
+# Platform from ExecStart/CATALINA_BASE (ez_systemd_pi_instance), the P1CERT
+# operator as a principal of the application tree.  Helpers of API 1-5 refuse
+# it.
+EZ_LIB_API=6
 
 EZ_ALLOWED_ROOTS='/srv /usr/local /opt'
 EZ_MAX_CERT_BYTES=65536
@@ -51,8 +57,11 @@ ez_ext_supported() {
   esac
 }
 
-# A basename belongs to ezdrowie.gov.pl when, without its extension, lowercased
-# and with ".", "_" and "-" removed, it contains "ezdrowiegovpl".
+# A basename is a candidate when, without its extension, lowercased and with
+# ".", "_" and "-" removed, it contains "ezdrowie" (pattern *ezdrowie*, any
+# case: ezdrowiegovpl_2026.pem, EZdrowie.cer, e-zdrowie-p1.crt).  The name
+# only selects candidates; every decision is taken from the X.509 content
+# (production ezdrowie.gov.pl identity, SHA-256, validity).
 ez_name_matches() {
   local name="$1" stem
 
@@ -60,9 +69,19 @@ ez_name_matches() {
   stem="${name%.*}"
   stem="$(ez_lower "$stem" | tr -d '._-')"
   case "$stem" in
-    *ezdrowiegovpl*) return 0 ;;
+    *ezdrowie*) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# Same rule for a keystore alias (JKS/PKCS12, as Java lists it): "ezdrowie"
+# in any case, ignoring ".", "_", "-" and spaces.  Informational only (shown
+# in plan); the P1 entry is identified by its certificate (ez_store_p1).
+ez_alias_matches() {
+  case "$(ez_lower "$1" | tr -d '._ -')" in
+    *ezdrowie*) return 0 ;;
+  esac
+  return 1
 }
 
 # Logical paths handled by the namespace are deliberately restricted to a
@@ -1066,57 +1085,185 @@ ez_pi_parents_ok() {
   done
 }
 
+# ez_pi_node_ok <path> <d|f> <uids> <gids>: a directory (d) or a regular file
+# with one hard link (f), not a symlink, owned by one of <uids> (space
+# separated), never world writable, group writable only for one of <gids>.
+ez_pi_node_ok() {
+  local path="$1" kind="$2" uids=" $3 " gids=" $4 " meta links owner group mode
+
+  [ ! -L "$path" ] || return 1
+  case "$kind" in
+    d) [ -d "$path" ] ;;
+    f) [ -f "$path" ] ;;
+    *) false ;;
+  esac || return 1
+  meta="$(stat -c '%h %u %g %a' -- "$path" 2>/dev/null)" || return 1
+  read -r links owner group mode <<EOF
+$meta
+EOF
+  case "$links:$owner:$group:$mode" in
+    *[!0-9:]*|:*|*::*|*:) return 1 ;;
+  esac
+  [ "$kind" = d ] || [ "$links" = 1 ] || return 1
+  case "$uids" in *" $owner "*) ;; *) return 1 ;; esac
+  [ $((8#$mode & 8#002)) -eq 0 ] || return 1
+  if [ $((8#$mode & 8#020)) -ne 0 ]; then
+    case "$gids" in *" $group "*) ;; *) return 1 ;; esac
+  fi
+  return 0
+}
+
 # ez_pi_tree_ok <fs-prefix> <ip-root> <trusted-uid> <trusted-gid> <app-uid> <app-gid>
+#   [<appconfig> [<operator-uid> <operator-gid>]]
 # The installation directory, every directory below it down to WEB-INF and
-# appConfig.properties itself belong to root or to the application user of
-# the unit (User=): owner root or that user, group write only for the root
-# group or the user's primary group, never world writable, no symlink.  The
-# file is a regular file with one hard link and at most
-# EZ_PI_APPCONFIG_MAX_BYTES bytes.  Matches the real model itgo:itgo 775.
+# appConfig.properties itself (default <ip-root>/$EZ_PI_APPCONFIG_REL, else
+# <appconfig>, which must lie below <ip-root>) belong to root, to the
+# application user of the unit (User=) or to the P1CERT operator: owner one
+# of them, group write only for one of their primary groups, never world
+# writable, no symlink.  The file is a regular file with one hard link and at
+# most EZ_PI_APPCONFIG_MAX_BYTES bytes.  Matches the real model itgo:itgo 775.
+# The operator adds no privilege: an owner of the installation directory the
+# unit runs from (ez_systemd_pi_instance) already controls what the unit
+# executes on its next restart.
 ez_pi_tree_ok() {
-  local prefix="$1" root="$2" tuid="$3" tgid="$4" auid="$5" agid="$6" file current rest part meta links owner group mode size
+  local prefix="$1" root="$2" tuid="$3" tgid="$4" auid="$5" agid="$6" file="${7:-}" ouid="${8:-}" ogid="${9:-}"
+  local current rest part size uids gids
 
   case "$tuid:$tgid:$auid:$agid" in
     *[!0-9:]*|:*|*::*|*:) return 1 ;;
   esac
+  uids="$tuid $auid"; gids="$tgid $agid"
+  case "$ouid:$ogid" in
+    :) ;;
+    *[!0-9:]*|:*|*::*|*:) return 1 ;;
+    *) uids="$uids $ouid"; gids="$gids $ogid" ;;
+  esac
   ez_path_under_roots "$root" || return 1
-  file="$root/$EZ_PI_APPCONFIG_REL"
+  [ -n "$file" ] || file="$root/$EZ_PI_APPCONFIG_REL"
+  case "$file" in
+    "$root"/?*/WEB-INF/appConfig.properties) ;;
+    *) return 1 ;;
+  esac
   ez_path_under_roots "$file" || return 1
   ez_path_no_symlinks "$prefix" "$file" || return 1
   current="$root"
-  rest="$EZ_PI_APPCONFIG_REL"
+  rest="${file#"$root"/}"
   while :; do
-    ez_target_dir_ok "$prefix$current" "$tuid" "$tgid" "$auid" "$agid" || return 1
+    ez_pi_node_ok "$prefix$current" d "$uids" "$gids" || return 1
     case "$rest" in
       */*) part="${rest%%/*}"; rest="${rest#*/}"; current="$current/$part" ;;
       *) break ;;
     esac
   done
-  [ -f "$prefix$file" ] && [ ! -L "$prefix$file" ] || return 1
-  meta="$(stat -c '%h %u %g %a %s' -- "$prefix$file" 2>/dev/null)" || return 1
-  read -r links owner group mode size <<EOF
-$meta
-EOF
-  case "$links:$owner:$group:$mode:$size" in
-    *[!0-9:]*|:*|*::*|*:) return 1 ;;
-  esac
-  [ "$links" = 1 ] || return 1
-  [ "$owner" = "$tuid" ] || [ "$owner" = "$auid" ] || return 1
-  [ $((8#$mode & 8#002)) -eq 0 ] || return 1
-  if [ $((8#$mode & 8#020)) -ne 0 ]; then
-    [ "$group" = "$tgid" ] || [ "$group" = "$agid" ] || return 1
-  fi
+  ez_pi_node_ok "$prefix$file" f "$uids" "$gids" || return 1
+  size="$(stat -c '%s' -- "$prefix$file" 2>/dev/null)" || return 1
+  case "$size" in ''|*[!0-9]*) return 1 ;; esac
   [ "$size" -le "$EZ_PI_APPCONFIG_MAX_BYTES" ]
 }
 
 # ez_pi_appconfig_trusted <fs-prefix> <ip-root> <trusted-uid> <trusted-gid> <app-uid> <app-gid>
-# Narrow trust policy for appConfig.properties of one IntegrationPlatform
-# installation (ez_pi_parents_ok and ez_pi_tree_ok).  <ip-root> must itself be
-# an installation directory (its own ez_ip_root).  Used only for SSL.patch
-# evidence; helper_path_trusted / helper_node_trusted are not affected.
+#   [<appconfig> [<operator-uid> <operator-gid>]]
+# Narrow trust policy for appConfig.properties of one classic Integration
+# Platform installation (ez_pi_parents_ok and ez_pi_tree_ok).  <ip-root> must
+# itself be an installation directory: its own ez_ip_root when its path names
+# an IntegrationPlatform, otherwise a directory strictly below an allowed root
+# (ez_systemd_pi_instance).  Used only for SSL.patch evidence;
+# helper_path_trusted / helper_node_trusted are not affected.
 ez_pi_appconfig_trusted() {
-  [ "$(ez_ip_root "$2")" = "$2" ] || return 1
+  case "$(ez_lower "$2")" in
+    *integrationplatform*) [ "$(ez_ip_root "$2")" = "$2" ] || return 1 ;;
+    *) ez_path_under_roots "$2" || return 1 ;;
+  esac
   ez_pi_parents_ok "$1" "$2" "$3" "$4" && ez_pi_tree_ok "$@"
+}
+
+# Tomcat instance (CATALINA_BASE) a unit runs, from "systemctl show" output:
+#   - CATALINA_BASE, else CATALINA_HOME, of Environment= (one plain absolute
+#     path, nothing to expand),
+#   - the directory above "bin" of every ExecStart program or shell script
+#     named startup.sh, catalina.sh or daemon.sh (ez_systemd_run_paths;
+#     e.g. /srv/IntegrationPlatform_EUSL/apache-tomcat/bin/startup.sh).
+# All of them must name the same directory below an allowed root; an "X"
+# record (command that cannot be analysed) or two instances fail.  Nothing
+# is printed when the unit shows no Tomcat (exit 0 with empty output); exit
+# 1 means ambiguous.
+ez_systemd_tomcat_base() {
+  local props="$1" kind value base="" env cand
+
+  env="$(printf '%s\n' "$props" | sed -n 's/^Environment=//p' | tr ' \t' '\n\n' | awk -F= '
+    $1 == "CATALINA_BASE" { b = substr($0, 15) } $1 == "CATALINA_HOME" { h = substr($0, 15) }
+    END { if (b != "") print b; else if (h != "") print h }')"
+  if [ -n "$env" ]; then
+    case "$env" in */) env="${env%/}" ;; esac
+    ez_path_under_roots "$env" || return 1
+    base="$env"
+  fi
+  while IFS=' ' read -r kind value; do
+    case "$kind" in
+      X) return 1 ;;
+      P|A) ;;
+      *) continue ;;
+    esac
+    case "$value" in
+      /*/bin/startup.sh|/*/bin/catalina.sh|/*/bin/daemon.sh) cand="${value%/bin/*}" ;;
+      *) continue ;;
+    esac
+    ez_path_under_roots "$cand" || return 1
+    if [ -z "$base" ]; then
+      base="$cand"
+    elif [ "$base" != "$cand" ]; then
+      return 1
+    fi
+  done <<EOF
+$(ez_systemd_run_paths "$props")
+EOF
+  printf '%s' "$base"
+}
+
+# The classic Integration Platform installation a unit runs from and the
+# appConfig.properties of its Tomcat instance: prints "<root>|<appconfig>".
+#   - when any run or reference path names an IntegrationPlatform component,
+#     <root> is ez_systemd_ip_root (fail closed, unchanged rules) and the
+#     Tomcat instance, when the unit shows one, must lie inside it,
+#   - otherwise (installation named freely, e.g. /srv/PI_EUSL/apache-tomcat)
+#     the unit must show exactly one Tomcat instance: <root> is the directory
+#     above it when its name starts with "apache-tomcat" or "tomcat" and that
+#     directory lies strictly below an allowed root, else the instance itself.
+# <appconfig> is <tomcat>/webapps/p1-war/WEB-INF/appConfig.properties
+# (default <root>/$EZ_PI_APPCONFIG_REL when the unit shows no instance).  The
+# unit name is never used.
+ez_systemd_pi_instance() {
+  local props="$1" root base named=no kind value parent
+
+  base="$(ez_systemd_tomcat_base "$props")" || return 1
+  while IFS=' ' read -r kind value; do
+    case "$kind:$(ez_lower "$value")" in
+      [WPAR]:*integrationplatform*) named=yes ;;
+    esac
+  done <<EOF
+$(ez_systemd_run_paths "$props")
+EOF
+  if [ "$named" = yes ]; then
+    root="$(ez_systemd_ip_root "$props")" || return 1
+    if [ -n "$base" ]; then
+      case "$base" in
+        "$root"/?*) ;;
+        *) return 1 ;;
+      esac
+    fi
+  else
+    [ -n "$base" ] || return 1
+    root="$base"
+    parent="${base%/*}"
+    case "$(ez_lower "${base##*/}")" in
+      apache-tomcat*|tomcat*) ! ez_path_under_roots "$parent" || root="$parent" ;;
+    esac
+  fi
+  if [ -n "$base" ]; then
+    printf '%s|%s' "$root" "$base/webapps/p1-war/WEB-INF/appConfig.properties"
+  else
+    printf '%s|%s' "$root" "$root/$EZ_PI_APPCONFIG_REL"
+  fi
 }
 
 # Prints a file for SSL.patch evidence: at most EZ_PI_APPCONFIG_MAX_BYTES
@@ -1194,9 +1341,10 @@ ez_pi_ssl_patch_is() {
 #      installation do not matter.  A common parent such as /srv is never
 #      enough, or
 #   C. classic Integration Platform: <pi-appconfig-text> is the content of
-#      <ip-root>/$EZ_PI_APPCONFIG_REL of the one installation the unit runs
-#      from (ez_systemd_ip_root: all ExecStart commands, shells and
-#      WorkingDirectory unambiguous), read by the caller only after
+#      appConfig.properties of the Tomcat instance of the one installation
+#      the unit runs from (ez_systemd_pi_instance: ExecStart/CATALINA_BASE,
+#      all ExecStart commands, shells and WorkingDirectory unambiguous; the
+#      unit name is irrelevant), read by the caller only after
 #      ez_pi_appconfig_trusted, and its SSL.patch names exactly the
 #      certificate (ez_pi_ssl_patch_is).  The certificate may lie anywhere
 #      (e.g. /srv/CERTYFIKATY); its location alone is never evidence.
@@ -1234,10 +1382,11 @@ $(ez_systemd_run_paths "$props")
 EOF
   fi
   [ -n "$appcfg" ] || return 1
-  root="$(ez_systemd_ip_root "$props")" || return 1
+  root="$(ez_systemd_pi_instance "$props")" || return 1
   printf '%s\n' "$appcfg" | ez_pi_ssl_patch_is "$cert" || return 1
+  appcfg="${root#*|}"
   printf '%s SSL.patch wskazuje certyfikat w instalacji IntegrationPlatform %s' \
-    "${EZ_PI_APPCONFIG_REL#apache-tomcat/webapps/}" "$root"
+    "${appcfg#*/webapps/}" "${root%%|*}"
 }
 
 # ez_mount_covers <cert-path> <bind-source>: a Docker bind mount source covers
@@ -2405,6 +2554,8 @@ EZ_STORE_PW_MAX=1024
 #   C <entry> <position-in-chain> <offset>:<length>  followed by the
 #                                   certificate as PEM lines; <offset> is the
 #                                   0-based offset of its 4-byte length field
+#   S <entry> <offset> <length>     the whole entry (tag to its last byte),
+#                                   0-based offset
 #   D <stored SHA-1 integrity digest, hex>
 #   BAD <reason>                    malformed or unsupported (exit 1)
 # Private key bytes are skipped, never decoded or printed.  Non-printable
@@ -2447,6 +2598,8 @@ END {
   cnt = u4(); if (cnt > maxent) fail("magazyn zawiera więcej niż " maxent " wpisów")
   rec("H", VER, cnt, BODY)
   for (e = 1; e <= cnt; e++) {
+    if (e > 1) rec("S", e - 1, es - 1, P - es)
+    es = P
     tag = u4(); alias = utf(); need(8); P += 8
     if (tag == 1) {
       n = u4(); need(n); P += n
@@ -2458,6 +2611,7 @@ END {
       cert(e, 1)
     } else fail("nieobsługiwany typ wpisu " tag " (" alias ")")
   }
+  if (cnt > 0) rec("S", cnt, es - 1, P - es)
   if (P != BODY + 1) fail("dane po ostatnim wpisie (magazyn uszkodzony)")
   d = ""
   for (i = BODY + 1; i <= N; i++) d = d sprintf("%02x", B[i])
@@ -2568,7 +2722,7 @@ ez_store_fields() {
 ez_jks_read() {
   local file="$1" line entry="" kind="" alias="" pos="" span="" pem="" inpem=0 bad=""
 
-  EZS_JKS_BODY=""; EZS_JKS_DIGEST=""
+  EZS_JKS_BODY=""; EZS_JKS_DIGEST=""; EZS_JKS_SPAN=()
   while IFS= read -r line; do
     if [ "$inpem" -eq 1 ]; then
       pem="$pem$line
@@ -2588,6 +2742,7 @@ ez_jks_read() {
         [ "$kind" != PrivateKeyEntry ] || EZS_KEYS=$((EZS_KEYS + 1))
         ;;
       C) pos="$EZR_B"; span="$EZR_C"; pem=""; inpem=1 ;;
+      S) EZS_JKS_SPAN[$EZR_A]="$EZR_B:$EZR_C" ;;
       D) EZS_JKS_DIGEST="$EZR_A" ;;
       BAD) bad="$EZR_A" ;;
     esac
@@ -2783,23 +2938,36 @@ ez_store_open() {
 
 # Identification of the P1 certificate (the production *.ezdrowie.gov.pl
 # server certificate) among ES_*: a row with a production ezdrowie.gov.pl
-# identity that is neither a CA nor self-signed, told apart by SHA-256.
-#   EZS_P1  PEWNA      exactly one trustedCertEntry holds it (EZS_P1_ROW),
-#           NIEPEWNA   several different ones, one certificate under several
-#                      aliases, one outside any entry (PKCS12 chain bag) or
-#                      a store not verified with its password,
+# identity that is neither a CA nor self-signed, told apart by SHA-256.  The
+# alias never decides anything.
+#   EZS_P1  PEWNA      one trustedCertEntry is the current P1 entry
+#                      (EZS_P1_ROW): the only one, or - with several - the
+#                      only one still valid, or, when all of them have
+#                      expired, the one with the latest NotAfter (the first
+#                      in store order on a tie).  The other P1
+#                      trustedCertEntry rows have all expired: EZS_P1_DROP
+#                      (row numbers) is what an approved update removes.
+#           NIEPEWNA   several P1 trustedCertEntry that are still valid
+#                      (EZS_P1_LIVE: their SHA-256, when this is the only
+#                      reason), one outside any entry (PKCS12 chain bag),
+#                      an unreadable certificate or a store not verified
+#                      with its password,
 #           CHRONIONY  only inside PrivateKeyEntry chains (never modified),
 #           BRAK       none (EZS_P1_WHY may name non-production ones),
 #           NIEZNANA   the content could not be read.
+# EZS_P1_NOTE names entries whose alias looks like e-Zdrowie (*ezdrowie*)
+# but whose certificate has no production ezdrowie.gov.pl identity.
 ez_store_p1() {
-  local i trusted="" keyed="" chain="" fps="" nfps=0 ntrusted=0 aliases="" other=""
+  local i trusted="" keyed="" chain="" ntrusted=0 aliases="" other="" now na best="" bestna=-1
+  local live="" nlive=0 livefps="" drops="" dropnames=""
 
-  EZS_P1=""; EZS_P1_WHY=""; EZS_P1_ROW=""
+  EZS_P1=""; EZS_P1_WHY=""; EZS_P1_ROW=""; EZS_P1_DROP=""; EZS_P1_LIVE=""; EZS_P1_NOTE=""
   if [ "$ES_COUNT" -eq 0 ] && [ "$EZS_STATUS" != OK ]; then
     EZS_P1=NIEZNANA
     EZS_P1_WHY='zawartość magazynu nie została odczytana'
     return 0
   fi
+  now="$(date -u '+%s')"
   i=0
   while [ "$i" -lt "$ES_COUNT" ]; do
     if [ -n "${ES_ID[$i]}" ]; then
@@ -2810,16 +2978,25 @@ ez_store_p1() {
           trustedCertEntry)
             trusted="$trusted $i"
             ntrusted=$((ntrusted + 1))
-            if ! ez_names_contain "$fps" "${ES_FP[$i]}"; then
-              fps="$fps ${ES_FP[$i]}"
-              nfps=$((nfps + 1))
-            fi
             aliases="${aliases:+$aliases, }${ES_ALIAS[$i]}"
+            # An unreadable date counts as valid: never removed.
+            na="$(ez_to_epoch "${ES_NOT_AFTER[$i]}")"
+            ez_epoch_ok "$na" || na=""
+            if [ -z "$na" ] || [ "$na" -gt "$now" ]; then
+              live="$live $i"
+              nlive=$((nlive + 1))
+              ez_names_contain "$livefps" "${ES_FP[$i]}" || livefps="${livefps:+$livefps }${ES_FP[$i]}"
+            fi
+            if [ -n "$na" ] && [ "$na" -gt "$bestna" ]; then
+              best="$i"; bestna="$na"
+            fi
             ;;
           PrivateKeyEntry) keyed="$keyed $i" ;;
           *) chain="$chain $i" ;;
         esac
       fi
+    elif [ "${ES_OK[$i]}" = yes ] && [ "${ES_KIND[$i]}" != chain ] && ez_alias_matches "${ES_ALIAS[$i]}"; then
+      EZS_P1_NOTE="${EZS_P1_NOTE:+$EZS_P1_NOTE, }${ES_ALIAS[$i]}"
     fi
     i=$((i + 1))
   done
@@ -2835,12 +3012,37 @@ ez_store_p1() {
   elif [ "$ntrusted" -eq 1 ]; then
     EZS_P1=PEWNA
     EZS_P1_ROW="${trusted# }"
-  elif [ "$nfps" -eq 1 ]; then
+  elif [ "$nlive" -ge 2 ]; then
+    # Two valid certificates (also one under several aliases): which one the
+    # application uses cannot be told from the store; valid entries are
+    # never removed.
     EZS_P1=NIEPEWNA
-    EZS_P1_WHY="ten sam certyfikat pod kilkoma aliasami: $aliases"
+    if [ "$(printf '%s\n' $livefps | grep -c .)" -eq 1 ]; then
+      EZS_P1_WHY="ten sam ważny certyfikat pod kilkoma aliasami: $aliases"
+    else
+      EZS_P1_WHY="kilka różnych ważnych certyfikatów ezdrowie.gov.pl: $aliases"
+    fi
+    EZS_P1_LIVE="$livefps"
   else
-    EZS_P1=NIEPEWNA
-    EZS_P1_WHY="kilka różnych certyfikatów ezdrowie.gov.pl: $aliases"
+    # At most one still valid: it is the current entry (latest NotAfter);
+    # all others have expired.
+    if [ "$nlive" -eq 1 ]; then
+      best="${live# }"
+    fi
+    if [ -z "$best" ]; then
+      EZS_P1=NIEPEWNA
+      EZS_P1_WHY="kilka certyfikatów ezdrowie.gov.pl z nieczytelną datą ważności: $aliases"
+    else
+      EZS_P1=PEWNA
+      EZS_P1_ROW="$best"
+      for i in $trusted; do
+        [ "$i" != "$best" ] || continue
+        drops="${drops:+$drops }$i"
+        dropnames="${dropnames:+$dropnames, }${ES_ALIAS[$i]} (do ${ES_NOT_AFTER[$i]})"
+      done
+      EZS_P1_DROP="$drops"
+      EZS_P1_WHY="wygasłe wpisy ezdrowie.gov.pl do usunięcia przy podmianie: $dropnames"
+    fi
   fi
   if [ "$ntrusted" -gt 0 ] && [ -n "$keyed" ]; then
     EZS_P1_WHY="${EZS_P1_WHY:+$EZS_P1_WHY; }certyfikat ezdrowie.gov.pl także we wpisie z kluczem prywatnym (chroniony)"
@@ -2855,46 +3057,146 @@ ez_store_p1() {
     if [ "${ES_OK[$i]}" != yes ]; then
       [ "$EZS_P1" != PEWNA ] || EZS_P1=NIEPEWNA
       EZS_P1_WHY="${EZS_P1_WHY:+$EZS_P1_WHY; }nieczytelny certyfikat we wpisie ${ES_ALIAS[$i]:-bez aliasu}"
+      EZS_P1_LIVE=""
     fi
     i=$((i + 1))
   done
+  if [ "$EZS_P1" != PEWNA ]; then
+    EZS_P1_ROW=""; EZS_P1_DROP=""
+  fi
+  [ "$EZS_STATUS" = OK ] || EZS_P1_LIVE=""
   return 0
+}
+
+# SHA-256 of the rows EZS_P1_DROP as one comma-separated list without
+# duplicates (one certificate under several expired aliases appears once):
+# the 6th field of a Docker target spec.  Empty when nothing is removed.
+ez_store_p1_drop_fps() {
+  local i out=""
+
+  for i in $EZS_P1_DROP; do
+    case ",$out," in
+      *",${ES_FP[$i]},"*) ;;
+      *) out="${out:+$out,}${ES_FP[$i]}" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# ez_store_p1_drop_match <fp-list>: true when the comma-separated SHA-256 of
+# an approved plan are exactly ez_store_p1_drop_fps of the store just
+# identified, or when every one of them is still an expired P1 entry (a row
+# that expired after the plan is kept: only what the operator saw is removed).
+# Sets EZS_P1_DROP to the rows of exactly those certificates.
+ez_store_p1_drop_match() {
+  local want="$1" i rows="" fp seen="," found
+
+  [ -n "$want" ] || { EZS_P1_DROP=""; return 0; }
+  for fp in $(printf '%s' "$want" | tr ',' ' '); do
+    ez_fp_ok "$fp" || return 1
+    case "$seen" in *",$fp,"*) return 1 ;; esac
+    seen="$seen$fp,"
+    found=no
+    for i in $EZS_P1_DROP; do
+      if [ "${ES_FP[$i]}" = "$fp" ]; then
+        rows="${rows:+$rows }$i"
+        found=yes
+      fi
+    done
+    [ "$found" = yes ] || return 1
+  done
+  EZS_P1_DROP="$rows"
 }
 
 # ---------------------------------------------------------------------------
 # Docker targets: replacement building blocks (used by the root helper).
 # ---------------------------------------------------------------------------
 
-# ez_jks_replace_cert <jks> <row> <source-cert> <PEM|DER> <out>
-# Writes to <out> the JKS <jks> (already read by ez_jks_read, so ES_OFF,
-# ES_LEN and EZS_JKS_BODY describe it) with the certificate of ES_* row
-# <row> replaced by the first certificate of <source-cert>.  Every other
-# byte (header, aliases, dates, all other entries including the protected
-# private keys) is copied unchanged; only the 4-byte length, the
-# certificate and the integrity digest (recomputed with EZS_PASSWORD, which
-# reaches iconv on stdin only) change.
-ez_jks_replace_cert() {
-  local file="$1" row="$2" src="$3" inform="$4" out="$5" off len n rest digest
+# ez_jks_rewrite <jks> <row> <source-cert> <PEM|DER> <out> [<drop-row>...]
+# Writes to <out> the JKS <jks> (already read by ez_jks_read, so ES_*,
+# EZS_JKS_SPAN, EZS_ENTRIES and EZS_JKS_BODY describe it) with the
+# certificate of the trustedCertEntry of ES_* row <row> replaced by the first
+# certificate of <source-cert> and the trustedCertEntry entries of the
+# <drop-row> rows removed.  Every other byte (version, aliases, dates, all
+# other entries including the protected private keys, their order) is copied
+# unchanged; only the entry count, the 4-byte length and the certificate of
+# <row>, the removed entries and the integrity digest (recomputed with
+# EZS_PASSWORD, which reaches iconv on stdin only) change.
+ez_jks_rewrite() {
+  local file="$1" row="$2" src="$3" inform="$4" out="$5" off len n digest e span pos r
+  local rentry roff rlen drop=" " ndrop=0 dropped=0 size
 
-  off="${ES_OFF[$row]:-}"; len="${ES_LEN[$row]:-}"
-  case "$off:$len:$EZS_JKS_BODY" in
+  shift 5
+  rentry="${ES_ENTRY[$row]:-}"; roff="${ES_OFF[$row]:-}"; rlen="${ES_LEN[$row]:-}"
+  [ "${ES_KIND[$row]:-}" = trustedCertEntry ] || return 1
+  case "$rentry:$roff:$rlen:$EZS_JKS_BODY:$EZS_ENTRIES" in
     *[!0-9:]*|:*|*::*|*:) return 1 ;;
   esac
+  for r in "$@"; do
+    [ "${ES_KIND[$r]:-}" = trustedCertEntry ] && [ "${ES_ENTRY[$r]}" != "$rentry" ] || return 1
+    case "$drop" in *" ${ES_ENTRY[$r]} "*) return 1 ;; esac
+    drop="$drop${ES_ENTRY[$r]} "
+    ndrop=$((ndrop + 1))
+  done
+  # The entries cover the body exactly, one after the other.
+  pos=12; e=1
+  while [ "$e" -le "$EZS_ENTRIES" ]; do
+    span="${EZS_JKS_SPAN[$e]:-}"
+    case "$span" in ''|*[!0-9:]*|:*|*:) return 1 ;; esac
+    [ "${span%%:*}" = "$pos" ] || return 1
+    pos=$((pos + ${span#*:}))
+    e=$((e + 1))
+  done
+  [ "$pos" = "$EZS_JKS_BODY" ] || return 1
+  # The certificate of a trustedCertEntry is the end of its entry.
+  span="${EZS_JKS_SPAN[$rentry]}"
+  [ $(( ${span%%:*} + ${span#*:} )) = $((roff + 4 + rlen)) ] || return 1
   n="$(LC_ALL=C openssl x509 -inform "$inform" -in "$src" -outform DER 2>/dev/null | wc -c | tr -d ' ')"
   case "$n" in ''|*[!0-9]*|0) return 1 ;; esac
-  rest=$((EZS_JKS_BODY - off - 4 - len))
-  [ "$rest" -ge 0 ] || return 1
-  {
-    head -c "$off" -- "$file" &&
-      ez_hex_bytes "$(printf '%02x%02x%02x%02x' $((n >> 24 & 255)) $((n >> 16 & 255)) $((n >> 8 & 255)) $((n & 255)))" &&
-      LC_ALL=C openssl x509 -inform "$inform" -in "$src" -outform DER 2>/dev/null &&
-      tail -c "+$((off + 4 + len + 1))" -- "$file" | head -c "$rest"
-  } > "$out" || return 1
-  [ "$(ez_file_size "$out")" = $((EZS_JKS_BODY - len + n)) ] || return 1
+  # Subshell: "exit" stops only the writer.
+  (
+    head -c 8 -- "$file" &&
+      ez_hex_bytes "$(printf '%08x' $((EZS_ENTRIES - ndrop)))" || exit 1
+    e=1
+    while [ "$e" -le "$EZS_ENTRIES" ]; do
+      span="${EZS_JKS_SPAN[$e]}"; off="${span%%:*}"; len="${span#*:}"
+      case "$drop" in
+        *" $e "*) ;;
+        *)
+          if [ "$e" = "$rentry" ]; then
+            ez_file_range "$file" "$off" $((roff - off)) &&
+              ez_hex_bytes "$(printf '%08x' "$n")" &&
+              LC_ALL=C openssl x509 -inform "$inform" -in "$src" -outform DER 2>/dev/null || exit 1
+          else
+            ez_file_range "$file" "$off" "$len" || exit 1
+          fi
+          ;;
+      esac
+      e=$((e + 1))
+    done
+  ) > "$out" || return 1
+  for e in $drop; do
+    span="${EZS_JKS_SPAN[$e]}"
+    dropped=$((dropped + ${span#*:}))
+  done
+  size=$((EZS_JKS_BODY - dropped - rlen + n))
+  [ "$(ez_file_size "$out")" = "$size" ] || return 1
   digest="$( { printf '%s' "$EZS_PASSWORD" | LC_ALL=C iconv -f UTF-8 -t UTF-16BE 2>/dev/null; \
     printf 'Mighty Aphrodite'; cat -- "$out"; } | openssl dgst -sha1 2>/dev/null | awk '{ print $NF }')"
   [ "${#digest}" -eq 40 ] || return 1
   ez_hex_bytes "$digest" >> "$out"
+}
+
+# ez_jks_replace_cert <jks> <row> <source-cert> <PEM|DER> <out>: only the
+# certificate of row <row> (ez_jks_rewrite without removed entries).
+ez_jks_replace_cert() {
+  ez_jks_rewrite "$1" "$2" "$3" "$4" "$5"
+}
+
+# Writes <length> bytes of <file> starting at 0-based <offset>.
+ez_file_range() {
+  [ "$3" -gt 0 ] || return 0
+  tail -c "+$(($2 + 1))" -- "$1" | head -c "$3"
 }
 
 # Writes the bytes of a lowercase hex string.
@@ -2933,23 +3235,59 @@ ez_dc_target_path_ok() {
 }
 
 # One file of a Docker application in plan records and helper arguments:
-# path|type|old-file-sha256|old-fp|alias ("-" for PEM/DER).
+# path|type|old-file-sha256|old-fp|alias ("-" for PEM/DER), for JKS/PKCS12
+# optionally followed by "|<sha256>[,<sha256>...]": the expired P1
+# trustedCertEntry certificates the approved update removes from the store
+# (ez_store_p1_drop_fps; never the replaced one, no duplicates).
 ez_dc_target_spec_ok() {
-  local path type sha fp alias separators
+  local path type sha fp alias drops="" separators d seen="," n=0
 
   separators="${1//[!|]/}"
-  [ "${#separators}" -eq 4 ] || return 1
+  case "${#separators}" in
+    4|5) ;;
+    *) return 1 ;;
+  esac
   # One line: "read" below would silently drop everything after a newline.
   ! printf '%s' "$1" | LC_ALL=C grep -q '[[:cntrl:]]' && [ "$(printf '%s' "$1" | wc -l | tr -d ' ')" = 0 ] || return 1
-  IFS='|' read -r path type sha fp alias <<EOF
+  if [ "${#separators}" -eq 5 ]; then
+    drops="${1##*|}"
+    IFS='|' read -r path type sha fp alias <<EOF
+${1%|*}
+EOF
+    case "$type" in JKS|PKCS12) ;; *) return 1 ;; esac
+    case "$drops" in ''|,*|*,|*,,*) return 1 ;; esac
+    for d in $(printf '%s' "$drops" | tr ',' ' '); do
+      ez_fp_ok "$d" && [ "$d" != "$fp" ] || return 1
+      case "$seen" in *",$d,"*) return 1 ;; esac
+      seen="$seen$d,"
+      n=$((n + 1))
+    done
+    [ "$n" -le "$EZ_STORE_MAX_ENTRIES" ] || return 1
+  else
+    IFS='|' read -r path type sha fp alias <<EOF
 $1
 EOF
+  fi
   ez_dc_target_path_ok "$path" && ez_digest_ok "$sha" && ez_fp_ok "$fp" || return 1
   case "$type:$alias" in
     PEM:-|DER:-) ;;
     JKS:*|PKCS12:*) ez_dc_alias_ok "$alias" || return 1 ;;
     *) return 1 ;;
   esac
+}
+
+# Fields of a spec accepted by ez_dc_target_spec_ok: EZT_PATH EZT_TYPE EZT_SHA
+# EZT_FP EZT_ALIAS EZT_DROPS (empty without the 6th field).
+ez_dc_target_spec_fields() {
+  local spec="$1"
+
+  EZT_DROPS=""
+  case "${spec//[!|]/}" in
+    '|||||') EZT_DROPS="${spec##*|}"; spec="${spec%|*}" ;;
+  esac
+  IFS='|' read -r EZT_PATH EZT_TYPE EZT_SHA EZT_FP EZT_ALIAS <<EOF
+$spec
+EOF
 }
 
 # An alias that may travel in plan records and helper arguments (always as
@@ -3035,10 +3373,16 @@ ez_dc_rows_norm() {
   printf '%s\n' "$1" | awk -F'|' 'NF { print $1 "|" $3 "|" $4 "|" $5 }' | LC_ALL=C sort
 }
 
-# Expected rows of a store after its P1 row $2 gets fingerprint $3; $1 =
-# rows before.
+# Expected rows of a store after its P1 row $2 gets fingerprint $3 and the
+# rows $4 (space separated, may be empty) are removed; $1 = rows before.
+# Entry numbers of the remaining entries close up (JKS keeps the order).
 ez_dc_rows_expected() {
-  printf '%s\n' "$1" | awk -F'|' -v row="$2" -v fp="$3" 'BEGIN { OFS = "|" } NR == row + 1 { $5 = fp } { print }'
+  printf '%s\n' "$1" | awk -F'|' -v row="$2" -v fp="$3" -v drop=" ${4:-} " '
+    BEGIN { OFS = "|" }
+    index(drop, " " (NR - 1) " ") > 0 { next }
+    NR == row + 1 { $5 = fp }
+    $2 != 0 && $2 != "" { if ($2 != last) { last = $2; n++ } $2 = n }
+    { print }'
 }
 
 # Checks the store ES_* just opened (EZS_*) against the expected result:
@@ -3091,47 +3435,92 @@ ez_p12_tool() {
   return "$rc"
 }
 
+# Digests of the JKS just read (ez_jks_read), one line per entry in order:
+# the whole entry, except for entry $2 (the replaced certificate) whose bytes
+# before the certificate length field are taken (offset $3).  Then the
+# version header.  Used to prove that only the replaced certificate and the
+# removed entries differ.
+ez_jks_entry_digests() {
+  local file="$1" rentry="$2" roff="$3" skip=" ${4:-} " e=1 span off len
+
+  printf 'H %s\n' "$(ez_file_range_digest "$file" 0 8)"
+  while [ "$e" -le "$EZS_ENTRIES" ]; do
+    span="${EZS_JKS_SPAN[$e]:-}"; off="${span%%:*}"; len="${span#*:}"
+    case "$skip" in
+      *" $e "*) ;;
+      *)
+        if [ "$e" = "$rentry" ]; then
+          printf 'P %s\n' "$(ez_file_range_digest "$file" "$off" $((roff - off)))"
+        else
+          printf 'E %s\n' "$(ez_file_range_digest "$file" "$off" "$len")"
+        fi
+        ;;
+    esac
+    e=$((e + 1))
+  done
+}
+
 # ez_dc_stage_store <current> <JKS|PKCS12> <alias> <old-fp> <source>
-#   <source-format> <new-fp> <out>
-# Writes to <out> the store <current> with only the certificate of its P1
-# trustedCertEntry <alias> replaced by the first certificate of <source>,
-# and proves it (EZS_PASSWORD must be set):
-#   - <current> opens with the password and holds exactly that P1 entry,
-#   - JKS: byte surgery (ez_jks_replace_cert); every byte outside the
-#     certificate is unchanged,
+#   <source-format> <new-fp> <out> [<drop-fps>]
+# Writes to <out> the store <current> with the certificate of its P1
+# trustedCertEntry <alias> replaced by the first certificate of <source> and
+# the expired P1 trustedCertEntry entries holding one of the certificates
+# <drop-fps> (comma separated SHA-256, ez_store_p1_drop_fps) removed, and
+# proves it (EZS_PASSWORD must be set):
+#   - <current> opens with the password, <alias> is its current P1 entry
+#     and every <drop-fps> certificate is still an expired P1 entry,
+#   - JKS: byte surgery (ez_jks_rewrite); every byte of every other entry is
+#     unchanged, in the same order,
 #   - PKCS12: the Java KeyStore API tool; encrypted private keys byte for
 #     byte, attributes and algorithms unchanged (checked by the tool and
 #     here),
-#   - <out> opens with the same password and has the same entries with only
-#     the P1 fingerprint changed.
-# EZDS_EXPECT: the expected rows of <out>; EZDS_REASON on failure.
+#   - <out> opens with the same password and has the same entries, without
+#     the removed ones, with only the P1 fingerprint changed.
+# Private keys, TLS/WSS client entries, CA and every other certificate are
+# never removed or changed.  EZDS_EXPECT: the expected rows of <out>;
+# EZDS_DROP_ALIASES: the removed aliases (one per line); EZDS_REASON on
+# failure.
 ez_dc_stage_store() {
-  local cur="$1" type="$2" alias="$3" oldfp="$4" src="$5" inform="$6" newfp="$7" out="$8"
-  local row off len newlen olddig newdig algs
+  local cur="$1" type="$2" alias="$3" oldfp="$4" src="$5" inform="$6" newfp="$7" out="$8" dropfps="${9:-}"
+  local row r rentry olddig newdig algs drops entries="" nentry
+  local -a dropargs=()
 
-  EZDS_REASON=""; EZDS_EXPECT=""
+  EZDS_REASON=""; EZDS_EXPECT=""; EZDS_DROP_ALIASES=""
   if ! ez_store_open "$cur" "$type" yes || ! ez_dc_store_expected "$alias" "$oldfp" "$(ez_store_rows_text)"; then
     EZDS_REASON="magazyn nie otwiera się hasłem z konfiguracji albo nie zawiera oczekiwanego wpisu P1 $alias (${EZS_STATUS:-?})"
     return 1
   fi
   row="$EZS_P1_ROW"
-  EZDS_EXPECT="$(ez_dc_rows_expected "$(ez_store_rows_text)" "$row" "$newfp")"
+  if ! ez_store_p1_drop_match "$dropfps"; then
+    EZDS_REASON='wpisy wygasłych certyfikatów ezdrowie.gov.pl z planu nie odpowiadają magazynowi'
+    return 1
+  fi
+  drops="$EZS_P1_DROP"
+  for r in $drops; do
+    entries="$entries ${ES_ENTRY[$r]}"
+    dropargs[${#dropargs[@]}]="${ES_ALIAS[$r]}"
+    dropargs[${#dropargs[@]}]="${ES_FP[$r]}"
+    EZDS_DROP_ALIASES="${EZDS_DROP_ALIASES:+$EZDS_DROP_ALIASES
+}${ES_ALIAS[$r]}"
+  done
+  EZDS_EXPECT="$(ez_dc_rows_expected "$(ez_store_rows_text)" "$row" "$newfp" "$drops")"
   case "$type" in
     JKS)
-      off="${ES_OFF[$row]}"; len="${ES_LEN[$row]}"
-      olddig="$(ez_file_range_digest "$cur" 0 "$off")|$(ez_file_range_digest "$cur" $((off + 4 + len)) $((EZS_JKS_BODY - off - 4 - len)))"
-      ez_jks_replace_cert "$cur" "$row" "$src" "$inform" "$out" || { EZDS_REASON='nie można przygotować magazynu JKS'; return 1; }
+      rentry="${ES_ENTRY[$row]}"
+      olddig="$(ez_jks_entry_digests "$cur" "$rentry" "${ES_OFF[$row]}" "$entries")"
+      # shellcheck disable=SC2086 # row numbers
+      ez_jks_rewrite "$cur" "$row" "$src" "$inform" "$out" $drops || { EZDS_REASON='nie można przygotować magazynu JKS'; return 1; }
       if ! ez_store_open "$out" JKS yes || ! ez_dc_store_expected "$alias" "$newfp" "$EZDS_EXPECT"; then
         EZDS_REASON='przygotowany magazyn JKS nie przeszedł weryfikacji'
         return 1
       fi
-      newlen="${ES_LEN[$EZS_P1_ROW]}"
-      newdig="$(ez_file_range_digest "$out" 0 "$off")|$(ez_file_range_digest "$out" $((off + 4 + newlen)) $((EZS_JKS_BODY - off - 4 - newlen)))"
+      nentry="${ES_ENTRY[$EZS_P1_ROW]}"
+      newdig="$(ez_jks_entry_digests "$out" "$nentry" "${ES_OFF[$EZS_P1_ROW]}")"
       [ "$newdig" = "$olddig" ] || { EZDS_REASON='zmieniłyby się inne bajty magazynu JKS'; return 1; }
       ;;
     PKCS12)
       algs="$(ez_dc_p12_algs)"
-      ez_p12_tool replace "$cur" "$out" "$alias" "$oldfp" "$src" || {
+      ez_p12_tool replace "$cur" "$out" "$alias" "$oldfp" "$src" ${dropargs[@]+"${dropargs[@]}"} || {
         EZDS_REASON="${EZ_P12_MSG:-narzędzie PKCS12 zakończyło się błędem}"
         return 1
       }
@@ -3146,13 +3535,17 @@ ez_dc_stage_store() {
 }
 
 # ez_dc_verify_store <file> <type> <alias> <new-fp> <expected-rows> <original>
+#   [<removed-alias>...]
 # The store on disk after the replacement: password, integrity, entries and
 # (PKCS12) the tool's full comparison with the original bytes.
 ez_dc_verify_store() {
-  ez_store_open "$1" "$2" yes || return 1
-  if [ "$2" = PKCS12 ]; then
-    ez_p12_tool verify "$6" "$1" "$3" "$4" || return 1
-    ez_store_open "$1" PKCS12 yes || return 1
+  local file="$1" type="$2" alias="$3" fp="$4" expect="$5" orig="$6"
+
+  shift 6
+  ez_store_open "$file" "$type" yes || return 1
+  if [ "$type" = PKCS12 ]; then
+    ez_p12_tool verify "$orig" "$file" "$alias" "$fp" "$@" || return 1
+    ez_store_open "$file" PKCS12 yes || return 1
   fi
-  ez_dc_store_expected "$3" "$4" "$5"
+  ez_dc_store_expected "$alias" "$fp" "$expect"
 }
