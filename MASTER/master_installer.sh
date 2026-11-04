@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.144"
+MASTER_VERSION="1.2.145"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.28"
@@ -47,7 +47,7 @@ DOWNLOADER_APP_VERSION="1.0.9"
 UPGBUILDER_VERSION="0.1.14"
 SERVICEGUARD_VERSION="0.1.7"
 INVENTORY_VERSION="0.1.24"
-P1CERT_VERSION="0.1.18"
+P1CERT_VERSION="0.1.19"
 LOGGUARD_VERSION="0.2.4"
 
 MODE="install"
@@ -118,6 +118,10 @@ P1CERT_STAGE_DIR=""
 # Set when a module uninstall left something behind; the master then exits
 # non-zero after printing the summary.
 MODULE_UNINSTALL_FAILED=0
+# Set when a module was installed but reported an incomplete integration
+# (P1CERT installer exit status 3); the master finishes the other modules and
+# exits non-zero after printing the summary.
+MODULE_INSTALL_INCOMPLETE=0
 LOGGUARD_LOCAL_DIR="${SOURCE_DIR}/LOGGUARD"
 LOGGUARD_LOCAL_PATH="${LOGGUARD_LOCAL_DIR}/logguard_installer_public.sh"
 UPGBUILDER_LOCAL_MAP="${SOURCE_DIR}/UPGBUILDER/upgbuilder.map"
@@ -1216,11 +1220,15 @@ module_health_for_module() {
         && -L /usr/local/bin/itgo-inv ]] && echo "OK" || echo "BROKEN"
       ;;
     P1CERT)
+      # The ezdrowie integration (root helper and its sudoers entry) belongs
+      # to a healthy installation: a missing part is repaired by the installer.
       [[ -d "$ITGO_HOME/UTILITY/P1CERT" \
         && -f "$version_file" \
         && -x "$ITGO_HOME/UTILITY/P1CERT/bin/p1cert" \
         && -x "$ITGO_HOME/UTILITY/P1CERT/bin/p1cert_audit.sh" \
-        && -L /usr/local/bin/p1cert ]] && echo "OK" || echo "BROKEN"
+        && -L /usr/local/bin/p1cert \
+        && -f /usr/local/libexec/itgo-p1cert/p1cert-ezdrowie-helper \
+        && -f /etc/sudoers.d/itgo-p1cert-ezdrowie ]] && echo "OK" || echo "BROKEN"
       ;;
     LOGGUARD)
       if [[ -d "$ITGO_HOME/UTILITY/LOGGUARD" \
@@ -2796,6 +2804,40 @@ download_p1cert_payload() {
   done < "$payload_file"
 
   p1cert_verify_stage "$out_dir"
+}
+
+# Install/update of P1CERT through the staged installer.  Exit status 3 of
+# the installer: P1CERT is installed, but its ezdrowie system integration
+# (Java/PKCS12 tool, helper, sudoers, service) is INCOMPLETE - reported as an
+# ERROR in the summary and a non-zero master exit, the remaining modules are
+# still handled.  Any other failure stops the master as before.
+run_p1cert_install() {
+  local rc=0
+
+  run_p1cert_installer_staged "$TARGET_USER" || rc=$?
+  case "$rc" in
+    0)
+      echo "[$(ts)] OK: P1CERT done."
+      ;;
+    3)
+      echo "[$(ts)] ERROR: P1CERT installed, but its ezdrowie system integration is INCOMPLETE (see the installer lines above; diagnosis: sudo -u $TARGET_USER p1cert ezdrowie check)."
+      add_summary "P1CERT: ERROR (installed, ezdrowie integration INCOMPLETE - run/schedule unavailable; see the log)"
+      MODULE_INSTALL_INCOMPLETE=1
+      ;;
+    *)
+      echo "[$(ts)] ERROR: P1CERT installer failed."
+      exit 1
+      ;;
+  esac
+}
+
+# Exit status after an install/update flow (summary already printed).
+exit_after_module_install() {
+  if [[ "$MODULE_INSTALL_INCOMPLETE" == "1" ]]; then
+    echo "[$(ts)] ERROR: at least one module reported an incomplete installation (see the summary)."
+    exit 1
+  fi
+  exit 0
 }
 
 # Runs the P1CERT installer (install/update, or "--uninstall") as root from a
@@ -4955,8 +4997,7 @@ install_p1cert_step() {
         [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
         UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
         [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
-        run_p1cert_installer_staged "$TARGET_USER" || { echo "[$(ts)] ERROR: P1CERT installer failed."; exit 1; }
-        echo "[$(ts)] OK: P1CERT done."
+        run_p1cert_install
       else
         echo "[$(ts)] SKIP: P1CERT."
       fi
@@ -4970,8 +5011,7 @@ install_p1cert_step() {
       [[ -n "${ITGO_HOME:-}" ]] || { echo "[$(ts)] ERROR: cannot resolve home"; exit 1; }
       UTILITY_DIR="${UTILITY_DIR:-$ITGO_HOME/UTILITY}"
       [[ -d "$UTILITY_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$UTILITY_DIR"
-      run_p1cert_installer_staged "$TARGET_USER" || { echo "[$(ts)] ERROR: P1CERT installer failed."; exit 1; }
-      echo "[$(ts)] OK: P1CERT done."
+      run_p1cert_install
     fi
   fi
 }
@@ -5458,7 +5498,7 @@ main() {
     cleanup_tmp_installers_no_prompt
     echo "[$(ts)] DONE."
     print_summary
-    exit 0
+    exit_after_module_install
   fi
 
   if [[ "$MODULES_ONLY_MODE" == "1" ]]; then
@@ -5516,7 +5556,7 @@ main() {
     cleanup_tmp_installers_no_prompt
     echo "[$(ts)] DONE."
     print_summary
-    exit 0
+    exit_after_module_install
   fi
 
   prepare_user_paths_if_possible
@@ -5701,6 +5741,7 @@ main() {
   echo "[$(ts)] DONE."
   [[ -n "${FINAL_LOG:-}" ]] && echo "[$(ts)] Master log: $FINAL_LOG"
   print_summary
+  exit_after_module_install
 }
 
 main "$@"
