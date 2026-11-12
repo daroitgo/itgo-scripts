@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - wget
 # ==========================================================
 
-VERSION="1.0.9"
+VERSION="1.0.10"
 MANIFEST_URL="https://helpdesk.itgo.com.pl/nextcloud/index.php/s/s2778Z6z4rEibLp/download"
 
 TARGET_DIR="${HOME}/UPG"
@@ -283,23 +283,174 @@ resolve_version() {
   printf '%s\n' "$manifest" | jq -r --arg channel "$channel" --argjson n "$choice" '.channels[$channel][$n-1].version'
 }
 
-resolve_filename_from_header() {
-  local url="$1"
-  local filename
+# Wypisuje surową wartość parametru $2 (np. "filename" lub "filename*")
+# z ostatniego nagłówka Content-Disposition w odpowiedzi HTTP $1.
+# Nazwa nagłówka i parametru jest porównywana bez względu na wielkość liter.
+# Kody wyjścia: 0 - parametr znaleziony, 2 - brak nagłówka, 3 - brak parametru.
+extract_content_disposition_param() {
+  local headers="$1"
+  local want="$2"
 
-  filename="$(
-    curl -fsSIL "$url" \
-      | awk -F'filename=\"' '/^Content-Disposition:/ {print $2}' \
-      | tr -d '"' \
-      | tr -d '\r'
-  )"
+  LC_ALL=C awk -v want="$want" '
+    { sub(/\r$/, "") }
+    tolower($0) ~ /^content-disposition[ \t]*:/ {
+      hdr = substr($0, index($0, ":") + 1)
+      found = 1
+    }
+    END {
+      if (!found) exit 2
+      n = length(hdr); i = 1; have = 0; result = ""
+      while (i <= n) {
+        c = substr(hdr, i, 1)
+        if (c == ";" || c == " " || c == "\t") { i++; continue }
+        name = ""
+        while (i <= n) {
+          c = substr(hdr, i, 1)
+          if (c == "=" || c == ";") break
+          name = name c; i++
+        }
+        sub(/[ \t]+$/, "", name)
+        val = ""
+        if (i <= n && substr(hdr, i, 1) == "=") {
+          i++
+          while (i <= n && (substr(hdr, i, 1) == " " || substr(hdr, i, 1) == "\t")) i++
+          if (substr(hdr, i, 1) == "\"") {
+            i++
+            while (i <= n) {
+              c = substr(hdr, i, 1)
+              if (c == "\\" && i < n) { i++; val = val substr(hdr, i, 1); i++; continue }
+              if (c == "\"") { i++; break }
+              val = val c; i++
+            }
+            while (i <= n && substr(hdr, i, 1) != ";") i++
+          } else {
+            while (i <= n && substr(hdr, i, 1) != ";") { val = val substr(hdr, i, 1); i++ }
+            sub(/[ \t]+$/, "", val)
+          }
+        }
+        if (!have && tolower(name) == want) { result = val; have = 1 }
+      }
+      if (!have) exit 3
+      printf "%s", result
+    }
+  ' <<<"$headers"
+}
+
+# Dekoduje wartość rozszerzoną RFC 8187 (charset'lang'pct-encoded).
+# Obsługiwany jest wyłącznie charset UTF-8. Kod 1 oznacza wartość nieobsługiwaną.
+decode_ext_filename_value() {
+  local raw="$1"
+  local charset rest encoded
+  local re_attr='^([A-Za-z0-9!#$&+.^_`|~-]|%[0-9A-Fa-f][0-9A-Fa-f])+$'
+  local re_ctrl='%([01][0-9A-Fa-f]|7[Ff])'
+
+  case "$raw" in
+    *\'*\'*) ;;
+    *) return 1 ;;
+  esac
+
+  charset="${raw%%\'*}"
+  rest="${raw#*\'}"
+  encoded="${rest#*\'}"
+
+  case "${charset,,}" in
+    utf-8) ;;
+    *) return 1 ;;
+  esac
+
+  [[ "$encoded" =~ $re_attr ]] || return 1
+  if [[ "$encoded" =~ $re_ctrl ]]; then
+    return 1
+  fi
+
+  printf '%b' "${encoded//%/\\x}"
+}
+
+# Weryfikuje, że nazwa pliku jest bezpieczna do zapisu w katalogu docelowym.
+validate_download_filename() {
+  local name="$1"
+  local LC_ALL=C
+
+  if [ -z "$name" ]; then
+    echo "ERROR: Nagłówek HTTP zawiera pustą nazwę pliku." >&2
+    return 1
+  fi
+
+  case "$name" in
+    */*|*\\*)
+      echo "ERROR: Nazwa pliku z nagłówka HTTP zawiera separator katalogu - odrzucono." >&2
+      return 1
+      ;;
+  esac
+
+  if [[ "$name" =~ ^\.+$ ]]; then
+    echo "ERROR: Nazwa pliku z nagłówka HTTP jest niedozwolona: ${name}" >&2
+    return 1
+  fi
+
+  if [[ "$name" == *[[:cntrl:]]* ]]; then
+    echo "ERROR: Nazwa pliku z nagłówka HTTP zawiera znaki sterujące - odrzucono." >&2
+    return 1
+  fi
+
+  if [ "${#name}" -gt 255 ]; then
+    echo "ERROR: Nazwa pliku z nagłówka HTTP jest zbyt długa." >&2
+    return 1
+  fi
+
+  return 0
+}
+
+# Ustala nazwę pliku z nagłówków HTTP przekazanych w $1.
+# Na stdout wypisuje wyłącznie nazwę pliku; błędy trafiają na stderr.
+parse_filename_from_headers() {
+  local headers="$1"
+  local ext_value="" plain_value="" decoded="" filename=""
+  local ext_rc=0 plain_rc=0
+
+  ext_value="$(extract_content_disposition_param "$headers" "filename*")" || ext_rc=$?
+  if [ "$ext_rc" -eq 2 ]; then
+    echo "ERROR: Brak nagłówka Content-Disposition w odpowiedzi HTTP." >&2
+    return 1
+  fi
+  plain_value="$(extract_content_disposition_param "$headers" "filename")" || plain_rc=$?
+
+  if [ "$ext_rc" -eq 0 ]; then
+    if decoded="$(decode_ext_filename_value "$ext_value")" && [ -n "$decoded" ]; then
+      filename="$decoded"
+    elif [ "$plain_rc" -eq 0 ]; then
+      echo "WARN: Nieobsługiwany parametr filename* w Content-Disposition - używam filename." >&2
+    else
+      echo "ERROR: Nieobsługiwana wartość filename* w Content-Disposition." >&2
+      return 1
+    fi
+  fi
 
   if [ -z "$filename" ]; then
-    echo "ERROR: Nie udało się ustalić nazwy pliku z nagłówka HTTP."
+    if [ "$plain_rc" -ne 0 ]; then
+      echo "ERROR: Nagłówek Content-Disposition nie zawiera nazwy pliku." >&2
+      return 1
+    fi
+    filename="$plain_value"
+  fi
+
+  validate_download_filename "$filename" || return 1
+  printf '%s\n' "$filename"
+}
+
+resolve_filename_from_header() {
+  local url="$1"
+  local headers
+
+  if ! headers="$(curl -fsSIL "$url")"; then
+    echo "ERROR: Nie udało się pobrać nagłówków HTTP: ${url}" >&2
     exit 1
   fi
 
-  printf '%s\n' "$filename"
+  if ! parse_filename_from_headers "$headers"; then
+    echo "ERROR: Nie udało się ustalić nazwy pliku z nagłówka HTTP." >&2
+    exit 1
+  fi
 }
 
 format_duration() {
@@ -481,4 +632,7 @@ main() {
   echo "========================================"
 }
 
-main "$@"
+# DWUPG_LIB_ONLY=1 pozwala testom załadować funkcje bez uruchamiania main.
+if [ "${DWUPG_LIB_ONLY:-0}" != "1" ]; then
+  main "$@"
+fi
