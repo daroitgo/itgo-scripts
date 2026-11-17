@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.16"
+COLLECTOR_VERSION = "0.1.18"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -32,17 +32,27 @@ MAX_MPI_ENV_BYTES = 64 * 1024
 MAX_EDM_ENV_BYTES = 64 * 1024
 MAX_APPLICATION_ENV_BYTES = 64 * 1024
 MAX_APPLICATION_COMPOSE_BYTES = 256 * 1024
+MAX_GENERIC_COMPOSE_IMAGES = 64
+MAX_COMPOSE_IMAGE_REFERENCE_CHARS = 512
+MAX_COMPOSE_IMAGE_REPOSITORY_CHARS = 255
+MAX_COMPOSE_IMAGE_TAG_CHARS = 128
 MAX_MEMINFO_BYTES = 64 * 1024
 MAX_INTEGRATION_WEBAPPS = 64
 MAX_INTEGRATION_MAVEN_GROUP_DIRS = 32
 MAX_INTEGRATION_MAVEN_ARTIFACT_DIRS = 32
 MAX_APPLICATION_BASE_CHILDREN = 1024
+MAX_APPLICATION_SCAN_DEPTH = 2
+MAX_APPLICATION_DIRECTORIES = 4096
 MAX_WARNINGS = 32
 MAX_WARNING_MESSAGE_CHARS = 200
 MAX_HOSTNAME_CHARS = 255
 ITGO_IDENTITY_PATH = "/home/itgo/UTILITY/ITGO-CONFIG/client-identity.json"
 ITGO_CLIENT_CODE_PATTERN = re.compile(r"^[a-z0-9_-]+$")
-APPLICATION_BASE_PATHS = ("/srv", "/usr/local", "/opt")
+APPLICATION_BASE_PATHS = ("/srv", "/usr/local", "/usr/app", "/usr", "/opt")
+SYSTEM_APPLICATION_DIRECTORY_NAMES = frozenset((
+    "bin", "etc", "games", "include", "lib", "lib32", "lib64", "libexec",
+    "sbin", "share", "src", "var",
+))
 PSIM2_EDM_DIRECTORY_NAMES = ("edm", "edm_psim2")
 COMPOSE_FILENAMES = (
     "docker-compose.yml",
@@ -679,6 +689,231 @@ def read_allowlisted_compose_image_tags(compose_path, allowed_repositories):
         (repository, tag)
         for repository, tag in images.items()
         if tag is not None
+    )
+
+
+def is_valid_compose_repository(repository):
+    if (
+        not repository
+        or len(repository) > MAX_COMPOSE_IMAGE_REPOSITORY_CHARS
+        or any(character.isspace() for character in repository)
+        or any(character in repository for character in ("$", "{", "}", "@"))
+    ):
+        return False
+    parts = repository.split("/")
+    if any(not part for part in parts):
+        return False
+    first_name = parts[0]
+    if ":" in first_name:
+        first_name, port = first_name.rsplit(":", 1)
+        if (
+            not port.isdigit()
+            or not 1 <= len(port) <= 5
+            or not 1 <= int(port) <= 65535
+        ):
+            return False
+    component_pattern = r"^[a-z0-9]+(?:[._-]+[a-z0-9]+)*\Z"
+    return bool(first_name and re.match(component_pattern, first_name)) and all(
+        re.match(component_pattern, part) is not None for part in parts[1:]
+    )
+
+
+def parse_generic_compose_image(raw_image, registry_values, quote):
+    if not raw_image or len(raw_image) > MAX_COMPOSE_IMAGE_REFERENCE_CHARS:
+        return None
+    if quote == chr(39) and raw_image.startswith("${DOCKER_REGISTRY"):
+        return None
+    image = resolve_allowlisted_compose_registry(raw_image, registry_values)
+    if image is None or len(image) > MAX_COMPOSE_IMAGE_REFERENCE_CHARS:
+        return None
+    if any(character.isspace() for character in image):
+        return None
+
+    reference = image
+    if "@" in reference:
+        repository, digest = reference.rsplit("@", 1)
+        if not re.match(r"^sha256:[0-9a-f]{64}\Z", digest):
+            return None
+        reference = repository
+
+    repository = reference
+    tag = None
+    last_slash = reference.rfind("/")
+    last_colon = reference.rfind(":")
+    if last_colon > last_slash:
+        repository = reference[:last_colon]
+        candidate_tag = reference[last_colon + 1:]
+        if (
+            len(candidate_tag) <= MAX_COMPOSE_IMAGE_TAG_CHARS
+            and re.match(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z", candidate_tag)
+        ):
+            tag = candidate_tag
+        elif not any(character in candidate_tag for character in ("$", "{", "}")):
+            return None
+
+    if not is_valid_compose_repository(repository):
+        return None
+    result = {"repository": repository}
+    if tag is not None:
+        result["tag"] = tag
+    return result
+
+
+def read_generic_compose_images(compose_path):
+    """Return whether bounded Compose structure exists and safe observations."""
+    if not is_path_file_within_limit(compose_path, MAX_APPLICATION_COMPOSE_BYTES):
+        return False, []
+    contents = read_utf8_text_file(compose_path, MAX_APPLICATION_COMPOSE_BYTES)
+    if contents is None:
+        return False, []
+    registry_values = read_allowlisted_env_values(
+        os.path.join(os.path.dirname(compose_path), ".env"),
+        ("DOCKER_REGISTRY",),
+        include_empty=True,
+    )
+    has_services_section = False
+    has_service_declaration = False
+    in_services_section = False
+    service_indentation = None
+    field_indentation = None
+    current_service = False
+    current_service_has_image = False
+    ambiguous_structure = False
+    images = []
+    for line in contents.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        leading = line[:len(line) - len(line.lstrip())]
+        if "\t" in leading:
+            if in_services_section:
+                ambiguous_structure = True
+                break
+            continue
+        indentation = len(line) - len(line.lstrip())
+        if indentation == 0:
+            if stripped == "services:":
+                if has_services_section:
+                    ambiguous_structure = True
+                    break
+                has_services_section = True
+                in_services_section = True
+                continue
+            in_services_section = False
+            current_service = False
+            continue
+
+        if not in_services_section:
+            continue
+
+        service_match = re.match(
+            r"^(?P<key>[A-Za-z0-9][A-Za-z0-9_.-]*)\s*:\s*\Z", stripped
+        )
+        if service_indentation is None:
+            if service_match is None:
+                ambiguous_structure = True
+                break
+            service_indentation = indentation
+            current_service = not service_match.group("key").casefold().startswith("x-")
+            if current_service:
+                has_service_declaration = True
+            current_service_has_image = False
+            field_indentation = None
+            continue
+
+        if indentation < service_indentation:
+            ambiguous_structure = True
+            break
+        if indentation == service_indentation:
+            if service_match is None:
+                ambiguous_structure = True
+                break
+            current_service = not service_match.group("key").casefold().startswith("x-")
+            if current_service:
+                has_service_declaration = True
+            current_service_has_image = False
+            field_indentation = None
+            continue
+        if not current_service:
+            continue
+
+        field_match = re.match(
+            r"^(?P<key>[A-Za-z0-9][A-Za-z0-9_.-]*)\s*:\s*(?P<value>.*?)\s*\Z",
+            stripped,
+        )
+        if field_indentation is None:
+            if field_match is None:
+                ambiguous_structure = True
+                break
+            field_indentation = indentation
+        elif indentation < field_indentation:
+            ambiguous_structure = True
+            break
+
+        if indentation != field_indentation:
+            continue
+        if field_match is None:
+            ambiguous_structure = True
+            break
+        if field_match.group("key") != "image":
+            continue
+        if current_service_has_image:
+            ambiguous_structure = True
+            break
+        current_service_has_image = True
+        image = field_match.group("value").strip()
+        quote = None
+        if len(image) >= 2 and image[0] == image[-1] and image[0] in ("\"", chr(39)):
+            quote = image[0]
+            image = image[1:-1]
+        if not image:
+            continue
+        observation = parse_generic_compose_image(image, registry_values, quote)
+        if observation is not None:
+            observation["source_path"] = compose_path
+            images.append(observation)
+    if ambiguous_structure:
+        images = []
+    return has_services_section and has_service_declaration, images
+
+
+def generic_compose_candidate(candidate_path, base_path, candidate_name, warnings):
+    compose_files = []
+    images = []
+    seen_images = set()
+    image_limit_warned = False
+    for compose_path in collect_compose_files(candidate_path):
+        is_compose_file, observations = read_generic_compose_images(compose_path)
+        if not is_compose_file:
+            continue
+        compose_files.append(compose_path)
+        for observation in observations:
+            key = (observation["repository"], observation.get("tag"))
+            if key in seen_images:
+                continue
+            if len(images) >= MAX_GENERIC_COMPOSE_IMAGES:
+                if not image_limit_warned:
+                    add_warning(
+                        warnings,
+                        "APPLICATION_COMPOSE_IMAGE_LIMIT",
+                        candidate_name,
+                        "Application Compose image limit reached",
+                    )
+                    image_limit_warned = True
+                continue
+            seen_images.add(key)
+            images.append(observation)
+    if not compose_files:
+        return None
+    return application_candidate(
+        candidate_name,
+        candidate_path,
+        {
+            "base_path": base_path,
+            "matched_hint": "generic_compose",
+            "compose_files": compose_files,
+            "compose_images": images,
+        },
     )
 
 
@@ -1502,11 +1737,123 @@ def collect_application_candidates(
     base_paths=APPLICATION_BASE_PATHS,
 ):
     candidates = []
-
+    normalized_bases = []
     for base_path in base_paths:
-        base = base_path
+        normalized = os.path.normpath(base_path)
+        if normalized not in normalized_bases:
+            normalized_bases.append(normalized)
+    base_set = set(normalized_bases)
+    seen_directories = set()
+    visited_directories = [0]
+    directory_limit_warned = [False]
+    depth_limit_warned = [False]
+
+    def warn_once(flag, code, message):
+        if flag[0]:
+            return
+        flag[0] = True
+        add_warning(warnings, code, "application_candidates", message)
+
+    def uses_system_directory_exclusions(base):
+        normalized_parts = os.path.normpath(base).casefold().split(os.sep)
+        return normalized_parts[-1:] == ["usr"] or normalized_parts[-2:] == [
+            "usr", "local"
+        ]
+
+    def is_excluded_directory_name(base, name):
+        return (
+            uses_system_directory_exclusions(base)
+            and name.casefold() in SYSTEM_APPLICATION_DIRECTORY_NAMES
+        )
+
+    def inspect_candidate(child, base):
+        candidate_name = os.path.basename(child)
+        if is_non_primary_application_directory_name(candidate_name):
+            return False
+
+        before_count = len(candidates)
+        regional_detection = classify_known_regional_compose(
+            child, base, candidate_name, warnings
+        )
+        unresolved_regional_candidates = None
+        if regional_detection is not None:
+            regional_resolution, regional_candidates = regional_detection
+            if regional_resolution == "unresolved":
+                unresolved_regional_candidates = regional_candidates
+            else:
+                if candidate_name.lower().startswith("edm"):
+                    candidates.extend(legacy_edm_application_candidates(child, base))
+                candidates.extend(regional_candidates)
+                return True
+
+        if unresolved_regional_candidates is not None:
+            if candidate_name.lower().startswith("edm"):
+                legacy_edm_candidates = legacy_edm_application_candidates(child, base)
+                if legacy_edm_candidates:
+                    candidates.extend(legacy_edm_candidates)
+                    return True
+            if not candidate_name.lower().startswith("mpi"):
+                candidates.extend(unresolved_regional_candidates)
+                return True
+
+        if candidate_name.lower() in PSIM2_EDM_DIRECTORY_NAMES:
+            candidates.extend(legacy_edm_application_candidates(child, base))
+            return len(candidates) > before_count
+
+        special_candidates = special_application_candidates(
+            child, base, candidate_name, warnings
+        )
+        if special_candidates is not None:
+            candidates.extend(special_candidates)
+            return True
+
+        match = match_application_candidate(candidate_name)
+        if match is None:
+            generic_candidate = generic_compose_candidate(
+                child, base, candidate_name, warnings
+            )
+            if generic_candidate is None:
+                return False
+            candidates.append(generic_candidate)
+            return True
+
+        candidate_type, matched_hint = match
+        fields = {
+            "base_path": base,
+            "matched_hint": matched_hint,
+        }
+        if candidate_type == "docker_compose":
+            fields["compose_files"] = collect_compose_files(child)
+            application_version_value = read_mpi_env_version(child)
+            if application_version_value is not None:
+                fields["application_version"] = application_version_value
+        elif candidate_type == "edm":
+            application_version_value = read_edm_env_version(child)
+            if application_version_value is not None:
+                fields["application_version"] = application_version_value
+        elif candidate_type == "wildfly_jboss":
+            application_version_value = read_amms_build_metadata(child)
+            if application_version_value is not None:
+                fields["application_version"] = application_version_value
+        elif candidate_type == "integration_platform":
+            application_version_value, webapps = collect_integration_version_metadata(child)
+            if application_version_value is not None:
+                fields["application_version"] = application_version_value
+            fields["webapps"] = webapps
+
+        candidates.append({
+            "source": "filesystem_allowlist",
+            "source_path": child,
+            "name": os.path.basename(child),
+            "candidate_type": candidate_type,
+            "status": "candidate",
+            "fields": fields,
+        })
+        return True
+
+    def list_children(directory):
         try:
-            child_names = sorted(os.listdir(base))
+            child_names = sorted(os.listdir(directory))
         except OSError as error:
             if error.errno in (errno.EACCES, errno.EPERM):
                 add_warning(
@@ -1522,7 +1869,7 @@ def collect_application_candidates(
                     "application_candidates",
                     "Could not read allowlisted application base path",
                 )
-            continue
+            return []
 
         if len(child_names) > MAX_APPLICATION_BASE_CHILDREN:
             add_warning(
@@ -1532,94 +1879,97 @@ def collect_application_candidates(
                 "Application base child limit reached",
             )
             child_names = child_names[:MAX_APPLICATION_BASE_CHILDREN]
-        children = [os.path.join(base, name) for name in child_names]
+        return child_names
 
-        for child in children:
+    def has_scannable_child_directory(directory, base):
+        try:
+            entries = os.scandir(directory)
+        except OSError:
+            return False
+        try:
+            for index, entry in enumerate(entries):
+                if index >= MAX_APPLICATION_BASE_CHILDREN:
+                    add_warning(
+                        warnings,
+                        "APPLICATION_BASE_CHILD_LIMIT",
+                        "application_candidates",
+                        "Application base child limit reached",
+                    )
+                    return False
+                if is_excluded_directory_name(base, entry.name):
+                    continue
+                if is_non_primary_application_directory_name(entry.name):
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        return True
+                except OSError:
+                    continue
+        finally:
+            entries.close()
+        return False
+
+    for base in normalized_bases:
+        pending = []
+        if os.path.basename(base).lower() == "app":
+            pending.append((base, 0))
+        else:
+            for child_name in reversed(list_children(base)):
+                pending.append((os.path.join(base, child_name), 1))
+
+        while pending:
+            child, depth = pending.pop()
+            normalized_child = os.path.normpath(child)
+            if normalized_child in seen_directories:
+                continue
+            if normalized_child != base and normalized_child in base_set:
+                continue
+            child_name = os.path.basename(normalized_child)
+            if (
+                os.path.basename(base).lower() == "usr"
+                and depth == 1
+                and child_name.lower() in ("local", "app")
+            ):
+                continue
+            if is_excluded_directory_name(base, child_name):
+                continue
+            if is_non_primary_application_directory_name(child_name):
+                continue
             try:
                 if not os.path.isdir(child):
                     continue
             except OSError:
                 continue
+            if visited_directories[0] >= MAX_APPLICATION_DIRECTORIES:
+                warn_once(
+                    directory_limit_warned,
+                    "APPLICATION_DIRECTORY_LIMIT",
+                    "Application directory visit limit reached",
+                )
+                pending = []
+                break
+            visited_directories[0] += 1
+            seen_directories.add(normalized_child)
 
-            candidate_name = os.path.basename(child)
-            if is_non_primary_application_directory_name(candidate_name):
+            if depth > 1 and os.path.islink(child):
                 continue
-
-            regional_detection = classify_known_regional_compose(
-                child, base, candidate_name, warnings
-            )
-            unresolved_regional_candidates = None
-            if regional_detection is not None:
-                regional_resolution, regional_candidates = regional_detection
-                if regional_resolution == "unresolved":
-                    unresolved_regional_candidates = regional_candidates
-                else:
-                    if candidate_name.lower().startswith("edm"):
-                        candidates.extend(legacy_edm_application_candidates(child, base))
-                    candidates.extend(regional_candidates)
-                    continue
-
-            if unresolved_regional_candidates is not None:
-                if candidate_name.lower().startswith("edm"):
-                    legacy_edm_candidates = legacy_edm_application_candidates(
-                        child, base
+            detected = inspect_candidate(child, base)
+            if detected:
+                if depth == 0:
+                    pending = []
+                continue
+            if os.path.islink(child):
+                continue
+            if depth >= MAX_APPLICATION_SCAN_DEPTH:
+                if has_scannable_child_directory(child, base):
+                    warn_once(
+                        depth_limit_warned,
+                        "APPLICATION_DEPTH_LIMIT",
+                        "Application directory depth limit reached",
                     )
-                    if legacy_edm_candidates:
-                        candidates.extend(legacy_edm_candidates)
-                        continue
-                if not candidate_name.lower().startswith("mpi"):
-                    candidates.extend(unresolved_regional_candidates)
-                    continue
-
-            if candidate_name.lower() in PSIM2_EDM_DIRECTORY_NAMES:
-                candidates.extend(legacy_edm_application_candidates(child, base))
                 continue
-
-            special_candidates = special_application_candidates(
-                child, base, candidate_name, warnings
-            )
-            if special_candidates is not None:
-                candidates.extend(special_candidates)
-                continue
-
-            match = match_application_candidate(candidate_name)
-            if match is None:
-                continue
-
-            candidate_type, matched_hint = match
-            fields = {
-                "base_path": base,
-                "matched_hint": matched_hint,
-            }
-            if candidate_type == "docker_compose":
-                fields["compose_files"] = collect_compose_files(child)
-                application_version = read_mpi_env_version(child)
-                if application_version is not None:
-                    fields["application_version"] = application_version
-            elif candidate_type == "edm":
-                application_version = read_edm_env_version(child)
-                if application_version is not None:
-                    fields["application_version"] = application_version
-            elif candidate_type == "wildfly_jboss":
-                application_version = read_amms_build_metadata(child)
-                if application_version is not None:
-                    fields["application_version"] = application_version
-            elif candidate_type == "integration_platform":
-                application_version, webapps = collect_integration_version_metadata(child)
-                if application_version is not None:
-                    fields["application_version"] = application_version
-                fields["webapps"] = webapps
-
-            candidates.append(
-                {
-                    "source": "filesystem_allowlist",
-                    "source_path": child,
-                    "name": os.path.basename(child),
-                    "candidate_type": candidate_type,
-                    "status": "candidate",
-                    "fields": fields,
-                }
-            )
+            for nested_name in reversed(list_children(child)):
+                pending.append((os.path.join(child, nested_name), depth + 1))
 
     return candidates
 
