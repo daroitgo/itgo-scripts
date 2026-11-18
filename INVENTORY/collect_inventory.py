@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.18"
+COLLECTOR_VERSION = "0.1.19"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -48,7 +48,7 @@ MAX_WARNING_MESSAGE_CHARS = 200
 MAX_HOSTNAME_CHARS = 255
 ITGO_IDENTITY_PATH = "/home/itgo/UTILITY/ITGO-CONFIG/client-identity.json"
 ITGO_CLIENT_CODE_PATTERN = re.compile(r"^[a-z0-9_-]+$")
-APPLICATION_BASE_PATHS = ("/srv", "/usr/local", "/usr/app", "/usr", "/opt")
+APPLICATION_BASE_PATHS = ("/srv", "/usr/local", "/usr/app", "/app", "/usr", "/opt")
 SYSTEM_APPLICATION_DIRECTORY_NAMES = frozenset((
     "bin", "etc", "games", "include", "lib", "lib32", "lib64", "libexec",
     "sbin", "share", "src", "var",
@@ -59,6 +59,110 @@ COMPOSE_FILENAMES = (
     "docker-compose.yaml",
     "compose.yml",
     "compose.yaml",
+)
+
+# Compiled from docs/collectors/version-source-rule-catalog.json schema 1.0.
+# Only matrix entries with readiness=ready are included here. Product entries
+# remain implemented by the established specialist detectors below.
+CATALOG_SCHEMA_VERSION = "1.0"
+CATALOG_READY_MATRIX_RULE_COUNT = 69
+CATALOG_READY_PRODUCT_RULE_COUNT = 10
+CATALOG_UNRESOLVED_RULE_COUNT = 10
+CATALOG_RULE_ID_PREFIX = "version-source-catalog-1.0:"
+CATALOG_READY_PRODUCT_RULE_IDS = (
+    "amdx", "amms", "hazelcast", "hazelcast-management-center",
+    "integration-platform", "mpi", "mswia-edm", "p1-adapter", "psim2-edm",
+    "token-generator",
+)
+CATALOG_UNRESOLVED_RULE_IDS = (
+    "athos-mobit", "cpi-mpi-services", "hl7-proxy", "pi-hurtownie-provider",
+    "pi-wwks2", "si-aism", "si-crt-provider", "si-zsmopl-integration", "lab",
+    "nbk",
+)
+CATALOG_INFRASTRUCTURE_SERVICE_NAMES = frozenset((
+    "db", "database", "cache", "postgres", "postgresql", "redis",
+    "elasticsearch", "logstash", "kibana", "nginx",
+))
+
+# component_id, Compose path, ENV path, exact tag variable, directory aliases.
+# A None alias tuple is allowed only for a component-specific variable and
+# still requires a direct Compose image-tag binding.
+CATALOG_ENV_RULES = (
+    ("bosk", "docker-compose.yml", ".env", "BOSK_VERSION", ("bosk", "bosk-docker")),
+    ("cpi-hl7-services", "docker-compose.yml", ".env", "CPI_VERSION", ("cpi-hl7-services",)),
+    ("cpi-xml-services", "docker-compose.yml", ".env", "CPI_VERSION", ("cpi-xml-services",)),
+    ("csi-amms-rest-services", "docker-compose.yml", ".env", "IMAGE_VERSION", ("csi-amms-rest-services",)),
+    ("medical-events-data", "start_docker/docker-compose.yml", "start_docker/.env", "MEDICAL_EVENTS_DATA_VERSION", None),
+    ("medical-events-p1", "start_docker/docker-compose.yml", "start_docker/.env", "MEDICAL_EVENTS_P1_VERSION", None),
+    ("medical-events-repairer", "start_docker/docker-compose.yml", "start_docker/.env", "MEDICAL_EVENTS_REPAIRER_VERSION", None),
+    ("pi-hl7-provider", "docker-compose.yml", ".env", "PI_VERSION", ("pi-hl7-provider",)),
+    ("pi-xml-provider", "docker-compose.yml", ".env", "PI_VERSION", ("pi-xml-provider",)),
+    ("si-accept", "docker-compose.yml", ".env", "PI_VERSION", ("si-accept",)),
+    ("si-adm-nbk", "docker-compose.yml", ".env", "PI_VERSION", ("si-adm-nbk",)),
+    ("si-ai-services", "docker-compose.yml", ".env", "PI_VERSION", ("si-ai-services",)),
+    ("si-amms-push-service", "docker-compose.yml", ".env", "PI_VERSION", ("si-amms-push-service",)),
+    ("si-amms-services", "docker-compose.yml", ".env", "PI_VERSION", ("si-amms-services",)),
+    ("si-athos", "docker-compose.yml", ".env", "PI_VERSION", ("si-athos",)),
+    ("si-auth-service", "docker-compose.yml", ".env", "PI_VERSION", ("si-auth-service",)),
+    ("si-certificate", "docker-compose.yml", ".env", "PI_VERSION", ("si-certificate",)),
+    ("si-certum", "docker-compose.yml", ".env", "PI_VERSION", ("si-certum",)),
+    ("si-connector", "docker-compose.yml", ".env", "PI_VERSION", ("si-connector",)),
+    ("si-data-storage-service", "docker-compose.yml", ".env", "PI_VERSION", ("si-data-storage-service",)),
+    ("si-documents-utility", "docker-compose.yml", ".env", "PI_VERSION", ("si-documents-utility",)),
+    ("si-epuap", "docker-compose.yml", ".env", "PI_VERSION", ("si-epuap",)),
+    ("si-identitymanager", "docker-compose.yml", ".env", "PI_VERSION", ("si-identitymanager",)),
+    ("si-lab-integration", "docker-compose.yml", ".env", "PI_VERSION", ("si-lab-integration",)),
+    ("si-mf-gov", "docker-compose.yml", ".env", "PI_VERSION", ("si-mf-gov",)),
+    ("si-mhosp", "docker-compose.yml", ".env", "PI_VERSION", ("si-mhosp",)),
+    ("si-mpi", "docker-compose.yml", ".env", "PI_VERSION", ("si-mpi",)),
+    ("si-nfz", "docker-compose.yml", ".env", "PI_VERSION", ("si-nfz",)),
+    ("si-nmvs", "docker-compose.yml", ".env", "PI_VERSION", ("si-nmvs",)),
+    ("si-notifications", "docker-compose.yml", ".env", "PI_VERSION", ("si-notifications",)),
+    ("si-notifications-adm", "docker-compose.yml", ".env", "PI_VERSION", ("si-notifications-adm",)),
+    ("si-oplatomat", "docker-compose.yml", ".env", "PI_VERSION", ("si-oplatomat",)),
+    ("si-p1-ewp", "docker-compose.yml", ".env", "PI_VERSION", ("si-p1-ewp",)),
+    ("si-p1-medical-events", "docker-compose.yml", ".env", "PI_VERSION", ("si-p1-medical-events",)),
+    ("si-p1-services", "docker-compose.yml", ".env", "PI_VERSION", ("si-p1-services",)),
+    ("si-pdf-generator", "docker-compose.yml", ".env", "PI_VERSION", ("si-pdf-generator",)),
+    ("si-pharmacy-services", "docker-compose.yml", ".env", "PI_VERSION", ("si-pharmacy-services",)),
+    ("si-pharmindex-service", "docker-compose.yml", ".env", "PI_VERSION", ("si-pharmindex-service", "si-pharmaindex-service")),
+    ("si-pue", "docker-compose.yml", ".env", "PI_VERSION", ("si-pue",)),
+    ("si-rpl-import", "docker-compose.yml", ".env", "PI_VERSION", ("si-rpl-import",)),
+    ("si-rpwdl", "docker-compose.yml", ".env", "PI_VERSION", ("si-rpwdl",)),
+    ("si-simple", "docker-compose.yml", ".env", "PI_VERSION", ("si-simple",)),
+    ("si-teryt-service", "docker-compose.yml", ".env", "PI_VERSION", ("si-teryt-service",)),
+    ("si-topsor", "docker-compose.yml", ".env", "PI_VERSION", ("si-topsor",)),
+    ("si-zsmopl-integration-multiclient", "docker-compose.yml", ".env", "PI_VERSION", ("si-zsmopl-integration-multiclient",)),
+)
+
+# component_id, Compose path, exact direct service name. The repeated SDIP id
+# represents the catalog's explicitly approved alternative deployment layout.
+CATALOG_LITERAL_RULES = (
+    ("cpi-sdip-services", "full-stack/docker-compose.yml", "cpi-sdip-services"),
+    ("cpi-sdip-services", "sdip-provider/docker-compose.yml", "cpi-sdip-services"),
+    ("cpi-szrp-services", "docker-compose.yml", "cpi-szrp-services"),
+    ("ekrn", "docker-compose.yml", "ekrn"),
+    ("p1-ozr-provider", "docker-compose.yml", "pi-p1-ozr-provider"),
+    ("pi-kuj-pom-provider", "docker-compose.yml", "pi-kuj-pom-provider"),
+    ("pi-lab-medical-events", "docker-compose.yml", "pi-lab-medical-events"),
+    ("pi-lok-provider", "docker-compose.yml", "pi-lok-provider"),
+    ("pi-mon-eanalizy", "e-Analizy/docker-compose.yml", "pi-mon-eanalizy"),
+    ("pi-mon-provider", "e-Rejestracja/docker-compose.yml", "pi-mon-provider"),
+    ("pi-msim-provider", "docker-compose.yml", "pi-msim"),
+    ("pi-mswia-eanalizy", "e-analizy/docker-compose.yml", "pi-mswia-eanalizy"),
+    ("pi-mswia-provider", "e-rejestracja/docker-compose.yml", "pi-mswia"),
+    ("pi-p1-erejestracja-provider", "docker-compose.yml", "pi-p1-erejestracja-provider"),
+    ("pi-p1-ksk-provider", "docker-compose.yml", "pi-p1-ksk-provider"),
+    ("pi-p1-kso-provider", "docker-compose.yml", "pi-p1-kso-provider"),
+    ("pi-p1-sgsds-provider", "docker-compose.yml", "pi-p1-sgsds-provider"),
+    ("pi-p1-zlk-provider", "docker-compose.yml", "pi-p1-zlk-provider"),
+    ("pi-psim2-epn-provider", "EPN/docker-compose.yml", "pi-psim2-epn-provider"),
+    ("pi-psim-2-provider", "e-Rejestracja_e-Kontrahent/docker-compose.yml", "pi-psim-2-provider"),
+    ("pi-sam", "docker-compose.yml", "pi-sam-provider"),
+    ("pi-steryl", "docker-compose.yml", "pi-steryl"),
+    ("si-aism-db", "si-aism-db/docker-compose.yml", "asi-db"),
+    ("si-aism-keycloak", "si-aism-keycloak/docker-compose.yml", "keycloak"),
+    ("si-reverse-proxy", "si-reverse-proxy/docker-compose.yml", "nginx"),
 )
 DOCKER_EXACT_HINTS = {
     "zm_docker",
@@ -877,6 +981,330 @@ def read_generic_compose_images(compose_path):
     return has_services_section and has_service_declaration, images
 
 
+def read_catalog_compose_services(compose_path):
+    """Read only direct service image expressions from unambiguous Compose."""
+    if not is_path_file_within_limit(compose_path, MAX_APPLICATION_COMPOSE_BYTES):
+        return False, {}
+    contents = read_utf8_text_file(compose_path, MAX_APPLICATION_COMPOSE_BYTES)
+    if contents is None:
+        return False, {}
+
+    has_services_section = False
+    has_service_declaration = False
+    in_services_section = False
+    service_indentation = None
+    field_indentation = None
+    current_service = None
+    current_service_has_image = False
+    seen_services = set()
+    images = {}
+    ambiguous_structure = False
+
+    for line in contents.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        leading = line[:len(line) - len(line.lstrip())]
+        if "\t" in leading:
+            if in_services_section:
+                ambiguous_structure = True
+                break
+            continue
+        indentation = len(line) - len(line.lstrip())
+        if indentation == 0:
+            if stripped == "services:":
+                if has_services_section:
+                    ambiguous_structure = True
+                    break
+                has_services_section = True
+                in_services_section = True
+                continue
+            in_services_section = False
+            current_service = None
+            continue
+
+        if not in_services_section:
+            continue
+
+        service_match = re.match(
+            r"^(?P<key>[A-Za-z0-9][A-Za-z0-9_.-]*)\s*:\s*\Z", stripped
+        )
+        if service_indentation is None:
+            if service_match is None:
+                ambiguous_structure = True
+                break
+            service_indentation = indentation
+        elif indentation < service_indentation:
+            ambiguous_structure = True
+            break
+
+        if indentation == service_indentation:
+            if service_match is None:
+                ambiguous_structure = True
+                break
+            service_name = service_match.group("key")
+            if service_name in seen_services:
+                ambiguous_structure = True
+                break
+            seen_services.add(service_name)
+            current_service = (
+                None if service_name.casefold().startswith("x-") else service_name
+            )
+            if current_service is not None:
+                has_service_declaration = True
+            current_service_has_image = False
+            field_indentation = None
+            continue
+
+        if current_service is None:
+            continue
+
+        field_match = re.match(
+            r"^(?P<key>[A-Za-z0-9][A-Za-z0-9_.-]*)\s*:\s*(?P<value>.*?)\s*\Z",
+            stripped,
+        )
+        if field_indentation is None:
+            if field_match is None:
+                ambiguous_structure = True
+                break
+            field_indentation = indentation
+        elif indentation < field_indentation:
+            ambiguous_structure = True
+            break
+
+        if indentation != field_indentation:
+            continue
+        if field_match is None:
+            ambiguous_structure = True
+            break
+        if field_match.group("key") != "image":
+            continue
+        if current_service_has_image:
+            ambiguous_structure = True
+            break
+        current_service_has_image = True
+
+        image = field_match.group("value").strip()
+        quote = None
+        if len(image) >= 2 and image[0] == image[-1] and image[0] in ("\"", chr(39)):
+            quote = image[0]
+            image = image[1:-1]
+        if image and len(image) <= MAX_COMPOSE_IMAGE_REFERENCE_CHARS:
+            images[current_service] = (image, quote)
+
+    if ambiguous_structure:
+        return False, {}
+    return has_services_section and has_service_declaration, images
+
+
+def catalog_tag_variables(image, quote):
+    """Return exact variables used in a Compose image tag, never its repository."""
+    if quote == chr(39) or not image or len(image) > MAX_COMPOSE_IMAGE_REFERENCE_CHARS:
+        return set()
+    last_segment = image.rsplit("/", 1)[-1]
+    if ":" not in last_segment:
+        return set()
+    tag = last_segment.rsplit(":", 1)[-1]
+    variables = set()
+    pattern = re.compile(
+        r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?:(?::?[-+?])[^}]*)?\}|([A-Za-z_][A-Za-z0-9_]*))"
+    )
+    for match in pattern.finditer(tag):
+        variables.add(match.group(1) or match.group(2))
+    return variables
+
+
+def is_catalog_infrastructure_service(service):
+    normalized = service.casefold().replace("_", "-")
+    parts = tuple(part for part in normalized.split("-") if part)
+    return any(part in CATALOG_INFRASTRUCTURE_SERVICE_NAMES for part in parts)
+
+
+def catalog_path_candidates(candidate_path, relative_path):
+    """Resolve a fixed catalog path at a package root or at its named subroot."""
+    if (
+        not relative_path
+        or os.path.isabs(relative_path)
+        or os.path.normpath(relative_path).startswith(".." + os.sep)
+        or os.path.normpath(relative_path) == ".."
+    ):
+        return []
+    normalized = os.path.normpath(relative_path)
+    results = [os.path.join(candidate_path, normalized)]
+    parts = normalized.split(os.sep)
+    if (
+        len(parts) > 1
+        and parts[0].casefold() == os.path.basename(candidate_path).casefold()
+    ):
+        direct_path = os.path.join(candidate_path, *parts[1:])
+        if direct_path not in results:
+            results.append(direct_path)
+    return results
+
+
+def catalog_directory_matches(candidate_path, aliases):
+    if aliases is None:
+        return True
+    name = os.path.basename(candidate_path).casefold().replace("_", "-")
+    return name in tuple(alias.casefold().replace("_", "-") for alias in aliases)
+
+
+def catalog_application_version(
+    component_id,
+    method,
+    version,
+    source_path,
+    source_selector,
+    evidence_kind,
+):
+    return {
+        "kind": method,
+        "component_id": component_id,
+        "rule_id": CATALOG_RULE_ID_PREFIX + component_id,
+        "version": version,
+        "source_path": source_path,
+        "source_key": source_selector,
+        "source_selector": source_selector,
+        "source_state": "active",
+        "evidence_kind": evidence_kind,
+    }
+
+
+def catalog_component_candidate(component_id, candidate_path, base_path, version):
+    return {
+        "source": "filesystem_allowlist",
+        "source_path": candidate_path,
+        "name": component_id,
+        "candidate_type": "catalog_component",
+        "status": "candidate",
+        "fields": {
+            "base_path": base_path,
+            "matched_hint": "catalog_rule",
+            "product_identity": {
+                "kind": "catalog_component",
+                "source_key": component_id,
+            },
+            "application_version": version,
+        },
+    }
+
+
+def collect_catalog_application_candidates(candidate_path, base_path):
+    """Apply only compiled ready rules and emit at most one entry per component."""
+    results = []
+    seen_components = set()
+    compose_cache = {}
+
+    def compose_services(path):
+        if path not in compose_cache:
+            compose_cache[path] = read_catalog_compose_services(path)
+        return compose_cache[path]
+
+    for component_id, compose_relative, env_relative, variable, aliases in CATALOG_ENV_RULES:
+        if component_id in seen_components:
+            continue
+        if not catalog_directory_matches(candidate_path, aliases):
+            continue
+        compose_paths = catalog_path_candidates(candidate_path, compose_relative)
+        env_paths = catalog_path_candidates(candidate_path, env_relative)
+        matched_compose_path = None
+        for compose_path in compose_paths:
+            recognized, services = compose_services(compose_path)
+            if not recognized:
+                continue
+            if any(
+                not is_catalog_infrastructure_service(service)
+                and variable in catalog_tag_variables(image, quote)
+                for service, (image, quote) in services.items()
+            ):
+                matched_compose_path = compose_path
+                break
+        if matched_compose_path is None:
+            continue
+
+        env_path = None
+        version = None
+        for candidate_env_path in env_paths:
+            values = read_allowlisted_env_values(candidate_env_path, (variable,))
+            candidate_version = values.get(variable)
+            if candidate_version is None or re.match(
+                r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z", candidate_version
+            ) is None:
+                continue
+            env_path = candidate_env_path
+            version = candidate_version
+            break
+        if env_path is None:
+            continue
+
+        application_version_value = catalog_application_version(
+            component_id,
+            "catalog_env",
+            version,
+            env_path,
+            variable,
+            "local_compose_env_binding",
+        )
+        results.append(
+            catalog_component_candidate(
+                component_id,
+                candidate_path,
+                base_path,
+                application_version_value,
+            )
+        )
+        seen_components.add(component_id)
+
+    for component_id, compose_relative, service in CATALOG_LITERAL_RULES:
+        if component_id in seen_components:
+            continue
+        for compose_path in catalog_path_candidates(candidate_path, compose_relative):
+            recognized, services = compose_services(compose_path)
+            if not recognized or service not in services:
+                continue
+            image, quote = services[service]
+            registry_values = read_allowlisted_env_values(
+                os.path.join(os.path.dirname(compose_path), ".env"),
+                ("DOCKER_REGISTRY",),
+                include_empty=True,
+            )
+            if quote == chr(39) and image.startswith("${DOCKER_REGISTRY"):
+                observation = None
+            else:
+                resolved_image = resolve_allowlisted_compose_registry(
+                    image,
+                    registry_values,
+                )
+                observation = (
+                    parse_generic_compose_image(resolved_image, {}, quote)
+                    if resolved_image is not None
+                    else None
+                )
+            if observation is None or "tag" not in observation:
+                continue
+            selector = "services.{}.image.tag".format(service)
+            application_version_value = catalog_application_version(
+                component_id,
+                "catalog_compose_image",
+                observation["tag"],
+                compose_path,
+                selector,
+                "local_compose_literal_tag",
+            )
+            results.append(
+                catalog_component_candidate(
+                    component_id,
+                    candidate_path,
+                    base_path,
+                    application_version_value,
+                )
+            )
+            seen_components.add(component_id)
+            break
+
+    return results
+
+
 def generic_compose_candidate(candidate_path, base_path, candidate_name, warnings):
     compose_files = []
     images = []
@@ -1339,6 +1767,21 @@ KNOWN_REGIONAL_COMPOSE_REPOSITORIES = PSIM2_EDM_REPOSITORIES + (
     MSWIA_EREJ_REPOSITORY,
     EREJESTRACJA_REPOSITORY,
 )
+CATALOG_SPECIALIST_COMPOSE_COMPONENTS = {
+    COMPOSE_SINGLE_COMPONENTS["ekrn"]: "ekrn",
+    COMPOSE_SINGLE_COMPONENTS["ozr"]: "p1-ozr-provider",
+    COMPOSE_SINGLE_COMPONENTS["vitreo"]: "cpi-szrp-services",
+    EREJESTRACJA_REPOSITORY: "pi-p1-erejestracja-provider",
+    PSIM2_EPN_REPOSITORY: "pi-psim2-epn-provider",
+    PSIM2_EREJ_REPOSITORY: "pi-psim-2-provider",
+    MSWIA_EANALIZY_REPOSITORY: "pi-mswia-eanalizy",
+    MSWIA_EREJ_REPOSITORY: "pi-mswia-provider",
+    "hazelcast/hazelcast": "hazelcast",
+    "hazelcast/management-center": "hazelcast-management-center",
+}
+CATALOG_SPECIALIST_ZM_COMPONENTS = dict(
+    (source_key, name) for name, source_key in ZM_COMPONENTS
+)
 
 
 def application_candidate(name, candidate_path, fields):
@@ -1350,6 +1793,89 @@ def application_candidate(name, candidate_path, fields):
         "status": "candidate",
         "fields": fields,
     }
+
+
+def add_catalog_source_metadata(version, component_id, selector, evidence_kind):
+    """Add the C2A provenance contract without removing legacy fields."""
+    version["component_id"] = component_id
+    version["rule_id"] = CATALOG_RULE_ID_PREFIX + component_id
+    if "source_key" not in version:
+        version["source_key"] = selector
+    version["source_selector"] = selector
+    if "source_state" not in version:
+        version["source_state"] = "active"
+    version["evidence_kind"] = evidence_kind
+
+
+def enrich_specialist_catalog_metadata(candidates):
+    """Add catalog provenance to exact established detectors, in place."""
+    for candidate in candidates:
+        fields = candidate.get("fields")
+        if not isinstance(fields, dict):
+            continue
+        version = fields.get("application_version")
+        if isinstance(version, dict) and "component_id" not in version:
+            kind = version.get("kind")
+            source_key = version.get("source_key")
+            component_id = None
+            selector = source_key
+            evidence_kind = "local_specialist_detector"
+            if kind == "amms_build":
+                component_id = "amms"
+                selector = "$.buildNumber"
+                evidence_kind = "local_nested_archive_json"
+            elif kind == "maven":
+                component_id = "integration-platform"
+                selector = "version"
+                evidence_kind = "local_maven_metadata"
+            elif kind == "mpi_env":
+                component_id = "mpi"
+            elif kind == "edm_env":
+                component_id = "amdx"
+            elif kind == "p1adapter_env":
+                component_id = "p1-adapter"
+            elif kind == "mswia_edm":
+                component_id = "mswia-edm"
+            elif kind == "zm_env":
+                component_id = CATALOG_SPECIALIST_ZM_COMPONENTS.get(source_key)
+            elif kind == "compose_image":
+                component_id = CATALOG_SPECIALIST_COMPOSE_COMPONENTS.get(source_key)
+            if component_id is not None and selector is not None:
+                add_catalog_source_metadata(
+                    version,
+                    component_id,
+                    selector,
+                    evidence_kind,
+                )
+
+        if fields.get("product_identity") == {
+            "kind": "psim2_edm",
+            "source_key": "PSIM2_EDM",
+        }:
+            for component in fields.get("components", ()):
+                if not isinstance(component, dict):
+                    continue
+                selector = component.get("source_key")
+                if selector is None:
+                    continue
+                add_catalog_source_metadata(
+                    component,
+                    "psim2-edm",
+                    selector,
+                    "local_psim2_env_signature",
+                )
+
+        if candidate.get("candidate_type") == "integration_platform":
+            for webapp in fields.get("webapps", ()):
+                if not isinstance(webapp, dict) or "version" not in webapp:
+                    continue
+                add_catalog_source_metadata(
+                    webapp,
+                    "integration-platform",
+                    "version",
+                    "local_maven_metadata",
+                )
+    return candidates
 
 
 def psim2_edm_candidate(candidate_path, base_path, warnings, compose_files):
@@ -1744,6 +2270,7 @@ def collect_application_candidates(
             normalized_bases.append(normalized)
     base_set = set(normalized_bases)
     seen_directories = set()
+    seen_catalog_sources = set()
     visited_directories = [0]
     directory_limit_warned = [False]
     depth_limit_warned = [False]
@@ -1772,6 +2299,24 @@ def collect_application_candidates(
             return False
 
         before_count = len(candidates)
+        catalog_candidates = collect_catalog_application_candidates(child, base)
+        if catalog_candidates:
+            nested_source = False
+            for catalog_candidate in catalog_candidates:
+                application_version_value = catalog_candidate["fields"]["application_version"]
+                source_path = os.path.normpath(application_version_value["source_path"])
+                detection_key = (
+                    application_version_value["rule_id"],
+                    source_path,
+                )
+                if detection_key not in seen_catalog_sources:
+                    seen_catalog_sources.add(detection_key)
+                    candidates.append(catalog_candidate)
+                relative_source = os.path.relpath(source_path, child)
+                if os.sep in relative_source:
+                    nested_source = True
+            return "catalog_nested" if nested_source else True
+
         regional_detection = classify_known_regional_compose(
             child, base, candidate_name, warnings
         )
@@ -1955,9 +2500,10 @@ def collect_application_candidates(
                 continue
             detected = inspect_candidate(child, base)
             if detected:
-                if depth == 0:
+                if depth == 0 and detected != "catalog_nested":
                     pending = []
-                continue
+                if detected != "catalog_nested":
+                    continue
             if os.path.islink(child):
                 continue
             if depth >= MAX_APPLICATION_SCAN_DEPTH:
@@ -1971,7 +2517,7 @@ def collect_application_candidates(
             for nested_name in reversed(list_children(child)):
                 pending.append((os.path.join(child, nested_name), depth + 1))
 
-    return candidates
+    return enrich_specialist_catalog_metadata(candidates)
 
 
 def collect_report(
