@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-from __future__ import print_function
-
 """Generate a bounded, read-only Linux inventory report."""
+
+from __future__ import print_function
 
 import argparse
 import errno
@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.19"
+COLLECTOR_VERSION = "0.1.20"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -101,7 +101,6 @@ CATALOG_ENV_RULES = (
     ("si-adm-nbk", "docker-compose.yml", ".env", "PI_VERSION", ("si-adm-nbk",)),
     ("si-ai-services", "docker-compose.yml", ".env", "PI_VERSION", ("si-ai-services",)),
     ("si-amms-push-service", "docker-compose.yml", ".env", "PI_VERSION", ("si-amms-push-service",)),
-    ("si-amms-services", "docker-compose.yml", ".env", "PI_VERSION", ("si-amms-services",)),
     ("si-athos", "docker-compose.yml", ".env", "PI_VERSION", ("si-athos",)),
     ("si-auth-service", "docker-compose.yml", ".env", "PI_VERSION", ("si-auth-service",)),
     ("si-certificate", "docker-compose.yml", ".env", "PI_VERSION", ("si-certificate",)),
@@ -133,6 +132,21 @@ CATALOG_ENV_RULES = (
     ("si-teryt-service", "docker-compose.yml", ".env", "PI_VERSION", ("si-teryt-service",)),
     ("si-topsor", "docker-compose.yml", ".env", "PI_VERSION", ("si-topsor",)),
     ("si-zsmopl-integration-multiclient", "docker-compose.yml", ".env", "PI_VERSION", ("si-zsmopl-integration-multiclient",)),
+)
+
+# Component-specific ENV variants whose identity additionally requires one exact
+# Compose service. Multiple rows may represent one component; seen_components
+# keeps the emitted observation singular when layouts overlap.
+# component_id, Compose path, ENV path, exact tag variable, aliases, exact service.
+CATALOG_EXACT_SERVICE_ENV_RULES = (
+    (
+        "si-amms-services", "docker-compose.yml", ".env",
+        "ASVC_SERVICE_VERSION", ("si-amms-services",), "si-amms-services-app",
+    ),
+    (
+        "si-amms-services", "docker-compose.yml", ".env",
+        "PI_VERSION", ("si-amms-services",), "si-amms-services",
+    ),
 )
 
 # component_id, Compose path, exact direct service name. The repeated SDIP id
@@ -1200,7 +1214,16 @@ def collect_catalog_application_candidates(candidate_path, base_path):
             compose_cache[path] = read_catalog_compose_services(path)
         return compose_cache[path]
 
-    for component_id, compose_relative, env_relative, variable, aliases in CATALOG_ENV_RULES:
+    env_rules = tuple(rule + (None,) for rule in CATALOG_ENV_RULES)
+    env_rules += CATALOG_EXACT_SERVICE_ENV_RULES
+    for (
+        component_id,
+        compose_relative,
+        env_relative,
+        variable,
+        aliases,
+        exact_service,
+    ) in env_rules:
         if component_id in seen_components:
             continue
         if not catalog_directory_matches(candidate_path, aliases):
@@ -1212,11 +1235,18 @@ def collect_catalog_application_candidates(candidate_path, base_path):
             recognized, services = compose_services(compose_path)
             if not recognized:
                 continue
-            if any(
-                not is_catalog_infrastructure_service(service)
-                and variable in catalog_tag_variables(image, quote)
-                for service, (image, quote) in services.items()
-            ):
+            if exact_service is None:
+                has_binding = any(
+                    not is_catalog_infrastructure_service(service)
+                    and variable in catalog_tag_variables(image, quote)
+                    for service, (image, quote) in services.items()
+                )
+            else:
+                service_image = services.get(exact_service)
+                has_binding = service_image is not None and variable in (
+                    catalog_tag_variables(service_image[0], service_image[1])
+                )
+            if has_binding:
                 matched_compose_path = compose_path
                 break
         if matched_compose_path is None:

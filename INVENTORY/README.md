@@ -83,9 +83,19 @@ itgo-inv schedule-run-now
 
 Commands that change systemd state run directly as root or through `sudo` otherwise.
 
+## Python runtime
+
+The collector requires Python 3.6 or newer (it uses `os.scandir()` iterators with `close()`, `str.casefold()` and `os.cpu_count()`); Python 2.7 cannot run it.
+
+- On fresh installation and on upgrade the installer first looks for a compatible interpreter (`python3`, then `python3.13` … `python3.6`). An existing compatible Python 3 is used as it is: no package is installed or upgraded.
+- When none exists, the installer installs the distribution package from the repositories already configured on the system: `python3` (fallback `python36`) through `dnf`/`yum` on RHEL, Oracle Linux, Rocky Linux and AlmaLinux, `python3` through `apt-get` on Debian and Ubuntu. On Oracle Linux 7 this is Python 3.6.8 from `ol7_latest`, installed side by side with the system Python 2.7.
+- `/usr/bin/python`, alternatives and Python 2 are never changed or removed by INVENTORY. An installed but too old `python3` package is not upgraded.
+- If Python 3.6+ cannot be provided, the installer stops with an error before changing anything; existing files, configuration, schedule and reports are kept. After installation the installer verifies that the installed collector starts and fails otherwise.
+- `itgo-inv collect` runs the collector only with Python 3.6+ and reports a clear error otherwise; `itgo-inv version` shows the selected Python runtime.
+
 ## Collector scope
 
-The current collector version is 0.1.15. It runs read-only and is compatible with Python 2.7 and Python 3.x.
+The current collector version is 0.1.15. It runs read-only and requires Python 3.6 or newer.
 
 The host section of the report includes:
 
