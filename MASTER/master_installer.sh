@@ -37,7 +37,7 @@ set -euo pipefail 2>/dev/null || set -eu
 # - Cleans downloaded *.sh from TMP at the end (asks).
 # - Bash backups are kept as single .bak files (no timestamp pile-up).
 # ==========================================================
-MASTER_VERSION="1.2.148"
+MASTER_VERSION="1.2.149"
 
 # >>> AUTO-MODULE-VERSIONS START >>>
 STATUS_VERSION="3.12.28"
@@ -46,7 +46,7 @@ TSEQ_VERSION="3.12.9"
 DOWNLOADER_APP_VERSION="1.0.10"
 UPGBUILDER_VERSION="0.1.14"
 SERVICEGUARD_VERSION="0.1.7"
-INVENTORY_VERSION="0.1.26"
+INVENTORY_VERSION="0.1.27"
 P1CERT_VERSION="0.1.19"
 LOGGUARD_VERSION="0.2.4"
 
@@ -422,13 +422,23 @@ module_has_runtime_dependencies() {
   esac
 }
 
+# The INVENTORY collector requires Python 3.6+ (os.scandir() iterator close(),
+# str.casefold(), os.cpu_count()); Python 2 cannot run it.  Keep the candidate
+# list and the probe aligned with collector_python_command in INVENTORY/itgo-inv
+# and inv_find_python in INVENTORY/inventory_installer_public.sh.
+INVENTORY_PYTHON_MIN_LABEL="3.6"
+INVENTORY_PYTHON_PROBE='import sys
+if sys.version_info[:2] < (3, 6):
+    sys.exit(1)
+import argparse, errno, json, os, re, shlex, subprocess, tempfile, time, zipfile
+sys.exit(0 if hasattr(os, "scandir") else 1)'
+
 inventory_python_command() {
   local candidate
 
-  # Keep this order aligned with INVENTORY/itgo-inv.
-  for candidate in python3 python3.11 python3.9 python3.8 python3.7 python3.6 python python2 python2.7; do
+  for candidate in python3 python3.13 python3.12 python3.11 python3.10 python3.9 python3.8 python3.7 python3.6; do
     if command -v "$candidate" >/dev/null 2>&1 \
-      && "$candidate" -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then
+      && "$candidate" -I -c "$INVENTORY_PYTHON_PROBE" >/dev/null 2>&1; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -451,7 +461,7 @@ verify_module_runtime_dependencies() {
   local module="${1:?}" pkg
 
   if [[ "$module" == "INVENTORY" ]] && ! inventory_python_command >/dev/null; then
-    echo "[$(ts)] ERROR: INVENTORY requires a working supported Python interpreter."
+    echo "[$(ts)] ERROR: INVENTORY requires Python ${INVENTORY_PYTHON_MIN_LABEL} or newer (python3); no compatible interpreter found."
     return 1
   fi
 
@@ -475,7 +485,14 @@ ensure_module_runtime_dependencies() {
   local module="${1:?}" pkg inventory_python_missing="0"
   local missing=()
 
+  # A compatible Python 3 is used as it is.  Without one, python3 is installed
+  # side by side with Python 2 (no /usr/bin/python or alternatives changes); an
+  # installed but too old python3 package is never upgraded implicitly.
   if [[ "$module" == "INVENTORY" ]] && ! inventory_python_command >/dev/null; then
+    if pkg_installed python3 2>/dev/null; then
+      echo "[$(ts)] ERROR: package python3 is installed, but provides no compatible Python ${INVENTORY_PYTHON_MIN_LABEL}+ for INVENTORY; it is not upgraded automatically. Install Python ${INVENTORY_PYTHON_MIN_LABEL}+ manually."
+      return 1
+    fi
     inventory_python_missing="1"
     missing+=(python3)
   fi
@@ -508,9 +525,9 @@ ensure_module_runtime_dependencies() {
   fi
 
   if [[ "$inventory_python_missing" == "1" ]]; then
-    if ! command -v python3 >/dev/null 2>&1 \
-      || ! python3 -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then
-      echo "[$(ts)] ERROR: package python3 was installed for INVENTORY, but python3 is not working."
+    hash -r 2>/dev/null || true
+    if ! inventory_python_command >/dev/null; then
+      echo "[$(ts)] ERROR: package python3 was installed for INVENTORY, but no compatible Python ${INVENTORY_PYTHON_MIN_LABEL}+ interpreter is available."
       return 1
     fi
   fi
@@ -1217,7 +1234,7 @@ module_health_for_module() {
         && -x "$ITGO_HOME/UTILITY/INVENTORY/bin/collect_inventory.py" \
         && -d "$ITGO_HOME/UTILITY/INVENTORY/reports" \
         && -d "$ITGO_HOME/UTILITY/INVENTORY/logs" \
-        && -L /usr/local/bin/itgo-inv ]] && echo "OK" || echo "BROKEN"
+        && -L /usr/local/bin/itgo-inv ]] && inventory_python_command >/dev/null && echo "OK" || echo "BROKEN"
       ;;
     P1CERT)
       # The ezdrowie integration (root helper and its sudoers entry) belongs
@@ -4952,8 +4969,7 @@ install_inventory_step() {
         [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
 
         download_inventory_payload "$inventory_dir"
-        run_module_root "$inventory_sh" "$TARGET_USER"
-        echo "[$(ts)] OK: INVENTORY done."
+        run_inventory_installer "$inventory_sh"
       else
         echo "[$(ts)] SKIP: INVENTORY."
       fi
@@ -4978,10 +4994,27 @@ install_inventory_step() {
       [[ -d "$TMP_DIR" ]] || install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$TMP_DIR"
 
       download_inventory_payload "$inventory_dir"
-      run_module_root "$inventory_sh" "$TARGET_USER"
-      echo "[$(ts)] OK: INVENTORY done."
+      run_inventory_installer "$inventory_sh"
     fi
   fi
+}
+
+# The INVENTORY installer ensures Python 3.6+ itself and verifies that the
+# installed collector starts; any failure stops MASTER instead of reporting OK.
+run_inventory_installer() {
+  local inventory_sh="${1:?}"
+
+  if ! run_module_root "$inventory_sh" "$TARGET_USER"; then
+    echo "[$(ts)] ERROR: INVENTORY installer failed (Python ${INVENTORY_PYTHON_MIN_LABEL}+ runtime or collector verification); INVENTORY is not operational."
+    add_summary "INVENTORY: ERROR (installer failed; Python ${INVENTORY_PYTHON_MIN_LABEL}+ runtime or collector not working)"
+    exit 1
+  fi
+  if ! inventory_python_command >/dev/null; then
+    echo "[$(ts)] ERROR: INVENTORY installed, but no compatible Python ${INVENTORY_PYTHON_MIN_LABEL}+ interpreter is available."
+    add_summary "INVENTORY: ERROR (no compatible Python ${INVENTORY_PYTHON_MIN_LABEL}+)"
+    exit 1
+  fi
+  echo "[$(ts)] OK: INVENTORY done."
 }
 
 # P1CERT is always installed from a root-only staging directory below /run
