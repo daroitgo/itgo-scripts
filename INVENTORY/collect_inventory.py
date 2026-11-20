@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.20"
+COLLECTOR_VERSION = "0.1.21"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -65,9 +65,9 @@ COMPOSE_FILENAMES = (
 # Only matrix entries with readiness=ready are included here. Product entries
 # remain implemented by the established specialist detectors below.
 CATALOG_SCHEMA_VERSION = "1.0"
-CATALOG_READY_MATRIX_RULE_COUNT = 69
+CATALOG_READY_MATRIX_RULE_COUNT = 70
 CATALOG_READY_PRODUCT_RULE_COUNT = 10
-CATALOG_UNRESOLVED_RULE_COUNT = 10
+CATALOG_UNRESOLVED_RULE_COUNT = 9
 CATALOG_RULE_ID_PREFIX = "version-source-catalog-1.0:"
 CATALOG_READY_PRODUCT_RULE_IDS = (
     "amdx", "amms", "hazelcast", "hazelcast-management-center",
@@ -76,7 +76,7 @@ CATALOG_READY_PRODUCT_RULE_IDS = (
 )
 CATALOG_UNRESOLVED_RULE_IDS = (
     "athos-mobit", "cpi-mpi-services", "hl7-proxy", "pi-hurtownie-provider",
-    "pi-wwks2", "si-aism", "si-crt-provider", "si-zsmopl-integration", "lab",
+    "pi-wwks2", "si-crt-provider", "si-zsmopl-integration", "lab",
     "nbk",
 )
 CATALOG_INFRASTRUCTURE_SERVICE_NAMES = frozenset((
@@ -146,6 +146,24 @@ CATALOG_EXACT_SERVICE_ENV_RULES = (
     (
         "si-amms-services", "docker-compose.yml", ".env",
         "PI_VERSION", ("si-amms-services",), "si-amms-services",
+    ),
+)
+
+# One matrix component whose authoritative version is shared by two application
+# services. Both exact services must bind their own exact ENV variable directly
+# in the image tag. A singular version is emitted only when both local values
+# agree; otherwise both observations are retained as an explicit ambiguity.
+# component_id, Compose path, ENV path, aliases, ((service, variable), ...).
+CATALOG_PAIRED_ENV_RULES = (
+    (
+        "si-aism",
+        "si-aism/docker-compose.yml",
+        "si-aism/.env",
+        ("si-aism",),
+        (
+            ("asi-backend", "ASI_BACKEND_SERVICE_VERSION"),
+            ("asi-frontend", "ASI_FRONTEND_SERVICE_VERSION"),
+        ),
     ),
 )
 
@@ -1184,22 +1202,28 @@ def catalog_application_version(
     }
 
 
-def catalog_component_candidate(component_id, candidate_path, base_path, version):
+def catalog_component_candidate(
+    component_id, candidate_path, base_path, version, extra_fields=None
+):
+    fields = {
+        "base_path": base_path,
+        "matched_hint": "catalog_rule",
+        "product_identity": {
+            "kind": "catalog_component",
+            "source_key": component_id,
+        },
+    }
+    if version is not None:
+        fields["application_version"] = version
+    if extra_fields:
+        fields.update(extra_fields)
     return {
         "source": "filesystem_allowlist",
         "source_path": candidate_path,
         "name": component_id,
         "candidate_type": "catalog_component",
         "status": "candidate",
-        "fields": {
-            "base_path": base_path,
-            "matched_hint": "catalog_rule",
-            "product_identity": {
-                "kind": "catalog_component",
-                "source_key": component_id,
-            },
-            "application_version": version,
-        },
+        "fields": fields,
     }
 
 
@@ -1281,6 +1305,94 @@ def collect_catalog_application_candidates(candidate_path, base_path):
                 candidate_path,
                 base_path,
                 application_version_value,
+            )
+        )
+        seen_components.add(component_id)
+
+    for (
+        component_id,
+        compose_relative,
+        env_relative,
+        aliases,
+        bindings,
+    ) in CATALOG_PAIRED_ENV_RULES:
+        if component_id in seen_components:
+            continue
+        if not catalog_directory_matches(candidate_path, aliases):
+            continue
+        matched_compose_path = None
+        for compose_path in catalog_path_candidates(candidate_path, compose_relative):
+            recognized, services = compose_services(compose_path)
+            if not recognized:
+                continue
+            if all(
+                service in services
+                and variable
+                in catalog_tag_variables(
+                    services[service][0],
+                    services[service][1],
+                )
+                for service, variable in bindings
+            ):
+                matched_compose_path = compose_path
+                break
+        if matched_compose_path is None:
+            continue
+
+        variables = tuple(variable for _service, variable in bindings)
+        matched_env_path = None
+        values = None
+        for env_path in catalog_path_candidates(candidate_path, env_relative):
+            candidate_values = read_allowlisted_env_values(env_path, variables)
+            if all(
+                variable in candidate_values
+                and re.match(
+                    r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z",
+                    candidate_values[variable],
+                )
+                is not None
+                for variable in variables
+            ):
+                matched_env_path = env_path
+                values = candidate_values
+                break
+        if matched_env_path is None or values is None:
+            continue
+
+        observations = []
+        for service, variable in bindings:
+            observations.append(
+                {
+                    "service": service,
+                    "selector": variable,
+                    "version": values[variable],
+                    "source_path": matched_env_path,
+                    "compose_path": matched_compose_path,
+                    "image_selector": "services.{}.image.tag".format(service),
+                }
+            )
+        distinct_versions = set(item["version"] for item in observations)
+        resolution = "matched" if len(distinct_versions) == 1 else "ambiguous"
+        application_version_value = None
+        if resolution == "matched":
+            application_version_value = catalog_application_version(
+                component_id,
+                "catalog_env",
+                observations[0]["version"],
+                matched_env_path,
+                "+".join(variables),
+                "local_compose_env_bindings_equal",
+            )
+        results.append(
+            catalog_component_candidate(
+                component_id,
+                candidate_path,
+                base_path,
+                application_version_value,
+                {
+                    "catalog_version_observations": observations,
+                    "catalog_version_resolution": resolution,
+                },
             )
         )
         seen_components.add(component_id)
@@ -2333,18 +2445,32 @@ def collect_application_candidates(
         if catalog_candidates:
             nested_source = False
             for catalog_candidate in catalog_candidates:
-                application_version_value = catalog_candidate["fields"]["application_version"]
-                source_path = os.path.normpath(application_version_value["source_path"])
-                detection_key = (
-                    application_version_value["rule_id"],
-                    source_path,
+                catalog_fields = catalog_candidate["fields"]
+                application_version_value = catalog_fields.get("application_version")
+                if isinstance(application_version_value, dict):
+                    source_paths = (application_version_value["source_path"],)
+                    rule_id = application_version_value["rule_id"]
+                else:
+                    source_paths = tuple(
+                        observation["source_path"]
+                        for observation in catalog_fields.get(
+                            "catalog_version_observations", ()
+                        )
+                        if isinstance(observation, dict)
+                        and "source_path" in observation
+                    )
+                    rule_id = CATALOG_RULE_ID_PREFIX + catalog_candidate["name"]
+                normalized_source_paths = tuple(
+                    os.path.normpath(source_path) for source_path in source_paths
                 )
+                detection_key = (rule_id, normalized_source_paths)
                 if detection_key not in seen_catalog_sources:
                     seen_catalog_sources.add(detection_key)
                     candidates.append(catalog_candidate)
-                relative_source = os.path.relpath(source_path, child)
-                if os.sep in relative_source:
-                    nested_source = True
+                for source_path in normalized_source_paths:
+                    relative_source = os.path.relpath(source_path, child)
+                    if os.sep in relative_source:
+                        nested_source = True
             return "catalog_nested" if nested_source else True
 
         regional_detection = classify_known_regional_compose(
