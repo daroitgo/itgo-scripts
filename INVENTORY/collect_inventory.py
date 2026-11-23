@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.21"
+COLLECTOR_VERSION = "0.1.22"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -65,9 +65,9 @@ COMPOSE_FILENAMES = (
 # Only matrix entries with readiness=ready are included here. Product entries
 # remain implemented by the established specialist detectors below.
 CATALOG_SCHEMA_VERSION = "1.0"
-CATALOG_READY_MATRIX_RULE_COUNT = 70
+CATALOG_READY_MATRIX_RULE_COUNT = 71
 CATALOG_READY_PRODUCT_RULE_COUNT = 10
-CATALOG_UNRESOLVED_RULE_COUNT = 9
+CATALOG_UNRESOLVED_RULE_COUNT = 8
 CATALOG_RULE_ID_PREFIX = "version-source-catalog-1.0:"
 CATALOG_READY_PRODUCT_RULE_IDS = (
     "amdx", "amms", "hazelcast", "hazelcast-management-center",
@@ -76,8 +76,7 @@ CATALOG_READY_PRODUCT_RULE_IDS = (
 )
 CATALOG_UNRESOLVED_RULE_IDS = (
     "athos-mobit", "cpi-mpi-services", "hl7-proxy", "pi-hurtownie-provider",
-    "pi-wwks2", "si-crt-provider", "si-zsmopl-integration", "lab",
-    "nbk",
+    "pi-wwks2", "si-crt-provider", "lab", "nbk",
 )
 CATALOG_INFRASTRUCTURE_SERVICE_NAMES = frozenset((
     "db", "database", "cache", "postgres", "postgresql", "redis",
@@ -149,6 +148,16 @@ CATALOG_EXACT_SERVICE_ENV_RULES = (
     ),
 )
 
+# Exact-service ENV rules whose service/Compose evidence is part of the emitted
+# contract and is independently allowlisted by the backend.
+CATALOG_STRICT_SERVICE_ENV_RULES = (
+    (
+        "si-zsmopl-integration", "docker-compose.yml", ".env",
+        "PI_VERSION", ("si-zsmopl-integration",),
+        "si-zsmopl-integration-app",
+    ),
+)
+
 # One matrix component whose authoritative version is shared by two application
 # services. Both exact services must bind their own exact ENV variable directly
 # in the image tag. A singular version is emitted only when both local values
@@ -163,6 +172,56 @@ CATALOG_PAIRED_ENV_RULES = (
         (
             ("asi-backend", "ASI_BACKEND_SERVICE_VERSION"),
             ("asi-frontend", "ASI_FRONTEND_SERVICE_VERSION"),
+        ),
+    ),
+)
+
+# Installer module metadata is distinct from the executable technology image
+# tag. Identity requires the exact installation directory and Compose service;
+# every allowlisted metadata value must be present, valid and equal. Unequal
+# values are retained as an ambiguity rather than choosing one source.
+# component_id, Compose path, aliases, exact service,
+# ((source role, ENV path, selector), ...).
+CATALOG_MODULE_METADATA_RULES = (
+    (
+        "si-aism-db",
+        "si-aism-db/docker-compose.yml",
+        ("si-aism-db",),
+        "asi-db",
+        (
+            ("application_module", "si-aism-db/common.env", "APP_VERSION"),
+            (
+                "installer_module",
+                "si-aism-db/installer.env",
+                "INSTALL_ENV_MODULE_VERSION",
+            ),
+        ),
+    ),
+    (
+        "si-aism-keycloak",
+        "si-aism-keycloak/docker-compose.yml",
+        ("si-aism-keycloak",),
+        "keycloak",
+        (
+            ("application_module", "si-aism-keycloak/common.env", "APP_VERSION"),
+            (
+                "installer_module",
+                "si-aism-keycloak/installer.env",
+                "INSTALL_ENV_MODULE_VERSION",
+            ),
+        ),
+    ),
+    (
+        "si-reverse-proxy",
+        "si-reverse-proxy/docker-compose.yml",
+        ("si-reverse-proxy",),
+        "nginx",
+        (
+            (
+                "installer_module",
+                "si-reverse-proxy/installer.env",
+                "INSTALL_ENV_MODULE_VERSION",
+            ),
         ),
     ),
 )
@@ -192,9 +251,6 @@ CATALOG_LITERAL_RULES = (
     ("pi-psim-2-provider", "e-Rejestracja_e-Kontrahent/docker-compose.yml", "pi-psim-2-provider"),
     ("pi-sam", "docker-compose.yml", "pi-sam-provider"),
     ("pi-steryl", "docker-compose.yml", "pi-steryl"),
-    ("si-aism-db", "si-aism-db/docker-compose.yml", "asi-db"),
-    ("si-aism-keycloak", "si-aism-keycloak/docker-compose.yml", "keycloak"),
-    ("si-reverse-proxy", "si-reverse-proxy/docker-compose.yml", "nginx"),
 )
 DOCKER_EXACT_HINTS = {
     "zm_docker",
@@ -1238,8 +1294,9 @@ def collect_catalog_application_candidates(candidate_path, base_path):
             compose_cache[path] = read_catalog_compose_services(path)
         return compose_cache[path]
 
-    env_rules = tuple(rule + (None,) for rule in CATALOG_ENV_RULES)
-    env_rules += CATALOG_EXACT_SERVICE_ENV_RULES
+    env_rules = tuple(rule + (None, False) for rule in CATALOG_ENV_RULES)
+    env_rules += tuple(rule + (False,) for rule in CATALOG_EXACT_SERVICE_ENV_RULES)
+    env_rules += tuple(rule + (True,) for rule in CATALOG_STRICT_SERVICE_ENV_RULES)
     for (
         component_id,
         compose_relative,
@@ -1247,6 +1304,7 @@ def collect_catalog_application_candidates(candidate_path, base_path):
         variable,
         aliases,
         exact_service,
+        strict_service_evidence,
     ) in env_rules:
         if component_id in seen_components:
             continue
@@ -1297,14 +1355,28 @@ def collect_catalog_application_candidates(candidate_path, base_path):
             version,
             env_path,
             variable,
-            "local_compose_env_binding",
+            (
+                "local_exact_service_compose_env_binding"
+                if strict_service_evidence
+                else "local_compose_env_binding"
+            ),
         )
+        extra_fields = None
+        if strict_service_evidence:
+            extra_fields = {
+                "catalog_compose_binding": {
+                    "service": exact_service,
+                    "compose_path": matched_compose_path,
+                    "image_selector": "services.{}.image.tag".format(exact_service),
+                }
+            }
         results.append(
             catalog_component_candidate(
                 component_id,
                 candidate_path,
                 base_path,
                 application_version_value,
+                extra_fields,
             )
         )
         seen_components.add(component_id)
@@ -1391,6 +1463,84 @@ def collect_catalog_application_candidates(candidate_path, base_path):
                 application_version_value,
                 {
                     "catalog_version_observations": observations,
+                    "catalog_version_resolution": resolution,
+                },
+            )
+        )
+        seen_components.add(component_id)
+
+    for (
+        component_id,
+        compose_relative,
+        aliases,
+        exact_service,
+        metadata_sources,
+    ) in CATALOG_MODULE_METADATA_RULES:
+        if component_id in seen_components:
+            continue
+        if not catalog_directory_matches(candidate_path, aliases):
+            continue
+        matched_compose_path = None
+        for compose_path in catalog_path_candidates(candidate_path, compose_relative):
+            recognized, services = compose_services(compose_path)
+            if recognized and exact_service in services:
+                matched_compose_path = compose_path
+                break
+        if matched_compose_path is None:
+            continue
+
+        observations = []
+        metadata_complete = True
+        for source_role, env_relative, variable in metadata_sources:
+            matched_env_path = None
+            version = None
+            for env_path in catalog_path_candidates(candidate_path, env_relative):
+                values = read_allowlisted_env_values(env_path, (variable,))
+                candidate_version = values.get(variable)
+                if candidate_version is None or re.match(
+                    r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z",
+                    candidate_version,
+                ) is None:
+                    continue
+                matched_env_path = env_path
+                version = candidate_version
+                break
+            if matched_env_path is None or version is None:
+                metadata_complete = False
+                break
+            observations.append(
+                {
+                    "source_role": source_role,
+                    "service": exact_service,
+                    "selector": variable,
+                    "version": version,
+                    "source_path": matched_env_path,
+                    "compose_path": matched_compose_path,
+                }
+            )
+        if not metadata_complete:
+            continue
+
+        distinct_versions = set(item["version"] for item in observations)
+        resolution = "matched" if len(distinct_versions) == 1 else "ambiguous"
+        application_version_value = None
+        if resolution == "matched":
+            application_version_value = catalog_application_version(
+                component_id,
+                "catalog_env",
+                observations[0]["version"],
+                observations[0]["source_path"],
+                "+".join(item["selector"] for item in observations),
+                "local_module_metadata_values",
+            )
+        results.append(
+            catalog_component_candidate(
+                component_id,
+                candidate_path,
+                base_path,
+                application_version_value,
+                {
+                    "catalog_module_version_observations": observations,
                     "catalog_version_resolution": resolution,
                 },
             )
