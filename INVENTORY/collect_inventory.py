@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.22"
+COLLECTOR_VERSION = "0.1.23"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -214,7 +214,7 @@ CATALOG_MODULE_METADATA_RULES = (
     (
         "si-reverse-proxy",
         "si-reverse-proxy/docker-compose.yml",
-        ("si-reverse-proxy",),
+        ("si-reverse-proxy", "si-aism-reverse-proxy"),
         "nginx",
         (
             (
@@ -1208,7 +1208,7 @@ def is_catalog_infrastructure_service(service):
     return any(part in CATALOG_INFRASTRUCTURE_SERVICE_NAMES for part in parts)
 
 
-def catalog_path_candidates(candidate_path, relative_path):
+def catalog_path_candidates(candidate_path, relative_path, aliases=None):
     """Resolve a fixed catalog path at a package root or at its named subroot."""
     if (
         not relative_path
@@ -1220,10 +1220,21 @@ def catalog_path_candidates(candidate_path, relative_path):
     normalized = os.path.normpath(relative_path)
     results = [os.path.join(candidate_path, normalized)]
     parts = normalized.split(os.sep)
-    if (
+    candidate_name = os.path.basename(candidate_path)
+    direct_root_match = (
         len(parts) > 1
-        and parts[0].casefold() == os.path.basename(candidate_path).casefold()
-    ):
+        and parts[0].casefold().replace("_", "-")
+        == candidate_name.casefold().replace("_", "-")
+    )
+    if len(parts) > 1 and aliases is not None:
+        approved_aliases = tuple(
+            alias.casefold().replace("_", "-") for alias in aliases
+        )
+        direct_root_match = (
+            catalog_directory_matches(candidate_path, aliases)
+            and parts[0].casefold().replace("_", "-") in approved_aliases
+        )
+    if direct_root_match:
         direct_path = os.path.join(candidate_path, *parts[1:])
         if direct_path not in results:
             results.append(direct_path)
@@ -1234,7 +1245,10 @@ def catalog_directory_matches(candidate_path, aliases):
     if aliases is None:
         return True
     name = os.path.basename(candidate_path).casefold().replace("_", "-")
-    return name in tuple(alias.casefold().replace("_", "-") for alias in aliases)
+    approved_aliases = tuple(
+        alias.casefold().replace("_", "-") for alias in aliases
+    )
+    return name in approved_aliases
 
 
 def catalog_application_version(
@@ -1310,8 +1324,10 @@ def collect_catalog_application_candidates(candidate_path, base_path):
             continue
         if not catalog_directory_matches(candidate_path, aliases):
             continue
-        compose_paths = catalog_path_candidates(candidate_path, compose_relative)
-        env_paths = catalog_path_candidates(candidate_path, env_relative)
+        compose_paths = catalog_path_candidates(
+            candidate_path, compose_relative, aliases
+        )
+        env_paths = catalog_path_candidates(candidate_path, env_relative, aliases)
         matched_compose_path = None
         for compose_path in compose_paths:
             recognized, services = compose_services(compose_path)
@@ -1393,7 +1409,9 @@ def collect_catalog_application_candidates(candidate_path, base_path):
         if not catalog_directory_matches(candidate_path, aliases):
             continue
         matched_compose_path = None
-        for compose_path in catalog_path_candidates(candidate_path, compose_relative):
+        for compose_path in catalog_path_candidates(
+            candidate_path, compose_relative, aliases
+        ):
             recognized, services = compose_services(compose_path)
             if not recognized:
                 continue
@@ -1414,7 +1432,7 @@ def collect_catalog_application_candidates(candidate_path, base_path):
         variables = tuple(variable for _service, variable in bindings)
         matched_env_path = None
         values = None
-        for env_path in catalog_path_candidates(candidate_path, env_relative):
+        for env_path in catalog_path_candidates(candidate_path, env_relative, aliases):
             candidate_values = read_allowlisted_env_values(env_path, variables)
             if all(
                 variable in candidate_values
@@ -1481,7 +1499,9 @@ def collect_catalog_application_candidates(candidate_path, base_path):
         if not catalog_directory_matches(candidate_path, aliases):
             continue
         matched_compose_path = None
-        for compose_path in catalog_path_candidates(candidate_path, compose_relative):
+        for compose_path in catalog_path_candidates(
+            candidate_path, compose_relative, aliases
+        ):
             recognized, services = compose_services(compose_path)
             if recognized and exact_service in services:
                 matched_compose_path = compose_path
@@ -1494,7 +1514,9 @@ def collect_catalog_application_candidates(candidate_path, base_path):
         for source_role, env_relative, variable in metadata_sources:
             matched_env_path = None
             version = None
-            for env_path in catalog_path_candidates(candidate_path, env_relative):
+            for env_path in catalog_path_candidates(
+                candidate_path, env_relative, aliases
+            ):
                 values = read_allowlisted_env_values(env_path, (variable,))
                 candidate_version = values.get(variable)
                 if candidate_version is None or re.match(
