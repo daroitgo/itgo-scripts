@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.24"
+COLLECTOR_VERSION = "0.1.25"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -49,6 +49,7 @@ MAX_HOSTNAME_CHARS = 255
 ITGO_IDENTITY_PATH = "/home/itgo/UTILITY/ITGO-CONFIG/client-identity.json"
 ITGO_CLIENT_CODE_PATTERN = re.compile(r"^[a-z0-9_-]+$")
 APPLICATION_BASE_PATHS = ("/srv", "/usr/local", "/usr/app", "/app", "/usr", "/opt")
+APPLICATION_EXCLUDED_PATHS = ("/opt/containerd", "/srv/keystores")
 SYSTEM_APPLICATION_DIRECTORY_NAMES = frozenset((
     "bin", "etc", "games", "include", "lib", "lib32", "lib64", "libexec",
     "sbin", "share", "src", "var",
@@ -642,7 +643,7 @@ def normalize_command_output(value):
     return value
 
 
-def probe_command(spec, warnings):
+def probe_command(spec, warnings, warn_not_found=True):
     executable_path = find_executable(
         spec.executable,
         SAFE_COMMAND_ENV["PATH"],
@@ -657,12 +658,13 @@ def probe_command(spec, warnings):
     }
 
     if executable_path is None:
-        add_warning(
-            warnings,
-            "COMMAND_NOT_FOUND",
-            spec.name,
-            "{} is not available".format(spec.executable),
-        )
+        if warn_not_found:
+            add_warning(
+                warnings,
+                "COMMAND_NOT_FOUND",
+                spec.name,
+                "{} is not available".format(spec.executable),
+            )
         return item
 
     command = [executable_path] + list(spec.arguments)
@@ -717,8 +719,33 @@ def probe_command(spec, warnings):
     return item
 
 
+def collect_runtimes(warnings):
+    runtimes = []
+    compose_plugin_detected = False
+    for spec in COMMAND_SPECS:
+        warn_not_found = not (
+            spec.name == "docker-compose" and compose_plugin_detected
+        )
+        runtime = probe_command(spec, warnings, warn_not_found=warn_not_found)
+        runtimes.append(runtime)
+        if spec.name == "docker-compose-plugin":
+            compose_plugin_detected = runtime["status"] == "detected"
+    return runtimes
+
+
 def is_non_primary_application_directory_name(name):
     return NON_PRIMARY_APPLICATION_SUFFIX_PATTERN.search(name) is not None
+
+
+def is_excluded_application_path(path):
+    normalized_path = os.path.normpath(path)
+    for excluded_path in APPLICATION_EXCLUDED_PATHS:
+        normalized_excluded = os.path.normpath(excluded_path)
+        if normalized_path == normalized_excluded:
+            return True
+        if normalized_path.startswith(normalized_excluded + os.sep):
+            return True
+    return False
 
 
 def match_application_candidate(name):
@@ -2859,6 +2886,8 @@ def collect_application_candidates(
         return False
 
     for base in normalized_bases:
+        if is_excluded_application_path(base):
+            continue
         pending = []
         if os.path.basename(base).lower() == "app":
             pending.append((base, 0))
@@ -2869,6 +2898,8 @@ def collect_application_candidates(
         while pending:
             child, depth = pending.pop()
             normalized_child = os.path.normpath(child)
+            if is_excluded_application_path(normalized_child):
+                continue
             if normalized_child in seen_directories:
                 continue
             if normalized_child != base and normalized_child in base_set:
@@ -2973,7 +3004,7 @@ def collect_report(
             "cpu_logical_count": cpu_logical_count,
             "memory_total_bytes": memory_total_bytes,
         },
-        "runtimes": [probe_command(spec, warnings) for spec in COMMAND_SPECS],
+        "runtimes": collect_runtimes(warnings),
         "application_candidates": collect_application_candidates(
             warnings,
             application_base_paths,
