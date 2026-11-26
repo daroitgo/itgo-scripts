@@ -15,7 +15,18 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ITGO_HOME="$(cd "${BASE_DIR}/../.." && pwd)"
-COLLECTOR="${BASE_DIR}/bin/collect_inventory.py"
+# The installed file is deliberately retained as the offline fallback for
+# existing installations.  Downloaded collectors are never written over it.
+COLLECTOR_LEGACY="${BASE_DIR}/bin/collect_inventory.py"
+COLLECTOR_SLOTS_DIR="${BASE_DIR}/collector-slots"
+COLLECTOR_CURRENT_LINK="${BASE_DIR}/collector-current"
+COLLECTOR_UPDATE_STATE="${BASE_DIR}/run/collector-update.last"
+COLLECTOR_UPDATE_KEY="${BASE_DIR}/config/collector-update-public.pem"
+COLLECTOR_MANIFEST_URL="${COLLECTOR_MANIFEST_URL:-https://raw.githubusercontent.com/daroitgo/itgo-scripts-public/main/COLLECTOR/collector-manifest-v1.json}"
+COLLECTOR_SIGNATURE_URL="${COLLECTOR_SIGNATURE_URL:-https://raw.githubusercontent.com/daroitgo/itgo-scripts-public/main/COLLECTOR/collector-manifest-v1.json.sig}"
+COLLECTOR_UPDATE_INTERVAL=86400
+COLLECTOR_PSS_SALTLEN=32
+COLLECTOR="$COLLECTOR_LEGACY"
 REPORTS_DIR="${BASE_DIR}/reports"
 LOGS_DIR="${BASE_DIR}/logs"
 VERSION_FILE="${BASE_DIR}/inventory.version"
@@ -407,6 +418,155 @@ test_nextcloud() {
     "$NEXTCLOUD_URL" "$NEXTCLOUD_USER" "$client_code" "$client_code" "$CREDENTIAL_MODE"
 }
 
+collector_version_of() {
+  local path
+  path="$1"
+  [ -f "$path" ] || return 1
+  sed -n 's/^[[:space:]]*COLLECTOR_VERSION[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)"[[:space:]]*$/\1/p' "$path" | head -n 1
+}
+
+collector_version_is_newer() {
+  local py_cmd
+  py_cmd="$(collector_python_command)" || return 1
+  "$py_cmd" - "$1" "$2" <<'PY'
+import re
+import sys
+def parse(value):
+    if not re.match(r'^[0-9]+(?:\.[0-9]+)*$', value):
+        raise ValueError
+    return tuple(int(part) for part in value.split('.'))
+try:
+    candidate, installed = parse(sys.argv[1]), parse(sys.argv[2])
+    length = max(len(candidate), len(installed))
+    candidate += (0,) * (length - len(candidate))
+    installed += (0,) * (length - len(installed))
+    sys.exit(0 if candidate > installed else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+collector_current_path() {
+  local candidate
+  candidate="${COLLECTOR_CURRENT_LINK}/collect_inventory.py"
+  if [ -f "$candidate" ] && [ ! -L "$candidate" ]; then
+    printf '%s' "$candidate"
+  elif [ -f "$COLLECTOR_LEGACY" ] && [ ! -L "$COLLECTOR_LEGACY" ]; then
+    printf '%s' "$COLLECTOR_LEGACY"
+  else
+    return 1
+  fi
+}
+
+collector_update_due() {
+  local now last
+  [ -f "$COLLECTOR_UPDATE_STATE" ] && [ ! -L "$COLLECTOR_UPDATE_STATE" ] || return 0
+  now="$(date +%s 2>/dev/null)" || return 0
+  last="$(sed -n '1p' "$COLLECTOR_UPDATE_STATE" 2>/dev/null)"
+  case "$last" in ''|*[!0-9]*) return 0 ;; esac
+  [ $((now - last)) -ge "$COLLECTOR_UPDATE_INTERVAL" ]
+}
+
+collector_update_mark_checked() {
+  local tmp now
+  mkdir -p "$RUN_DIR" || return 1
+  now="$(date +%s 2>/dev/null)" || return 1
+  tmp="${RUN_DIR}/.collector-update.last.$$"
+  (umask 077; printf '%s\n' "$now" > "$tmp") && mv -f -- "$tmp" "$COLLECTOR_UPDATE_STATE"
+}
+
+collector_verify_manifest_signature() {
+  # Explicit RSA-PSS parameters are supported by OpenSSL 1.0.2 (Oracle Linux
+  # 7) and newer.  A missing/older implementation is a safe offline failure.
+  command -v openssl >/dev/null 2>&1 || return 1
+  openssl dgst -sha256 -verify "$COLLECTOR_UPDATE_KEY" -signature "$2" \
+    -sigopt rsa_padding_mode:pss -sigopt "rsa_pss_saltlen:${COLLECTOR_PSS_SALTLEN}" "$1" >/dev/null 2>&1
+}
+
+collector_read_manifest() {
+  local py_cmd
+  py_cmd="$(collector_python_command)" || return 1
+  "$py_cmd" - "$1" <<'PY'
+import io
+import json
+import re
+import sys
+import calendar
+import time
+try:
+    with io.open(sys.argv[1], 'r', encoding='utf-8') as source:
+        data = json.load(source)
+    required = ('schema', 'channel', 'version', 'artifact_tag', 'artifact_url', 'sha256', 'min_python', 'created_at', 'expires_at')
+    if not isinstance(data, dict) or set(data) != set(required): raise ValueError('fields')
+    if data['schema'] != 'collector-manifest-v1' or data['channel'] != 'stable': raise ValueError('schema')
+    if not re.match(r'^[0-9]+(?:\.[0-9]+)*$', data['version']): raise ValueError('version')
+    if not re.match(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$', data['artifact_tag']): raise ValueError('tag')
+    if data['artifact_tag'] in ('main', 'master'): raise ValueError('mutable tag')
+    expected = 'https://raw.githubusercontent.com/daroitgo/itgo-scripts-public/%s/COLLECTOR/collect_inventory.py' % data['artifact_tag']
+    if data['artifact_url'] != expected: raise ValueError('artifact URL')
+    if not re.match(r'^[0-9a-f]{64}$', data['sha256']): raise ValueError('sha256')
+    if data['min_python'] != '3.6': raise ValueError('python')
+    if not all(isinstance(data[key], str) and data[key] for key in ('created_at', 'expires_at')): raise ValueError('dates')
+    created = calendar.timegm(time.strptime(data['created_at'], '%Y-%m-%dT%H:%M:%SZ'))
+    expires = calendar.timegm(time.strptime(data['expires_at'], '%Y-%m-%dT%H:%M:%SZ'))
+    if created > expires or expires < time.time(): raise ValueError('expired')
+    sys.stdout.write('\t'.join((data['version'], data['artifact_url'], data['sha256'])))
+except Exception:
+    sys.exit(1)
+PY
+}
+
+collector_update_if_due() {
+  local temp manifest sig artifact fields candidate_version artifact_url expected_hash installed_version slot slot_file actual_hash
+  collector_update_due || return 0
+  if [ ! -f "$COLLECTOR_UPDATE_KEY" ] || [ -L "$COLLECTOR_UPDATE_KEY" ]; then
+    printf 'WARNING: Collector auto-update disabled: trusted public key is not installed. Using local Collector.\n' >&2
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+    printf 'WARNING: Collector update check skipped: curl or compatible OpenSSL is unavailable. Using local Collector.\n' >&2
+    return 0
+  fi
+  collector_update_mark_checked || true
+  temp="$(mktemp -d "${RUN_DIR}/.collector-update.XXXXXX" 2>/dev/null)" || return 0
+  manifest="$temp/manifest.json"; sig="$temp/manifest.sig"; artifact="$temp/collect_inventory.py"
+  if ! curl --fail --silent --show-error --location --connect-timeout 5 --max-time 20 --proto '=https' --tlsv1.2 -o "$manifest" "$COLLECTOR_MANIFEST_URL" \
+    || ! curl --fail --silent --show-error --location --connect-timeout 5 --max-time 20 --proto '=https' --tlsv1.2 -o "$sig" "$COLLECTOR_SIGNATURE_URL" \
+    || ! collector_verify_manifest_signature "$manifest" "$sig"; then
+    printf 'WARNING: Collector update verification failed; using local Collector.\n' >&2
+    rm -rf -- "$temp"
+    return 0
+  fi
+  fields="$(collector_read_manifest "$manifest")" || { printf 'WARNING: invalid signed Collector manifest; using local Collector.\n' >&2; rm -rf -- "$temp"; return 0; }
+  IFS=$'\t' read -r candidate_version artifact_url expected_hash <<EOF
+$fields
+EOF
+  installed_version="$(collector_version_of "$(collector_current_path 2>/dev/null || true)")" || {
+    printf 'WARNING: local Collector version is unknown; refusing automatic replacement.\n' >&2; rm -rf -- "$temp"; return 0; }
+  if ! collector_version_is_newer "$candidate_version" "$installed_version"; then rm -rf -- "$temp"; return 0; fi
+  if ! curl --fail --silent --show-error --location --connect-timeout 5 --max-time 20 --proto '=https' --tlsv1.2 -o "$artifact" "$artifact_url"; then
+    printf 'WARNING: Collector download failed; using local Collector.\n' >&2; rm -rf -- "$temp"; return 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_hash="$(sha256sum "$artifact" 2>/dev/null | awk '{print $1}')"
+  else
+    actual_hash="$(openssl dgst -sha256 "$artifact" 2>/dev/null | sed 's/^.*= //')"
+  fi
+  if [ "$actual_hash" != "$expected_hash" ]; then
+    printf 'WARNING: Collector checksum mismatch; using local Collector.\n' >&2; rm -rf -- "$temp"; return 0
+  fi
+  if ! collector_version_of "$artifact" | grep -qx "$candidate_version" || ! "$(collector_python_command)" "$artifact" --help >/dev/null 2>&1; then
+    printf 'WARNING: downloaded Collector did not pass validation; using local Collector.\n' >&2; rm -rf -- "$temp"; return 0
+  fi
+  slot="${COLLECTOR_SLOTS_DIR}/${candidate_version}"; slot_file="${slot}/collect_inventory.py"
+  if ! mkdir -p "$slot" || ! install -m 0755 "$artifact" "${slot}/.collect_inventory.py.new" || ! mv -f -- "${slot}/.collect_inventory.py.new" "$slot_file" \
+    || ! ln -s "collector-slots/${candidate_version}" "${BASE_DIR}/.collector-current.new" || ! mv -f -- "${BASE_DIR}/.collector-current.new" "$COLLECTOR_CURRENT_LINK"; then
+    printf 'WARNING: could not atomically activate Collector; using local Collector.\n' >&2; rm -rf -- "$temp"; return 0
+  fi
+  printf 'Collector updated atomically: %s -> %s\n' "$installed_version" "$candidate_version"
+  rm -rf -- "$temp"
+}
+
 collector_has_output_option() {
   [ -f "$COLLECTOR" ] && grep -Eq -- '(^|[^A-Za-z0-9_-])--output([^A-Za-z0-9_-]|$)' "$COLLECTOR"
 }
@@ -414,7 +574,7 @@ collector_has_output_option() {
 run_collector() {
   local output_path="$1"
   local log_path="$2"
-  local py_cmd
+  local py_cmd selected_collector
 
   if ! py_cmd="$(collector_python_command)"; then
     printf 'error: the inventory collector requires Python %s or newer; no compatible interpreter found (tried: %s). Re-run the INVENTORY installer or MASTER to install python3 from the configured system repositories.\n' \
@@ -422,6 +582,24 @@ run_collector() {
     printf '%s python runtime error: Python %s+ required, none found\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$COLLECTOR_PYTHON_MIN_LABEL" >>"$log_path" 2>/dev/null || true
     return 1
   fi
+
+  selected_collector="$(collector_current_path)" || {
+    printf 'error: no usable local collector is available\n' >&2
+    return 1
+  }
+  if ! "$py_cmd" "$selected_collector" --help >/dev/null 2>&1; then
+    if [ "$selected_collector" != "$COLLECTOR_LEGACY" ] && "$py_cmd" "$COLLECTOR_LEGACY" --help >/dev/null 2>&1; then
+      printf 'WARNING: active Collector slot failed validation; rolling back to local Collector.\n' >&2
+      rm -f -- "${BASE_DIR}/.collector-current.rollback.new" 2>/dev/null || true
+      ln -s "bin" "${BASE_DIR}/.collector-current.rollback.new" 2>/dev/null \
+        && mv -f -- "${BASE_DIR}/.collector-current.rollback.new" "$COLLECTOR_CURRENT_LINK" || true
+      selected_collector="$COLLECTOR_LEGACY"
+    else
+      printf 'error: selected Collector does not start with Python %s\n' "$COLLECTOR_PYTHON_MIN_LABEL" >&2
+      return 1
+    fi
+  fi
+  COLLECTOR="$selected_collector"
 
   if collector_has_output_option; then
     "$py_cmd" "$COLLECTOR" --output "$output_path" >>"$log_path" 2>&1
@@ -569,8 +747,8 @@ retry_pending_reports() {
 collect_report() {
   local client_code hostname timestamp report_name report_path temp_path log_path nextcloud_ready=0 collision_index=0 nextcloud_state
 
-  if [ ! -f "$COLLECTOR" ]; then
-    printf 'error: collector not found: %s\n' "$COLLECTOR" >&2
+  if ! collector_current_path >/dev/null; then
+    printf 'error: collector not found: %s\n' "$COLLECTOR_LEGACY" >&2
     return 1
   fi
 
@@ -712,6 +890,7 @@ collect_with_lock() {
       printf 'error: could not acquire collect lock: %s\n' "$COLLECT_LOCK" >&2
       return 1
     fi
+    collector_update_if_due
     collect_report
   } 9<"$COLLECT_LOCK"
 }
@@ -1153,7 +1332,7 @@ show_latest() {
 show_version() {
   local inventory_version="unknown"
   local collector_version="unknown"
-  local py_cmd py_path py_version
+  local active_collector active_version py_cmd py_path py_version
 
   if [ -f "$VERSION_FILE" ]; then
     # shellcheck disable=SC1090
@@ -1164,6 +1343,11 @@ show_version() {
 
   printf 'Inventory module: %s\n' "$inventory_version"
   printf 'Inventory collector: %s\n' "$collector_version"
+  active_collector="$(collector_current_path 2>/dev/null || true)"
+  active_version="$(collector_version_of "$active_collector" 2>/dev/null || true)"
+  if [ -n "$active_version" ]; then
+    printf 'Active collector: %s\n' "$active_version"
+  fi
   if py_cmd="$(collector_python_command)"; then
     py_path="$(command -v "$py_cmd" 2>/dev/null || printf '%s' "$py_cmd")"
     py_version="$("$py_cmd" -c 'import sys; sys.stdout.write("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || printf 'unknown')"
@@ -1172,6 +1356,10 @@ show_version() {
     printf 'Python runtime: MISSING (Python %s+ required by the collector)\n' "$COLLECTOR_PYTHON_MIN_LABEL"
   fi
 }
+
+if [ "${ITGO_INV_LIB_ONLY:-0}" = 1 ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 command_name="${1:-collect}"
 

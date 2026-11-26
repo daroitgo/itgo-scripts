@@ -11,6 +11,7 @@ The public installer places files under:
 - `/home/itgo/UTILITY/INVENTORY/logs`
 - `/home/itgo/UTILITY/INVENTORY/config`
 - `/home/itgo/UTILITY/INVENTORY/run` (collect lock: `run/collect.lock`)
+- `/home/itgo/UTILITY/INVENTORY/collector-slots` (verified Collector versions)
 
 Nextcloud configuration, when enabled, is stored locally as:
 
@@ -57,6 +58,29 @@ itgo-inv test-nextcloud
 `configure-nextcloud` interactively asks for the Nextcloud URL, technical user and App Password. The App Password is never accepted as a CLI argument and is not written to logs. The configuration directory uses mode `0700`. Credential storage prefers user-scoped `systemd-creds`; when it is unavailable, the App Password falls back to a local file protected with mode `0600`.
 
 `collect` holds an exclusive `flock` lock on `run/collect.lock` for the whole run, so a manual `itgo-inv collect` and the systemd timer never run the collector at the same time; a second run reports that a collect is already in progress and exits without starting the collector. If `flock` is unavailable, `collect` prints a warning and runs without this protection.
+
+## Signed Collector updates
+
+Before a collection, at most once per 24 hours and while the existing `flock`
+lock is held, `itgo-inv` may check the stable manifest at
+`https://raw.githubusercontent.com/daroitgo/itgo-scripts-public/main/COLLECTOR/`.
+The manifest (`collector-manifest-v1.json`) and its detached `.sig` must verify
+with RSA-PSS/SHA-256 and a 32-byte salt; the downloaded Collector must also
+match the signed SHA-256. Only a strictly newer version from the manifest's
+immutable Git tag is accepted. Downloads use HTTPS and short timeouts.
+
+The trust anchor is the regular local file
+`config/collector-update-public.pem`, provisioned only by the trusted
+INVENTORY installer. It is intentionally absent from this repository: without
+it, without compatible OpenSSL, or on any network/signature/checksum/activation
+error, the check is skipped and the installed local Collector runs unchanged.
+The key is never downloaded from the update channel.
+
+Verified versions are installed into versioned `collector-slots/<version>`
+directories and activated by atomically replacing `collector-current`; the
+installer-provided `bin/collect_inventory.py` remains the offline fallback for
+existing installations. A failed or interrupted update never replaces either
+one. The Collector itself remains read-only.
 
 ## Automatic inventory
 

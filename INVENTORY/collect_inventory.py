@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.23"
+COLLECTOR_VERSION = "0.1.24"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -82,6 +82,14 @@ CATALOG_INFRASTRUCTURE_SERVICE_NAMES = frozenset((
     "db", "database", "cache", "postgres", "postgresql", "redis",
     "elasticsearch", "logstash", "kibana", "nginx",
 ))
+
+# These observations describe locally declared Elastic technology versions,
+# not product versions that can be compared with the release matrix.
+ELASTIC_TECHNOLOGY_SERVICES = {
+    "si-elastic-client": ("filebeat",),
+    "si-elastic-server": ("elasticsearch", "kibana"),
+}
+ELASTIC_TECHNOLOGY_VERSION_SELECTOR = "ELASTIC_VERSION"
 
 # component_id, Compose path, ENV path, exact tag variable, directory aliases.
 # A None alias tuple is allowed only for a component-specific variable and
@@ -1647,16 +1655,84 @@ def generic_compose_candidate(candidate_path, base_path, candidate_name, warning
             images.append(observation)
     if not compose_files:
         return None
+    fields = {
+        "base_path": base_path,
+        "matched_hint": "generic_compose",
+        "compose_files": compose_files,
+        "compose_images": images,
+    }
+    technology_fields = collect_elastic_technology_fields(
+        candidate_path, candidate_name
+    )
+    if technology_fields is not None:
+        fields.update(technology_fields)
     return application_candidate(
         candidate_name,
         candidate_path,
-        {
-            "base_path": base_path,
-            "matched_hint": "generic_compose",
-            "compose_files": compose_files,
-            "compose_images": images,
-        },
+        fields,
     )
+
+
+def collect_elastic_technology_fields(candidate_path, candidate_name):
+    """Read an Elastic version only from exact service image-tag bindings."""
+    component_id = candidate_name.casefold()
+    required_services = ELASTIC_TECHNOLOGY_SERVICES.get(component_id)
+    if (
+        required_services is None
+        or os.path.basename(candidate_path).casefold() != component_id
+    ):
+        return None
+
+    selector = ELASTIC_TECHNOLOGY_VERSION_SELECTOR
+    matched_compose_path = None
+    for compose_path in collect_compose_files(candidate_path):
+        recognized, services = read_catalog_compose_services(compose_path)
+        if not recognized:
+            continue
+        if all(
+            service in services
+            and selector
+            in catalog_tag_variables(services[service][0], services[service][1])
+            for service in required_services
+        ):
+            matched_compose_path = compose_path
+            break
+    if matched_compose_path is None:
+        return None
+
+    env_path = os.path.join(candidate_path, ".env")
+    version = read_allowlisted_env_values(env_path, (selector,)).get(selector)
+    if version is None or re.match(
+        r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z", version
+    ) is None:
+        return None
+
+    observations = [
+        {
+            "service": service,
+            "selector": selector,
+            "version": version,
+            "source_path": env_path,
+            "compose_path": matched_compose_path,
+            "image_selector": "services.{}.image.tag".format(service),
+        }
+        for service in required_services
+    ]
+    return {
+        "technology_version": {
+            "kind": "compose_env",
+            "component_id": component_id,
+            "version": version,
+            "source_path": env_path,
+            "source_key": selector,
+            "source_selector": selector,
+            "source_state": "active",
+            "evidence_kind": "local_exact_service_compose_env_binding",
+            "declaration_origin": "local_configuration",
+        },
+        "technology_version_observations": observations,
+        "technology_version_resolution": "matched",
+    }
 
 
 def collect_cpu_logical_count(warnings):
