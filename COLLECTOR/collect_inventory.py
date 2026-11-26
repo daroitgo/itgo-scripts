@@ -17,7 +17,7 @@ import time
 import zipfile
 
 COLLECTOR_NAME = "itgo-infocenter-inventory"
-COLLECTOR_VERSION = "0.1.25"
+COLLECTOR_VERSION = "0.1.26"
 FORMAT_VERSION = "0.1"
 COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_CHARS = 4096
@@ -61,23 +61,36 @@ COMPOSE_FILENAMES = (
     "compose.yml",
     "compose.yaml",
 )
+NBK_COMPOSE_FILENAME = "docker-compose.yml"
+NBK_APPLICATION_VERSION_SELECTORS = (
+    "BK_FRONT_VERSION",
+    "SEROLOGY_FRONT_VERSION",
+    "BT_FRONT_VERSION",
+    "PLATFORM_APP_VERSION",
+    "MESSAGES_APP_VERSION",
+    "BK_APP_VERSION",
+    "SEROLOGY_APP_VERSION",
+    "BT_APP_VERSION",
+    "SYNC_KEYCLOAK_APP_VERSION",
+)
+NBK_VERSION_PATTERN = re.compile(r"^v?(\d+\.\d+\.\d+\.p\d+)\Z")
 
 # Compiled from docs/collectors/version-source-rule-catalog.json schema 1.0.
 # Only matrix entries with readiness=ready are included here. Product entries
-# remain implemented by the established specialist detectors below.
+# remain implemented by the specialist detectors below.
 CATALOG_SCHEMA_VERSION = "1.0"
 CATALOG_READY_MATRIX_RULE_COUNT = 71
-CATALOG_READY_PRODUCT_RULE_COUNT = 10
-CATALOG_UNRESOLVED_RULE_COUNT = 8
+CATALOG_READY_PRODUCT_RULE_COUNT = 11
+CATALOG_UNRESOLVED_RULE_COUNT = 7
 CATALOG_RULE_ID_PREFIX = "version-source-catalog-1.0:"
 CATALOG_READY_PRODUCT_RULE_IDS = (
     "amdx", "amms", "hazelcast", "hazelcast-management-center",
-    "integration-platform", "mpi", "mswia-edm", "p1-adapter", "psim2-edm",
+    "integration-platform", "mpi", "mswia-edm", "nbk", "p1-adapter", "psim2-edm",
     "token-generator",
 )
 CATALOG_UNRESOLVED_RULE_IDS = (
     "athos-mobit", "cpi-mpi-services", "hl7-proxy", "pi-hurtownie-provider",
-    "pi-wwks2", "si-crt-provider", "lab", "nbk",
+    "pi-wwks2", "si-crt-provider", "lab",
 )
 CATALOG_INFRASTRUCTURE_SERVICE_NAMES = frozenset((
     "db", "database", "cache", "postgres", "postgresql", "redis",
@@ -1227,7 +1240,7 @@ def catalog_tag_variables(image, quote):
     last_segment = image.rsplit("/", 1)[-1]
     if ":" not in last_segment:
         return set()
-    tag = last_segment.rsplit(":", 1)[-1]
+    tag = last_segment.split(":", 1)[-1]
     variables = set()
     pattern = re.compile(
         r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?:(?::?[-+?])[^}]*)?\}|([A-Za-z_][A-Za-z0-9_]*))"
@@ -1305,6 +1318,125 @@ def catalog_application_version(
         "source_state": "active",
         "evidence_kind": evidence_kind,
     }
+
+
+def is_exact_nbk_installation(candidate_path, base_path):
+    """Match only the confirmed /usr/app/nbk installation layout."""
+    normalized_candidate = os.path.normpath(candidate_path)
+    normalized_base = os.path.normpath(base_path)
+    return (
+        os.path.dirname(normalized_candidate) == normalized_base
+        and os.path.basename(normalized_candidate).casefold() == "nbk"
+        and os.path.basename(normalized_base).casefold() == "app"
+        and os.path.basename(os.path.dirname(normalized_base)).casefold() == "usr"
+    )
+
+
+def read_nbk_compose_version(candidate_path, base_path, warnings):
+    """Read the NBK business version from all approved application tags."""
+    if not is_exact_nbk_installation(candidate_path, base_path):
+        return None
+    compose_path = os.path.join(candidate_path, NBK_COMPOSE_FILENAME)
+    if not os.path.isfile(compose_path):
+        return None
+
+    fields = {
+        "base_path": base_path,
+        "matched_hint": "nbk_compose",
+        "compose_files": [compose_path],
+    }
+    recognized, services = read_catalog_compose_services(compose_path)
+    if not recognized:
+        fields["catalog_version_observations"] = []
+        fields["catalog_version_resolution"] = "invalid"
+        add_warning(
+            warnings,
+            "NBK_COMPOSE_INVALID",
+            compose_path,
+            "NBK Compose structure is invalid or exceeds the safe read limit.",
+        )
+        return application_candidate("nbk", candidate_path, fields)
+
+    allowed_selectors = set(NBK_APPLICATION_VERSION_SELECTORS)
+    observations = []
+    invalid_selectors = set()
+    selector_counts = {}
+    for service in sorted(services):
+        image, quote = services[service]
+        used_selectors = catalog_tag_variables(image, quote) & allowed_selectors
+        if not used_selectors:
+            continue
+        last_segment = image.rsplit("/", 1)[-1]
+        tag = last_segment.split(":", 1)[-1] if ":" in last_segment else ""
+        for selector in sorted(used_selectors):
+            selector_counts[selector] = selector_counts.get(selector, 0) + 1
+            expression = re.match(
+                r"^\$\{" + re.escape(selector) + r":-([^{}]+)\}\Z",
+                tag,
+            )
+            version = None
+            if expression is not None:
+                version_match = NBK_VERSION_PATTERN.match(expression.group(1))
+                if version_match is not None:
+                    version = version_match.group(1)
+            if version is None:
+                invalid_selectors.add(selector)
+            observations.append(
+                {
+                    "service": service,
+                    "selector": selector,
+                    "version": version,
+                    "source_path": compose_path,
+                    "image_selector": "services.{}.image.tag".format(service),
+                }
+            )
+
+    observed_selectors = set(selector_counts)
+    missing_selectors = sorted(allowed_selectors - observed_selectors)
+    duplicate_selectors = sorted(
+        selector for selector, count in selector_counts.items() if count != 1
+    )
+    fields["catalog_version_observations"] = observations
+
+    if missing_selectors or invalid_selectors:
+        fields["catalog_version_resolution"] = "incomplete"
+        fields["missing_or_invalid_selectors"] = sorted(
+            set(missing_selectors) | invalid_selectors
+        )
+        add_warning(
+            warnings,
+            "NBK_VERSION_INCOMPLETE",
+            compose_path,
+            "NBK application image tags do not contain all approved version defaults.",
+        )
+        return application_candidate("nbk", candidate_path, fields)
+
+    versions = set(item["version"] for item in observations)
+    if duplicate_selectors or len(versions) != 1:
+        fields["catalog_version_resolution"] = "ambiguous"
+        if duplicate_selectors:
+            fields["duplicate_selectors"] = duplicate_selectors
+        add_warning(
+            warnings,
+            "NBK_VERSION_AMBIGUOUS",
+            compose_path,
+            "NBK application image tags declare inconsistent versions.",
+        )
+        return application_candidate("nbk", candidate_path, fields)
+
+    version = observations[0]["version"]
+    application_version_value = catalog_application_version(
+        "nbk",
+        "catalog_compose_default",
+        version,
+        compose_path,
+        "NBK_APPLICATION_VERSION_DEFAULTS",
+        "local_compose_application_tag_defaults_equal",
+    )
+    application_version_value["source_state"] = "declared_default"
+    fields["application_version"] = application_version_value
+    fields["catalog_version_resolution"] = "matched"
+    return application_candidate("nbk", candidate_path, fields)
 
 
 def catalog_component_candidate(
@@ -2716,6 +2848,11 @@ def collect_application_candidates(
             return False
 
         before_count = len(candidates)
+        nbk_candidate = read_nbk_compose_version(child, base, warnings)
+        if nbk_candidate is not None:
+            candidates.append(nbk_candidate)
+            return True
+
         catalog_candidates = collect_catalog_application_candidates(child, base)
         if catalog_candidates:
             nested_source = False
