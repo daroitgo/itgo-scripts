@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.30"
+VERSION="3.12.31"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -286,6 +286,24 @@ count_security_lines() {
   '
 }
 
+count_check_update_lines() {
+  awk '
+    /^[[:space:]]*$/ {next}
+    /^Last metadata expiration check:/ {next}
+    /^Loaded plugins:/ {next}
+    /^Loaded plugins$/ {next}
+    /^Updating Subscription Management repositories/ {next}
+    /^Unable to read consumer identity/ {next}
+    /^This system is not registered/ {next}
+    /^Available Packages/ {next}
+    /^Obsoleting Packages/ {next}
+    /^Security:/ {next}
+    NF < 3 {next}
+    $1 ~ /^[[:alnum:]][[:alnum:]_.+:-]*$/ {c++}
+    END {print c+0}
+  '
+}
+
 SEC_TIMEOUT="12s"
 
 if [[ "$os_id" == "debian" || "$os_id" == "ubuntu" || " ${ID_LIKE:-} " == *" debian "* ]]; then
@@ -332,6 +350,22 @@ if [[ "$os_id" == "debian" || "$os_id" == "ubuntu" || " ${ID_LIKE:-} " == *" deb
   fi
   rm -f "$tmp"
 elif command -v dnf >/dev/null 2>&1; then
+  tmp="$(mktemp)"
+  if timeout "$SEC_TIMEOUT" dnf -q --cacheonly check-update >"$tmp" 2>/dev/null; then
+    os_updates="0"
+  else
+    rc=$?
+    if [[ "$rc" == "100" ]]; then
+      n="$(count_check_update_lines <"$tmp")"
+      [[ "$n" -gt 0 ]] && os_updates="$n" || os_updates="UNKNOWN (unparsed check-update)"
+    elif [[ "$rc" == "124" ]]; then
+      os_updates="UNKNOWN (check-update timeout)"
+    else
+      os_updates="UNKNOWN (check-update error)"
+    fi
+  fi
+  rm -f "$tmp"
+
   security_src="dnf:updateinfo:cacheonly"
   tmp="$(mktemp)"
   if timeout "$SEC_TIMEOUT" dnf -q --cacheonly updateinfo list --security --available >"$tmp" 2>/dev/null; then
@@ -342,6 +376,22 @@ elif command -v dnf >/dev/null 2>&1; then
   fi
   rm -f "$tmp"
 elif command -v yum >/dev/null 2>&1; then
+  tmp="$(mktemp)"
+  if timeout "$SEC_TIMEOUT" yum -C -q check-update >"$tmp" 2>/dev/null; then
+    os_updates="0"
+  else
+    rc=$?
+    if [[ "$rc" == "100" ]]; then
+      n="$(count_check_update_lines <"$tmp")"
+      [[ "$n" -gt 0 ]] && os_updates="$n" || os_updates="UNKNOWN (unparsed check-update)"
+    elif [[ "$rc" == "124" ]]; then
+      os_updates="UNKNOWN (check-update timeout)"
+    else
+      os_updates="UNKNOWN (check-update error)"
+    fi
+  fi
+  rm -f "$tmp"
+
   security_src="yum:updateinfo:cacheonly"
   tmp="$(mktemp)"
   if timeout "$SEC_TIMEOUT" yum -q --cacheonly updateinfo list security >"$tmp" 2>/dev/null; then
