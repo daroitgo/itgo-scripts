@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.28"
+VERSION="3.12.29"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -174,6 +174,15 @@ write_eol_db() {
     printf "centos\t7\t2024-06-30\n"
     printf "centos-stream\t8\t2024-05-31\n"
     printf "centos-stream\t9\t2027-05-31\n"
+    # Dates below are maintained local lifecycle data.  An unknown release is
+    # deliberately reported as UNKNOWN rather than inferred from its codename.
+    printf "debian\t11\t2026-08-31\n"
+    printf "debian\t12\t2028-06-30\n"
+    printf "debian\t13\t2030-06-30\n"
+    printf "ubuntu\t20\t2025-04-01\n"
+    printf "ubuntu\t22\t2027-04-01\n"
+    printf "ubuntu\t24\t2029-04-01\n"
+    printf "ubuntu\t26\t2031-04-01\n"
   } > "$EOL_DB_FILE"
   chmod 0644 "$EOL_DB_FILE"
   chown "$TARGET_USER:$TARGET_USER" "$EOL_DB_FILE" 2>/dev/null || true
@@ -236,6 +245,10 @@ if [[ -f /var/lib/dnf/history.sqlite ]]; then
 elif ls /var/lib/yum/history/history-*.sqlite >/dev/null 2>&1; then
   f="$(ls -1t /var/lib/yum/history/history-*.sqlite 2>/dev/null | head -n1 || true)"
   [[ -n "${f:-}" ]] && last_update="$(stat -c '%y' "$f" 2>/dev/null | cut -d'.' -f1 || echo UNKNOWN)"
+elif [[ -f /var/log/apt/history.log ]]; then
+  last_update="$(stat -c '%y' /var/log/apt/history.log 2>/dev/null | cut -d'.' -f1 || echo UNKNOWN)"
+elif [[ -f /var/log/dpkg.log ]]; then
+  last_update="$(stat -c '%y' /var/log/dpkg.log 2>/dev/null | cut -d'.' -f1 || echo UNKNOWN)"
 fi
 
 UPDATE_WARN_DAYS=14
@@ -263,7 +276,7 @@ count_security_lines() {
     /^Loaded plugins:/ {next}
     /^Loaded plugins$/ {next}
     /^repo id/ {next}
-    /^RHSA-|^RLSA-|^ELSA-|^FEDORA-|^ALAS-|^OVMSA-|^CVE-/ {c++}
+    /^RHSA-|^RLSA-|^ELSA-|^FEDORA-|^ALAS-|^OVMSA-|^CVE-/ {c++; next}
     $0 ~ /^[A-Z]{2,}[0-9-]+/ {c++}
     END{print c}
   '
@@ -271,7 +284,39 @@ count_security_lines() {
 
 SEC_TIMEOUT="12s"
 
-if command -v dnf >/dev/null 2>&1; then
+if [[ "$os_id" == "debian" || "$os_id" == "ubuntu" || " ${ID_LIKE:-} " == *" debian "* ]]; then
+  security_src="apt:list:local-cache"
+  tmp="$(mktemp)"
+  # apt list reads the already downloaded package lists.  It does not refresh
+  # them and is used instead of apt update or an install simulation.
+  if command -v apt >/dev/null 2>&1 && timeout "$SEC_TIMEOUT" apt list --upgradable >"$tmp" 2>/dev/null; then
+    apt_lines="$(awk 'NR > 1 && NF {print}' "$tmp")"
+    if [[ -z "$apt_lines" ]]; then
+      security_hint="OK (none)"
+    elif echo "$apt_lines" | grep -Eqi '(^|[/:[:space:]-])(security|[a-z0-9.-]+-security)([/:[:space:]-]|$)'; then
+      # APT only exposes a trustworthy count when every listed candidate has a
+      # recognisable security/non-security suite.  Third-party or opaque suite
+      # names must not be silently counted as non-security updates.
+      if echo "$apt_lines" | awk '
+        /(^|[\/:[:space:]-])(security|[[:alnum:].-]+-security)([\/:[:space:]-]|$)/ {next}
+        /\/(stable|oldstable|testing|unstable|experimental|[[:alnum:].-]+-(updates|backports))[[:space:]]/ {next}
+        /\/(Debian|Ubuntu):/ {next}
+        {bad=1}
+        END {exit bad}
+      '; then
+        n="$(echo "$apt_lines" | grep -Eic '(^|[/:[:space:]-])(security|[a-z0-9.-]+-security)([/:[:space:]-]|$)')"
+        security_hint="SECURITY UPDATES AVAILABLE (${n})"
+      else
+        security_hint="UNKNOWN (APT origin not explicit)"
+      fi
+    else
+      security_hint="UNKNOWN (APT origin not explicit)"
+    fi
+  else
+    security_hint="UNKNOWN (no apt/local cache/timeout)"
+  fi
+  rm -f "$tmp"
+elif command -v dnf >/dev/null 2>&1; then
   security_src="dnf:updateinfo:cacheonly"
   tmp="$(mktemp)"
   if timeout "$SEC_TIMEOUT" dnf -q --cacheonly updateinfo list --security --available >"$tmp" 2>/dev/null; then
@@ -282,9 +327,9 @@ if command -v dnf >/dev/null 2>&1; then
   fi
   rm -f "$tmp"
 elif command -v yum >/dev/null 2>&1; then
-  security_src="yum:updateinfo"
+  security_src="yum:updateinfo:cacheonly"
   tmp="$(mktemp)"
-  if timeout "$SEC_TIMEOUT" yum -q updateinfo list security >"$tmp" 2>/dev/null; then
+  if timeout "$SEC_TIMEOUT" yum -q --cacheonly updateinfo list security >"$tmp" 2>/dev/null; then
     n="$(count_security_lines <"$tmp")"
     [[ "${n:-0}" -gt 0 ]] && security_hint="SECURITY UPDATES AVAILABLE (${n})" || security_hint="OK (none)"
   else
@@ -303,8 +348,7 @@ fw_ports_pm="UNKNOWN"
 fw_services_pm="UNKNOWN"
 fw_direct="UNKNOWN"
 
-if command -v firewall-cmd >/dev/null 2>&1; then
-  if firewall-cmd --state >/dev/null 2>&1; then
+if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     fw_state="running"
 
     fw_default="$(firewall-cmd --get-default-zone 2>/dev/null || true)"
@@ -342,21 +386,48 @@ if command -v firewall-cmd >/dev/null 2>&1; then
     else
       fw_direct="(n/a)"
     fi
-  else
-    fw_state="not running"
+else
+  # A stopped firewall service does not prove that kernel filtering is absent.
+  # Check each available backend without starting or reloading anything.
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    fw_state="ufw active"
+    fw_default="ufw"
+    fw_active="ufw"
+    fw_ports_pm="$(ufw status 2>/dev/null | awk 'NR>2 && NF {print $1}' | paste -sd, -)"
+    [[ -n "$fw_ports_pm" ]] || fw_ports_pm="(rules not listed)"
+    fw_services_pm="(n/a)"
+    fw_direct="(n/a)"
+  elif command -v nft >/dev/null 2>&1 && nft_rules="$(nft list ruleset 2>/dev/null)"; then
+    nft_count="$(printf '%s\n' "$nft_rules" | awk '/^[[:space:]]*(ip|ip6|inet|arp|bridge)[[:space:]].*filter|^[[:space:]]*(chain|add rule)/ {c++} END{print c+0}')"
+    fw_state="nftables ruleset"
+    fw_default="nftables"
+    fw_active="nftables (${nft_count} filter entries)"
+    fw_ports_pm="(inspect nft ruleset)"
+    fw_services_pm="(n/a)"
+    fw_direct="${nft_count}"
+  elif command -v iptables >/dev/null 2>&1 && ipt_rules="$(iptables -S 2>/dev/null)"; then
+    ipt_count="$(printf '%s\n' "$ipt_rules" | awk '/^-A / {c++} END{print c+0}')"
+    fw_state="iptables ruleset"
+    fw_default="iptables"
+    fw_active="iptables (${ipt_count} rules)"
+    fw_ports_pm="(inspect iptables rules)"
+    fw_services_pm="(n/a)"
+    fw_direct="${ipt_count}"
+  elif command -v firewall-cmd >/dev/null 2>&1; then
+    fw_state="firewalld not running; no other backend detected"
     fw_default="(firewalld down)"
-    fw_active="(firewalld down)"
-    fw_ports_pm="(firewalld down)"
-    fw_services_pm="(firewalld down)"
-    fw_direct="(firewalld down)"
+    fw_active="(rules unknown)"
+    fw_ports_pm="(rules unknown)"
+    fw_services_pm="(rules unknown)"
+    fw_direct="(rules unknown)"
+  else
+    fw_state="UNKNOWN (no firewall tool)"
+    fw_default="UNKNOWN"
+    fw_active="UNKNOWN"
+    fw_ports_pm="UNKNOWN"
+    fw_services_pm="UNKNOWN"
+    fw_direct="UNKNOWN"
   fi
-elif command -v iptables >/dev/null 2>&1; then
-  fw_state="iptables"
-  fw_default="(n/a)"
-  fw_active="(n/a)"
-  fw_ports_pm="(n/a)"
-  fw_services_pm="(n/a)"
-  fw_direct="(n/a)"
 fi
 
 support_until="UNKNOWN"
@@ -366,6 +437,8 @@ detect_product_local() {
   case "$os_id" in
     rocky|rockylinux|rocky-linux) echo "rocky-linux" ;;
     ol|oracle|oraclelinux|oracle-linux) echo "oracle-linux" ;;
+    debian) echo "debian" ;;
+    ubuntu) echo "ubuntu" ;;
     centos)
       [[ -f /etc/centos-release ]] && grep -qi "stream" /etc/centos-release && echo "centos-stream" || echo "centos"
     ;;
