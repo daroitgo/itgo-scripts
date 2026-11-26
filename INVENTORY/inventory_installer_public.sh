@@ -207,7 +207,6 @@ REPORTS_DIR="${INSTALL_DIR}/reports"
 LOGS_DIR="${INSTALL_DIR}/logs"
 CONFIG_DIR="${INSTALL_DIR}/config"
 RUN_DIR="${INSTALL_DIR}/run"
-COLLECTOR_SLOTS_DIR="${INSTALL_DIR}/collector-slots"
 
 SYSTEMD_UNIT_DIR="/etc/systemd/system"
 SERVICE_UNIT_PATH="${SYSTEMD_UNIT_DIR}/itgo-inventory.service"
@@ -221,7 +220,7 @@ if ! inventory_ensure_python3; then
   exit 1
 fi
 
-install -d -m 0755 "$INSTALL_DIR" "$BIN_DIR" "$REPORTS_DIR" "$LOGS_DIR" "$RUN_DIR" "$COLLECTOR_SLOTS_DIR"
+install -d -m 0755 "$INSTALL_DIR" "$BIN_DIR" "$REPORTS_DIR" "$LOGS_DIR" "$RUN_DIR"
 install -d -m 0700 "$CONFIG_DIR"
 
 install -m 0755 "${SCRIPT_DIR}/collect_inventory.py" "${BIN_DIR}/collect_inventory.py"
@@ -230,20 +229,10 @@ install -m 0644 "${SCRIPT_DIR}/inventory.version" "${INSTALL_DIR}/inventory.vers
 
 chown -R "${TARGET_USER}:${TARGET_USER}" "$INSTALL_DIR"
 
-chmod 0755 "$INSTALL_DIR" "$BIN_DIR" "$REPORTS_DIR" "$LOGS_DIR" "$RUN_DIR" "$COLLECTOR_SLOTS_DIR"
+chmod 0755 "$INSTALL_DIR" "$BIN_DIR" "$REPORTS_DIR" "$LOGS_DIR" "$RUN_DIR"
 chmod 0700 "$CONFIG_DIR"
 chmod 0755 "${BIN_DIR}/itgo-inv" "${BIN_DIR}/collect_inventory.py"
 chmod 0644 "${INSTALL_DIR}/inventory.version"
-
-# A production public key is deliberately not stored in this repository.  The
-# trusted release installer may provision config/collector-update-public.pem;
-# preserve it across upgrades.  Without that regular, local file itgo-inv
-# keeps using the installed collector and never accepts network updates.
-if [ -e "${CONFIG_DIR}/collector-update-public.pem" ] && { [ ! -f "${CONFIG_DIR}/collector-update-public.pem" ] || [ -L "${CONFIG_DIR}/collector-update-public.pem" ]; }; then
-  inv_warn "collector update public key is not a regular file; automatic Collector updates remain disabled"
-elif [ -f "${CONFIG_DIR}/collector-update-public.pem" ]; then
-  chmod 0644 "${CONFIG_DIR}/collector-update-public.pem"
-fi
 
 ln -sfn "${BIN_DIR}/itgo-inv" /usr/local/bin/itgo-inv
 

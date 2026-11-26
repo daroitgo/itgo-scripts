@@ -11,7 +11,6 @@ The public installer places files under:
 - `/home/itgo/UTILITY/INVENTORY/logs`
 - `/home/itgo/UTILITY/INVENTORY/config`
 - `/home/itgo/UTILITY/INVENTORY/run` (collect lock: `run/collect.lock`)
-- `/home/itgo/UTILITY/INVENTORY/collector-slots` (verified Collector versions)
 
 Nextcloud configuration, when enabled, is stored locally as:
 
@@ -59,28 +58,23 @@ itgo-inv test-nextcloud
 
 `collect` holds an exclusive `flock` lock on `run/collect.lock` for the whole run, so a manual `itgo-inv collect` and the systemd timer never run the collector at the same time; a second run reports that a collect is already in progress and exits without starting the collector. If `flock` is unavailable, `collect` prints a warning and runs without this protection.
 
-## Signed Collector updates
+## Collector updates
 
-Before a collection, at most once per 24 hours and while the existing `flock`
-lock is held, `itgo-inv` may check the stable manifest at
-`https://raw.githubusercontent.com/daroitgo/itgo-scripts-public/main/COLLECTOR/`.
-The manifest (`collector-manifest-v1.json`) and its detached `.sig` must verify
-with RSA-PSS/SHA-256 and a 32-byte salt; the downloaded Collector must also
-match the signed SHA-256. Only a strictly newer version from the manifest's
-immutable Git tag is accepted. Downloads use HTTPS and short timeouts.
+Every `itgo-inv` invocation queries GitHub PUBLIC for the latest
+`collector-*` tag, using the same GitHub tags API pattern as `master-update`.
+When that version is newer than the local `COLLECTOR_VERSION`, it downloads
+only `COLLECTOR/collect_inventory.py` from that tag over HTTPS. The download is
+first saved as a temporary file, checked for its declared version, compiled and
+run with `--help`; only then is the current Collector copied to
+`bin/collect_inventory.py.bak` and the temporary file atomically renamed into
+place. Downgrades are refused. Network, timeout, download or validation errors
+leave the current Collector in use. The Collector itself remains read-only.
 
-The trust anchor is the regular local file
-`config/collector-update-public.pem`, provisioned only by the trusted
-INVENTORY installer. It is intentionally absent from this repository: without
-it, without compatible OpenSSL, or on any network/signature/checksum/activation
-error, the check is skipped and the installed local Collector runs unchanged.
-The key is never downloaded from the update channel.
-
-Verified versions are installed into versioned `collector-slots/<version>`
-directories and activated by atomically replacing `collector-current`; the
-installer-provided `bin/collect_inventory.py` remains the offline fallback for
-existing installations. A failed or interrupted update never replaces either
-one. The Collector itself remains read-only.
+Collector releases are independent of INVENTORY: publish the file to PUBLIC as
+`COLLECTOR/collect_inventory.py` and tag it `collector-<COLLECTOR_VERSION>`.
+From DEV, `pwsh -File INVENTORY/stage-collector-public.ps1` stages exactly this
+file in the sibling PUBLIC repository; review it, then commit, tag and push in
+the normal release process. The staging script never commits, tags or pushes.
 
 ## Automatic inventory
 
