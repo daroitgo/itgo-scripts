@@ -60,10 +60,11 @@ itgo-inv test-nextcloud
 
 ## Collector updates
 
-Every `itgo-inv` invocation queries GitHub PUBLIC for the latest
-`collector-*` tag, using the same GitHub tags API pattern as `master-update`.
-When that version is newer than the local `COLLECTOR_VERSION`, it downloads
-only `COLLECTOR/collect_inventory.py` from that tag over HTTPS. The download is
+Every `itgo-inv` invocation downloads
+`PUBLIC/COLLECTOR/latest.version` from GitHub PUBLIC `main`. When that version
+is newer than the local `COLLECTOR_VERSION`, it downloads only
+`COLLECTOR/collect_inventory.py` from the immutable `collector-<version>` tag
+over HTTPS. The download is
 first saved as a temporary file, checked for its declared version, compiled and
 run with `--help`; only then is the current Collector copied to
 `bin/collect_inventory.py.bak` and the temporary file atomically renamed into
@@ -73,7 +74,8 @@ leave the current Collector in use. The Collector itself remains read-only.
 Collector releases are independent of INVENTORY: publish the file to PUBLIC as
 `COLLECTOR/collect_inventory.py` and tag it `collector-<COLLECTOR_VERSION>`.
 From DEV, `pwsh -File INVENTORY/stage-collector-public.ps1` stages exactly this
-file in the sibling PUBLIC repository; review it, then commit, tag and push in
+file and `COLLECTOR/latest.version` in the sibling PUBLIC repository; review
+them, then commit, tag and push in
 the normal release process. The staging script never commits, tags or pushes.
 
 ## Automatic inventory

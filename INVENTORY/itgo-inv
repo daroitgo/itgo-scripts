@@ -18,8 +18,8 @@ ITGO_HOME="$(cd "${BASE_DIR}/../.." && pwd)"
 COLLECTOR="${BASE_DIR}/bin/collect_inventory.py"
 COLLECTOR_BACKUP="${BASE_DIR}/bin/collect_inventory.py.bak"
 COLLECTOR_UPDATE_LOCK="${BASE_DIR}/run/collector-update.lock"
-COLLECTOR_GITHUB_API="https://api.github.com/repos/daroitgo/itgo-scripts-public/git/matching-refs/tags/collector-"
 COLLECTOR_GITHUB_RAW="https://raw.githubusercontent.com/daroitgo/itgo-scripts-public"
+COLLECTOR_LATEST_VERSION_URL="${COLLECTOR_GITHUB_RAW}/main/COLLECTOR/latest.version"
 REPORTS_DIR="${BASE_DIR}/reports"
 LOGS_DIR="${BASE_DIR}/logs"
 VERSION_FILE="${BASE_DIR}/inventory.version"
@@ -439,24 +439,22 @@ except Exception:
 PY
 }
 
-collector_latest_public_tag() {
-  curl --fail --silent --show-error --location --connect-timeout 5 --max-time 20 --proto '=https' --tlsv1.2 "$COLLECTOR_GITHUB_API" 2>/dev/null \
-    | grep -o '"ref":[[:space:]]*"refs/tags/collector-[^"]*"' \
-    | sed 's#.*"refs/tags/\(collector-[^"]*\)"#\1#' \
-    | sort -V | tail -n 1
+collector_latest_public_version() {
+  curl --fail --silent --show-error --location --connect-timeout 5 --max-time 20 --proto '=https' --tlsv1.2 "$COLLECTOR_LATEST_VERSION_URL" 2>/dev/null \
+    | tr -d '\r\n'
 }
 
 collector_update_if_available() {
-  local local_version latest_tag public_version download_url temp backup_tmp py_cmd
+  local local_version public_version download_url temp backup_tmp py_cmd
   [ -f "$COLLECTOR" ] && [ ! -L "$COLLECTOR" ] || return 0
   command -v curl >/dev/null 2>&1 || return 0
   py_cmd="$(collector_python_command)" || return 0
   local_version="$(collector_version_of "$COLLECTOR")" || return 0
-  latest_tag="$(collector_latest_public_tag)" || return 0
-  public_version="${latest_tag#collector-}"
-  case "$latest_tag" in collector-[0-9]*.*) ;; *) return 0 ;; esac
+  public_version="$(collector_latest_public_version)" || return 0
+  case "$public_version" in [0-9]*.*) ;; *) return 0 ;; esac
+  collector_version_is_newer "$public_version" "0" >/dev/null 2>&1 || return 0
   collector_version_is_newer "$public_version" "$local_version" || return 0
-  download_url="${COLLECTOR_GITHUB_RAW}/${latest_tag}/COLLECTOR/collect_inventory.py"
+  download_url="${COLLECTOR_GITHUB_RAW}/collector-${public_version}/COLLECTOR/collect_inventory.py"
   temp="${BASE_DIR}/bin/.collect_inventory.py.download.$$"
   backup_tmp="${BASE_DIR}/bin/.collect_inventory.py.bak.$$"
   rm -f -- "$temp" "$backup_tmp"
