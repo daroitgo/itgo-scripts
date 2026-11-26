@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.29"
+VERSION="3.12.30"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -227,12 +227,14 @@ host_ip="$(
 kernel="$(uname -r)"
 
 os_id="unknown"; os_ver="unknown"; os_pretty="UNKNOWN"
+os_codename=""
 if [[ -f /etc/os-release ]]; then
   # shellcheck disable=SC1091
   . /etc/os-release
   os_id="${ID:-unknown}"
   os_ver="${VERSION_ID:-unknown}"
   os_pretty="${PRETTY_NAME:-UNKNOWN}"
+  os_codename="${VERSION_CODENAME:-}"
 fi
 major="${os_ver%%.*}"
 
@@ -264,6 +266,8 @@ fi
 
 security_hint="UNKNOWN"
 security_src="n/a"
+os_updates="UNKNOWN"
+apt_origins="n/a"
 
 count_security_lines() {
   awk '
@@ -292,28 +296,39 @@ if [[ "$os_id" == "debian" || "$os_id" == "ubuntu" || " ${ID_LIKE:-} " == *" deb
   if command -v apt >/dev/null 2>&1 && timeout "$SEC_TIMEOUT" apt list --upgradable >"$tmp" 2>/dev/null; then
     apt_lines="$(awk 'NR > 1 && NF {print}' "$tmp")"
     if [[ -z "$apt_lines" ]]; then
+      os_updates="0"
+      apt_origins="security=0 other=0 ambiguous=0"
       security_hint="OK (none)"
-    elif echo "$apt_lines" | grep -Eqi '(^|[/:[:space:]-])(security|[a-z0-9.-]+-security)([/:[:space:]-]|$)'; then
-      # APT only exposes a trustworthy count when every listed candidate has a
-      # recognisable security/non-security suite.  Third-party or opaque suite
-      # names must not be silently counted as non-security updates.
-      if echo "$apt_lines" | awk '
-        /(^|[\/:[:space:]-])(security|[[:alnum:].-]+-security)([\/:[:space:]-]|$)/ {next}
-        /\/(stable|oldstable|testing|unstable|experimental|[[:alnum:].-]+-(updates|backports))[[:space:]]/ {next}
-        /\/(Debian|Ubuntu):/ {next}
-        {bad=1}
-        END {exit bad}
-      '; then
-        n="$(echo "$apt_lines" | grep -Eic '(^|[/:[:space:]-])(security|[a-z0-9.-]+-security)([/:[:space:]-]|$)')"
-        security_hint="SECURITY UPDATES AVAILABLE (${n})"
-      else
-        security_hint="UNKNOWN (APT origin not explicit)"
-      fi
     else
-      security_hint="UNKNOWN (APT origin not explicit)"
+      # Field 1 from apt list is package/suite.  Count security suites on their
+      # own: unrelated packages must not hide a confirmed security update.
+      read -r os_updates apt_security apt_other apt_ambiguous < <(printf '%s\n' "$apt_lines" | awk -v codename="$os_codename" '
+        function known_other(s) {
+          return codename != "" && (s == codename || s == codename "-updates" || s == codename "-backports" || s == codename "-proposed")
+        }
+        {
+          total++
+          split($1, part, "/")
+          suite=part[2]
+          if (suite == "" || suite !~ /^[[:alnum:]._-]+$/) {ambiguous++; next}
+          if (suite ~ /(^|[-.])security([-.]|$)/) {security++; next}
+          other++
+          if (!known_other(suite)) ambiguous++
+        }
+        END {print total+0, security+0, other+0, ambiguous+0}
+      ')
+      apt_origins="security=${apt_security} other=${apt_other} ambiguous=${apt_ambiguous}"
+      if [[ "$apt_security" -gt 0 ]]; then
+        security_hint="SECURITY UPDATES AVAILABLE (${apt_security})"
+      elif [[ "$apt_ambiguous" -gt 0 ]]; then
+        security_hint="UNKNOWN (APT origin ambiguous)"
+      else
+        security_hint="OK (none)"
+      fi
     fi
   else
     security_hint="UNKNOWN (no apt/local cache/timeout)"
+    apt_origins="UNKNOWN (no local cache)"
   fi
   rm -f "$tmp"
 elif command -v dnf >/dev/null 2>&1; then
@@ -484,8 +499,10 @@ echo "Kernel        : $kernel"
 echo "Java          : $java_ver"
 echo "Last update   : $last_update"
 echo "Update status : $update_hint"
+echo "OS updates    : $os_updates"
 echo "Security upd  : $security_hint"
 echo "Security src  : $security_src"
+echo "APT origins   : $apt_origins"
 echo "Support until : $support_until"
 echo "Support src   : $support_src"
 echo "Firewall      : $fw_state"
@@ -837,8 +854,10 @@ kernel="$(getv "Kernel")"
 java="$(getv "Java")"
 updated="$(getv "Last update")"
 status="$(getv "Update status")"
+osupdates="$(getv "OS updates")"
 secupd="$(getv "Security upd")"
 secsrc="$(getv "Security src")"
+aptorigins="$(getv "APT origins")"
 support="$(getv "Support until")"
 supportsrc="$(getv "Support src")"
 
@@ -1350,6 +1369,15 @@ security_short() {
   fi
 }
 
+os_updates_short() {
+  local n="${1:-UNKNOWN}"
+  if [[ "$n" =~ ^[0-9]+$ ]]; then
+    [[ "$n" == "0" ]] && echo "OK (none)" || echo "${n} AVAILABLE"
+  else
+    echo "$n"
+  fi
+}
+
 firewall_ports_display() {
   local active="$1" ports="$2" zone
   [[ -n "${ports:-}" ]] || { echo "UNKNOWN"; return; }
@@ -1436,8 +1464,9 @@ if [[ -n "${hostip:-}" && "${hostip:-UNKNOWN}" != "UNKNOWN" ]]; then
   host_value="${host_value}  IP ${hostip}"
 fi
 os_update="$(update_short "$status" "$updated")"
+os_available="$(os_updates_short "$osupdates")"
 sec_update="$(security_short "$secupd")"
-updates_value="OS $(color_update_value "$os_update") | Security $(color_update_value "$sec_update")"
+updates_value="Age $(color_update_value "$os_update") | OS $(color_update_value "$os_available") | Security $(color_update_value "$sec_update")"
 support_value="${support:-UNKNOWN} [${supportsrc:-local-db}]"
 
 server_body=""
@@ -1447,6 +1476,9 @@ server_body+="$(kv_line "Kernel" "${kernel:-UNKNOWN}" 54)"$'\n'
 server_body+="$(kv_line "Java" "${java:-UNKNOWN}" 54)"$'\n'
 server_body+="$(kv_line "P1 CERT" "$p1cert_used" 54)"$'\n'
 server_body+="$(kv_line "Updates" "$updates_value" 54)"$'\n'
+if [[ -n "${aptorigins:-}" && "$aptorigins" != "n/a" ]]; then
+  server_body+="$(kv_line "APT cache" "$aptorigins" 54)"$'\n'
+fi
 server_body+="$(kv_line "Support" "$support_value" 54)"
 
 fw_ports="$(firewall_ports_display "${fw_active:-UNKNOWN}" "${fw_pm_ports:-UNKNOWN}")"
