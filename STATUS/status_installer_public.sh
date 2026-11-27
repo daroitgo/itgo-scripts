@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.32"
+VERSION="3.12.33"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -1522,6 +1522,34 @@ service_record() {
   kv_lines "Hint" "${hint:-UNKNOWN}" "$width"
 }
 
+wildfly_embedded_helper() {
+  local identity="$1" path="$2" lower_identity lower_path
+  lower_identity="$(printf '%s' "$identity" | tr '[:upper:]' '[:lower:]')"
+  case "$lower_identity" in
+    *clamav*|*hazelcast*) ;;
+    *) return 1 ;;
+  esac
+  lower_path="$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')"
+  [[ "$lower_path" == /srv/wildflyamms/* ]]
+}
+
+app_service_record() {
+  local app="$1" state="$2" unit="$3" hint="$4" fullpath="$5" logsdir="$6" logsbytes="$7" width="$8"
+  local install_path log_path logs
+
+  # HINT is a collector-friendly prefix and may end in /... .  APPS must show
+  # only a complete installation path; a missing FULLPATH is not inferred.
+  install_path="${fullpath:-UNKNOWN}"
+  log_path="${logsdir:-UNKNOWN}"
+  logs="$(hr_bytes "${logsbytes:-}")"
+
+  printf '%s %s\n' "$(color_state "${app:-APP}")" "$(runtime_state_color "${state:-unknown}")"
+  kv_lines "Unit" "${unit:-unknown}" "$width"
+  kv_lines "Path" "$install_path" "$width"
+  kv_lines "Log dir" "$log_path" "$width"
+  kv_lines "Logs" "$logs" "$width"
+}
+
 setup_box_chars
 cols="$(terminal_width)"
 dashboard_w="$cols"
@@ -1663,13 +1691,13 @@ apps_inner="$((apps_w - 4))"
 apps_body=""
 if [[ -f "$APPS" ]]; then
   apps_count=0
-  while IFS=$'\t' read -r app unit hint logsbytes; do
+  while IFS=$'\t' read -r app unit hint fullpath logsdir logsbytes; do
+    wildfly_embedded_helper "${app:-} ${unit:-}" "${fullpath:-}" && continue
     apps_count="$((apps_count + 1))"
     st="$(svc_state "$unit")"
-    logs="$(hr_bytes "${logsbytes:-}")"
     [[ "$apps_count" -gt 1 ]] && apps_body+=$'\n'
-    apps_body+="$(service_record "${app:-APP}" "${st:-unknown}" "${logs:-n/a}" "${unit:-unknown}" "${hint:-UNKNOWN}" "$apps_inner")"
-  done < <(awk -F'\t' '$1=="SVC"{print $2 "\t" $3 "\t" $4 "\t" $7}' "$APPS" 2>/dev/null)
+    apps_body+="$(app_service_record "${app:-APP}" "${st:-unknown}" "${unit:-unknown}" "${hint:-}" "${fullpath:-}" "${logsdir:-}" "${logsbytes:-}" "$apps_inner")"
+  done < <(awk -F'\t' '$1=="SVC"{print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7}' "$APPS" 2>/dev/null)
   if [[ "${apps_count:-0}" -eq 0 ]]; then
     apps_body="no app services in cache; run: status -r"
   fi
@@ -1709,6 +1737,7 @@ declare -A G_PROJS G_HINT G_LOGS
 if [[ -f "$APPS" ]]; then
   while IFS=$'\t' read -r tag sys unit hint dir projs logsdir logsbytes; do
     [[ "$tag" == "CMP" ]] || continue
+    wildfly_embedded_helper "${sys:-} ${unit:-}" "${dir:-}" && continue
     key="${sys}__STATUS_COMPOSE_KEY__${unit}"
     cur="${G_PROJS[$key]-}"
     for p in $projs; do
