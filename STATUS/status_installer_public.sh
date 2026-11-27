@@ -22,7 +22,7 @@ set -o pipefail 2>/dev/null || true
 #   - status -r refreshes BOTH caches on demand
 # ==========================================================
 
-VERSION="3.12.31"
+VERSION="3.12.32"
 MODE="install"
 TARGET_USER="itgo"
 
@@ -1248,7 +1248,18 @@ setup_box_chars() {
 }
 
 strip_ansi() {
-  printf "%s" "$1" | sed $'s/\033\\[[0-9;]*[A-Za-z]//g'
+  local s="$1" before rest code esc=$'\033'
+  while [[ "$s" == *"$esc"* ]]; do
+    before="${s%%"$esc"*}"
+    rest="${s#*"$esc"}"
+    if [[ "$rest" =~ ^\[[0-9\;]*[[:alpha:]] ]]; then
+      code="${BASH_REMATCH[0]}"
+      s="${before}${rest:${#code}}"
+    else
+      break
+    fi
+  done
+  printf "%s" "$s"
 }
 
 visible_len() {
@@ -1281,10 +1292,9 @@ trim_visible() {
 trim2(){ trim_visible "$1" "$2"; }
 
 pad_visible() {
-  local s="$1" w="$2" out len
-  out="$(trim_visible "$s" "$w")"
-  len="$(visible_len "$out")"
-  printf "%s%s" "$out" "$(repeat_char " " "$((w-len))")"
+  local s="$1" w="$2" len
+  len="$(visible_len "$s")"
+  printf "%s%s" "$s" "$(repeat_char " " "$((w-len))")"
 }
 
 color_state() {
@@ -1301,8 +1311,10 @@ color_update_value() {
   local value="$1"
   if [[ "$value" == "OK" ]]; then
     printf "%s" "${GREEN}${value}${RESET}"
-  elif echo "$value" | grep -qi "UPDATE"; then
+  elif echo "$value" | grep -Eqi "UPDATE|ERROR|FAILED"; then
     printf "%s" "${RED}${value}${RESET}"
+  elif echo "$value" | grep -qi "UNKNOWN"; then
+    printf "%s" "${YELLOW}${value}${RESET}"
   else
     printf "%s" "$value"
   fi
@@ -1313,13 +1325,22 @@ module_state_color() {
 }
 
 wrap_words() {
-  local text="$1" width="$2" indent="${3:-0}" line="" prefix word
+  local text="$1" width="$2" indent="${3:-0}" line="" prefix word piece
   prefix="$(repeat_char " " "$indent")"
   [[ -n "${text:-}" ]] || text="UNKNOWN"
   for word in $text; do
+    while (($(visible_len "$word") > width)); do
+      piece="${word:0:width}"
+      if [[ -n "$line" ]]; then
+        printf "%s\n" "$line"
+        line=""
+      fi
+      printf "%s\n" "$piece"
+      word="${word:width}"
+    done
     if [[ -z "$line" ]]; then
       line="$word"
-    elif ((${#line} + 1 + ${#word} > width)); then
+    elif (($(visible_len "$line") + 1 + $(visible_len "$word") > width)); then
       printf "%s\n" "$line"
       line="${prefix}${word}"
     else
@@ -1329,11 +1350,18 @@ wrap_words() {
   [[ -n "$line" ]] && printf "%s\n" "$line"
 }
 
-kv_line() {
-  local key="$1" value="$2" width="$3" key_w=10 avail
+kv_lines() {
+  local key="$1" value="$2" width="$3" key_w=12 avail first=1 line
   avail="$((width - key_w - 1))"
   ((avail < 8)) && avail=8
-  printf "%-${key_w}s %s" "$key" "$(trim_visible "${value:-UNKNOWN}" "$avail")"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if ((first)); then
+      printf "%-${key_w}s %s\n" "$key" "$line"
+      first=0
+    else
+      printf "%-${key_w}s %s\n" "" "$line"
+    fi
+  done < <(wrap_words "${value:-UNKNOWN}" "$avail")
 }
 
 render_box() {
@@ -1368,9 +1396,8 @@ box_to_array() {
 render_two_boxes() {
   local title1="$1" body1="$2" title2="$3" body2="$4" cols="$5"
   local gap=2 width left_count right_count max_lines i
-  if ((cols >= 110)); then
+  if ((cols >= 120)); then
     width="$(( (cols - gap) / 2 ))"
-    ((width > 64)) && width=64
     box_to_array left_box "$title1" "$width" "$body1"
     box_to_array right_box "$title2" "$width" "$body2"
     left_count="${#left_box[@]}"
@@ -1382,7 +1409,6 @@ render_two_boxes() {
     done
   else
     width="$cols"
-    ((width > 90)) && width=90
     render_box "$title1" "$width" "$body1"
     echo
     render_box "$title2" "$width" "$body2"
@@ -1488,26 +1514,23 @@ runtime_state_color() {
   esac
 }
 
-apps_row() {
-  local app="$1" state="$2" logs="$3" unit="$4" hint="$5"
-  local app_w="$6" state_w="$7" logs_w="$8" unit_w="$9" hint_w="${10}"
-  printf "%s %s %s %s %s" \
-    "$(pad_visible "${app:-APP}" "$app_w")" \
-    "$(pad_visible "$(runtime_state_color "${state:-unknown}")" "$state_w")" \
-    "$(pad_visible "${logs:-n/a}" "$logs_w")" \
-    "$(pad_visible "${unit:-unknown}" "$unit_w")" \
-    "$(trim_visible "${hint:-UNKNOWN}" "$hint_w")"
-}
-
-docker_info_row() {
-  local label="$1" value="$2" width="$3"
-  printf "%-8s %s" "$label" "$(trim_visible "${value:-UNKNOWN}" "$((width - 9))")"
+service_record() {
+  local name="$1" state="$2" logs="$3" unit="$4" hint="$5" width="$6"
+  printf '%s %s\n' "$(color_state "${name:-APP}")" "$(runtime_state_color "${state:-unknown}")"
+  kv_lines "Unit" "${unit:-unknown}" "$width"
+  kv_lines "Logs" "${logs:-n/a}" "$width"
+  kv_lines "Hint" "${hint:-UNKNOWN}" "$width"
 }
 
 setup_box_chars
 cols="$(terminal_width)"
 dashboard_w="$cols"
-((dashboard_w > 132)) && dashboard_w=132
+((dashboard_w < 40)) && dashboard_w=40
+panel_w="$dashboard_w"
+if ((dashboard_w >= 120)); then
+  panel_w="$(( (dashboard_w - 2) / 2 ))"
+fi
+panel_inner="$((panel_w - 4))"
 
 host_value="${host:-UNKNOWN}"
 if [[ -n "${hostip:-}" && "${hostip:-UNKNOWN}" != "UNKNOWN" ]]; then
@@ -1520,21 +1543,22 @@ updates_value="Age $(color_update_value "$os_update") | OS $(color_update_value 
 support_value="${support:-UNKNOWN} [${supportsrc:-local-db}]"
 
 server_body=""
-server_body+="$(kv_line "Host" "$host_value" 54)"$'\n'
-server_body+="$(kv_line "OS" "${os:-UNKNOWN}" 54)"$'\n'
-server_body+="$(kv_line "Kernel" "${kernel:-UNKNOWN}" 54)"$'\n'
-server_body+="$(kv_line "Java" "${java:-UNKNOWN}" 54)"$'\n'
-server_body+="$(kv_line "P1 CERT" "$p1cert_used" 54)"$'\n'
-server_body+="$(kv_line "Updates" "$updates_value" 54)"$'\n'
+server_body+="$(kv_lines "Host" "$host_value" "$panel_inner")"$'\n'
+server_body+="$(kv_lines "OS" "${os:-UNKNOWN}" "$panel_inner")"$'\n'
+server_body+="$(kv_lines "Kernel" "${kernel:-UNKNOWN}" "$panel_inner")"$'\n'
+server_body+="$(kv_lines "Java" "${java:-UNKNOWN}" "$panel_inner")"$'\n'
+server_body+="$(kv_lines "P1 CERT" "$p1cert_used" "$panel_inner")"$'\n'
+server_body+="$(kv_lines "Updates" "$updates_value" "$panel_inner")"$'\n'
 if [[ -n "${aptorigins:-}" && "$aptorigins" != "n/a" ]]; then
-  server_body+="$(kv_line "APT cache" "$aptorigins" 54)"$'\n'
+  server_body+="$(kv_lines "APT cache" "$aptorigins" "$panel_inner")"$'\n'
 fi
-server_body+="$(kv_line "Support" "$support_value" 54)"
+server_body+="$(kv_lines "Support" "$support_value" "$panel_inner")"
 
 fw_ports="$(firewall_ports_display "${fw_active:-UNKNOWN}" "${fw_pm_ports:-UNKNOWN}")"
 fw_services="$(firewall_services_display "${fw_active:-UNKNOWN}" "${fw_pm_services:-UNKNOWN}")"
 firewall_body=""
-firewall_body+="$(kv_line "Zone" "${fw_active:-UNKNOWN}" 54)"$'\n'
+firewall_body+="$(kv_lines "State" "$(color_state "${fw:-UNKNOWN}")" "$panel_inner")"$'\n'
+firewall_body+="$(kv_lines "Zone" "${fw_active:-UNKNOWN}" "$panel_inner")"$'\n'
 firewall_body+="Ports"$'\n'
 while IFS= read -r line; do
   firewall_body+="  ${line}"$'\n'
@@ -1634,37 +1658,17 @@ render_two_boxes "MODULES" "$modules_body" "TOOLS / COMPONENTS" "$tools_body" "$
 
 echo
 apps_w="$dashboard_w"
-((apps_w > 100)) && apps_w=100
 apps_inner="$((apps_w - 4))"
-app_w=10
-app_state_w=8
-app_logs_w=8
-app_unit_w=20
-app_hint_w="$((apps_inner - app_w - app_state_w - app_logs_w - app_unit_w - 4))"
-if ((app_hint_w < 10)); then
-  app_unit_w=16
-  app_hint_w="$((apps_inner - app_w - app_state_w - app_logs_w - app_unit_w - 4))"
-fi
-if ((app_hint_w < 8)); then
-  app_w=8
-  app_state_w=7
-  app_logs_w=7
-  app_unit_w=12
-  app_hint_w="$((apps_inner - app_w - app_state_w - app_logs_w - app_unit_w - 4))"
-fi
-((app_hint_w < 6)) && app_hint_w=6
 
 apps_body=""
-apps_body+="$(apps_row "APP" "STATE" "LOGS" "UNIT" "HINT" "$app_w" "$app_state_w" "$app_logs_w" "$app_unit_w" "$app_hint_w")"$'\n'
-apps_body+="$(apps_row "--------" "--------" "------" "----------------" "----------------" "$app_w" "$app_state_w" "$app_logs_w" "$app_unit_w" "$app_hint_w")"
 if [[ -f "$APPS" ]]; then
   apps_count=0
   while IFS=$'\t' read -r app unit hint logsbytes; do
     apps_count="$((apps_count + 1))"
     st="$(svc_state "$unit")"
     logs="$(hr_bytes "${logsbytes:-}")"
-    apps_body+=$'\n'
-    apps_body+="$(apps_row "${app:-APP}" "${st:-unknown}" "${logs:-n/a}" "${unit:-unknown}" "${hint:-UNKNOWN}" "$app_w" "$app_state_w" "$app_logs_w" "$app_unit_w" "$app_hint_w")"
+    [[ "$apps_count" -gt 1 ]] && apps_body+=$'\n'
+    apps_body+="$(service_record "${app:-APP}" "${st:-unknown}" "${logs:-n/a}" "${unit:-unknown}" "${hint:-UNKNOWN}" "$apps_inner")"
   done < <(awk -F'\t' '$1=="SVC"{print $2 "\t" $3 "\t" $4 "\t" $7}' "$APPS" 2>/dev/null)
   if [[ "${apps_count:-0}" -eq 0 ]]; then
     apps_body="no app services in cache; run: status -r"
@@ -1685,10 +1689,9 @@ elif command -v docker-compose >/dev/null 2>&1; then
 fi
 
 docker_w="$dashboard_w"
-((docker_w > 90)) && docker_w=90
 docker_body=""
-docker_body+="$(docker_info_row "Docker" "$dockerv" "$((docker_w - 4))")"$'\n'
-docker_body+="$(docker_info_row "Compose" "$composev" "$((docker_w - 4))")"
+docker_body+="$(kv_lines "Docker" "$dockerv" "$((docker_w - 4))")"$'\n'
+docker_body+="$(kv_lines "Compose" "$composev" "$((docker_w - 4))")"
 
 echo
 render_box "DOCKER / COMPOSE" "$docker_w" "$docker_body"
@@ -1706,7 +1709,7 @@ declare -A G_PROJS G_HINT G_LOGS
 if [[ -f "$APPS" ]]; then
   while IFS=$'\t' read -r tag sys unit hint dir projs logsdir logsbytes; do
     [[ "$tag" == "CMP" ]] || continue
-    key="${sys}|||${unit}"
+    key="${sys}__STATUS_COMPOSE_KEY__${unit}"
     cur="${G_PROJS[$key]-}"
     for p in $projs; do
       if ! echo " $cur " | grep -q " $p "; then
@@ -1725,35 +1728,16 @@ if [[ -f "$APPS" ]]; then
 fi
 
 compose_w="$dashboard_w"
-((compose_w > 100)) && compose_w=100
 compose_inner="$((compose_w - 4))"
-compose_sys_w=10
-compose_state_w=8
-compose_logs_w=8
-compose_unit_w=20
-compose_hint_w="$((compose_inner - compose_sys_w - compose_state_w - compose_logs_w - compose_unit_w - 4))"
-if ((compose_hint_w < 10)); then
-  compose_unit_w=16
-  compose_hint_w="$((compose_inner - compose_sys_w - compose_state_w - compose_logs_w - compose_unit_w - 4))"
-fi
-if ((compose_hint_w < 8)); then
-  compose_sys_w=8
-  compose_state_w=7
-  compose_logs_w=7
-  compose_unit_w=12
-  compose_hint_w="$((compose_inner - compose_sys_w - compose_state_w - compose_logs_w - compose_unit_w - 4))"
-fi
-((compose_hint_w < 6)) && compose_hint_w=6
 
 compose_body=""
-compose_body+="$(apps_row "SYSTEM" "STATE" "LOGS" "UNIT" "HINT" "$compose_sys_w" "$compose_state_w" "$compose_logs_w" "$compose_unit_w" "$compose_hint_w")"$'\n'
-compose_body+="$(apps_row "--------" "--------" "------" "----------------" "----------------" "$compose_sys_w" "$compose_state_w" "$compose_logs_w" "$compose_unit_w" "$compose_hint_w")"
 
 if ((${#G_PROJS[@]} > 0)); then
+  compose_count=0
   while IFS= read -r key; do
     [[ -n "$key" ]] || continue
-    sys="${key%%|||*}"
-    unit="${key##*|||}"
+    sys="${key%%__STATUS_COMPOSE_KEY__*}"
+    unit="${key##*__STATUS_COMPOSE_KEY__}"
     hint="${G_HINT[$key]-UNKNOWN}"
     projs="${G_PROJS[$key]-}"
     logs="$(hr_bytes "${G_LOGS[$key]-}")"
@@ -1774,8 +1758,9 @@ if ((${#G_PROJS[@]} > 0)); then
       state="unknown"
     fi
 
-    compose_body+=$'\n'
-    compose_body+="$(apps_row "${sys:-UNKNOWN}" "${state:-unknown}" "${logs:-n/a}" "${unit:-unknown}" "${hint:-UNKNOWN}" "$compose_sys_w" "$compose_state_w" "$compose_logs_w" "$compose_unit_w" "$compose_hint_w")"
+    compose_count="$((compose_count + 1))"
+    [[ "$compose_count" -gt 1 ]] && compose_body+=$'\n'
+    compose_body+="$(service_record "${sys:-UNKNOWN}" "${state:-unknown}" "${logs:-n/a}" "${unit:-unknown}" "${hint:-UNKNOWN}; projects: ${projs:-UNKNOWN}" "$compose_inner")"
   done < <(printf "%s\n" "${!G_PROJS[@]}" | sort)
 else
   compose_body="no compose projects in cache; run: status -r"
